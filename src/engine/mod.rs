@@ -814,9 +814,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         if let Some(identity) = &record.provider_object {
-            if Uuid::parse_str(&identity.id).is_err() {
-                return Err(EngineError::OwnershipNotProven(
+            let provider_id = Uuid::parse_str(&identity.id).map_err(|_| {
+                EngineError::OwnershipNotProven(
                     "recorded Hyper-V provider object id is not a GUID".to_owned(),
+                )
+            })?;
+            if provider_id.to_string() != identity.id {
+                return Err(EngineError::OwnershipNotProven(
+                    "recorded Hyper-V provider object id is not canonical".to_owned(),
                 ));
             }
             if identity.name != record.ownership.provider_object_name {
@@ -1250,7 +1255,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
 
@@ -1298,10 +1303,11 @@ mod tests {
         installation_rotation_blocked: bool,
     }
 
+    #[derive(Clone)]
     struct MockHyperV {
         base_size: u64,
         use_path_aliases: bool,
-        state: Mutex<MockState>,
+        state: Arc<Mutex<MockState>>,
     }
 
     impl MockHyperV {
@@ -1310,7 +1316,7 @@ mod tests {
             Self {
                 base_size,
                 use_path_aliases: false,
-                state: Mutex::new(MockState::default()),
+                state: Arc::new(Mutex::new(MockState::default())),
             }
         }
 
@@ -1683,6 +1689,10 @@ mod tests {
                 name: cell.ownership.provider_object_name.clone(),
             },
             ProviderObjectIdentity {
+                id: format!("{{{}}}", cell.provider_object.as_ref().unwrap().id),
+                name: cell.ownership.provider_object_name.clone(),
+            },
+            ProviderObjectIdentity {
                 id: cell.provider_object.as_ref().unwrap().id.clone(),
                 name: "foreign-name".to_owned(),
             },
@@ -1822,6 +1832,66 @@ mod tests {
             calls_before
         );
         assert!(engine.state.cell_runtime_root(cell.id).exists());
+    }
+
+    #[test]
+    fn distinct_state_root_cannot_authorize_a_cell_from_another_installation() {
+        let directory = tempdir().unwrap();
+        let base_path = directory.path().join("base.vhdx");
+        fs::write(&base_path, b"immutable base").unwrap();
+        let provider = MockHyperV::new(base_path.clone());
+        let first = CellEngine::new(
+            StateStore::new(directory.path().join("state-a")),
+            provider.clone(),
+        );
+        let image_id = ImageId::parse("windows-dev").unwrap();
+        first
+            .register_image(RegisterImageRequest {
+                id: image_id.clone(),
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                path: base_path,
+            })
+            .unwrap();
+        let cell = first.create_cell(spec(image_id)).unwrap();
+
+        let second = CellEngine::new(StateStore::new(directory.path().join("state-b")), provider);
+        let second_installation = second.state.installation().unwrap();
+        assert_ne!(second_installation.install_id, cell.ownership.install_id);
+        let second_manifest = second
+            .state
+            .root()
+            .join("cells")
+            .join(format!("{}.json", cell.id));
+        fs::create_dir_all(second_manifest.parent().unwrap()).unwrap();
+        fs::copy(
+            first
+                .state
+                .root()
+                .join("cells")
+                .join(format!("{}.json", cell.id)),
+            second_manifest,
+        )
+        .unwrap();
+        let calls_before = second.provider.state.lock().unwrap().calls.len();
+
+        assert!(matches!(
+            second.start_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert!(matches!(
+            second.destroy_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert!(matches!(
+            second.reconcile_cell(cell.id).unwrap().reconciliation,
+            ReconciliationStatus::OwnershipMismatch { .. }
+        ));
+        assert_eq!(
+            second.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+        assert!(second.provider.state.lock().unwrap().vm.is_some());
     }
 
     #[test]
@@ -2240,6 +2310,45 @@ mod tests {
             ReconciliationStatus::OwnershipMismatch { .. }
         ));
         assert!(engine.destroy_cell(cell.id).is_err());
+    }
+
+    #[test]
+    fn destroyed_tombstone_stress_rejects_name_reuse_and_runtime_reappearance() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let snapshot = engine.provider.state.lock().unwrap().vm.clone().unwrap();
+        engine.destroy_cell(cell.id).unwrap();
+
+        for iteration in 0..32 {
+            let mut foreign = snapshot.clone();
+            foreign.id = Uuid::new_v4().to_string();
+            foreign.ownership_marker = format!("foreign-{iteration}");
+            engine.provider.state.lock().unwrap().vm = Some(foreign);
+            assert!(matches!(
+                engine.reconcile_cell(cell.id).unwrap().reconciliation,
+                ReconciliationStatus::OwnershipMismatch { .. }
+            ));
+            assert!(matches!(
+                engine.destroy_cell(cell.id),
+                Err(EngineError::ProviderDrift(_))
+            ));
+            engine.provider.state.lock().unwrap().vm = None;
+
+            engine.state.ensure_cell_runtime(cell.id).unwrap();
+            assert!(matches!(
+                engine.reconcile_cell(cell.id).unwrap().reconciliation,
+                ReconciliationStatus::OwnershipMismatch { .. }
+            ));
+            assert!(matches!(
+                engine.destroy_cell(cell.id),
+                Err(EngineError::ProviderDrift(_))
+            ));
+            let runtime = engine.state.pin_cell_runtime(cell.id).unwrap();
+            engine.state.remove_cell_runtime(cell.id, runtime).unwrap();
+        }
+
+        assert!(!engine.destroy_cell(cell.id).unwrap().changed);
+        assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 1);
     }
 
     #[test]

@@ -579,7 +579,11 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
         file.sync_all()
             .map_err(|source| io_error(&temporary, source))?;
         drop(file);
+        #[cfg(test)]
+        abort_at_test_checkpoint("before_manifest_rename");
         fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+        #[cfg(test)]
+        abort_at_test_checkpoint("after_manifest_rename");
         #[cfg(not(windows))]
         {
             let committed = open_state_file_read(path)?;
@@ -598,6 +602,17 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(test)]
+fn abort_at_test_checkpoint(checkpoint: &str) {
+    let is_child =
+        std::env::var_os("VMCELL_TEST_ATOMIC_CRASH_CHILD").is_some_and(|value| value == "1");
+    let selected =
+        std::env::var_os("VMCELL_TEST_ABORT_AT").is_some_and(|value| value == checkpoint);
+    if is_child && selected {
+        std::process::abort();
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<(), StateError> {
@@ -792,6 +807,9 @@ fn is_reparse_point(path: &Path) -> Result<bool, StateError> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
+    use std::str::FromStr;
+
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -799,6 +817,65 @@ mod tests {
     use crate::core::cell::{CellPhase, CellSpec, CellState};
     use crate::core::image::{Architecture, GuestOs, ImageBinding, ImageVariant};
     use crate::core::ownership::CellOwnership;
+
+    fn test_cell_record(store: &StateStore, cell_id: CellId) -> CellRecord {
+        let image_id = ImageId::parse("crash-base").unwrap();
+        let variant = ImageVariant {
+            provider: "hyperv".to_owned(),
+            disk_format: "vhdx".to_owned(),
+            path: store.root().join("base.vhdx"),
+            sha256: "abc".to_owned(),
+            file_size: 42,
+        };
+        let now = Utc::now();
+        CellRecord {
+            schema_version: CELL_SCHEMA_VERSION,
+            id: cell_id,
+            provider: "hyperv".to_owned(),
+            spec: CellSpec {
+                image: image_id.clone(),
+                provider: Some("hyperv".to_owned()),
+                cpu_count: 2,
+                memory_mib: 4096,
+                ttl_seconds: None,
+            },
+            image: ImageBinding::from_variant(image_id, &variant),
+            ownership: CellOwnership::new(
+                Uuid::new_v4(),
+                cell_id,
+                Uuid::new_v4(),
+                store.cell_configuration_path(cell_id),
+                store.cell_overlay_path(cell_id),
+            ),
+            provider_object: None,
+            state: CellState::Creating,
+            phase: CellPhase::IntentRecorded,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            last_error: Some("baseline".to_owned()),
+        }
+    }
+
+    fn phase_and_state(label: &str) -> (CellPhase, CellState) {
+        match label {
+            "intent" => (CellPhase::IntentRecorded, CellState::Creating),
+            "overlay" => (CellPhase::OverlayCreated, CellState::Creating),
+            "provider_created" => (CellPhase::ProviderObjectCreated, CellState::Creating),
+            "provider_claimed" => (CellPhase::ProviderObjectClaimed, CellState::Creating),
+            "ready" => (CellPhase::Ready, CellState::Stopped),
+            "destroying_provisioning" => (CellPhase::DestroyingProvisioning, CellState::Destroying),
+            "destroying" => (CellPhase::Destroying, CellState::Destroying),
+            "destroyed" => (CellPhase::Destroyed, CellState::Destroyed),
+            _ => panic!("unknown test phase {label}"),
+        }
+    }
+
+    fn subprocess_for(test_name: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("--exact").arg(test_name).arg("--nocapture");
+        command
+    }
 
     #[test]
     fn installation_identity_is_durable() {
@@ -972,6 +1049,124 @@ mod tests {
         ));
         drop(first);
         assert!(store.acquire_mutation_lock().is_ok());
+    }
+
+    #[test]
+    fn manifest_phase_transitions_survive_real_process_abort_at_atomic_boundaries() {
+        if std::env::var_os("VMCELL_TEST_ATOMIC_CRASH_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let cell_id =
+                CellId::from_str(std::env::var("VMCELL_TEST_CELL_ID").unwrap().as_str()).unwrap();
+            let label = std::env::var("VMCELL_TEST_TARGET_PHASE").unwrap();
+            let (phase, state) = phase_and_state(&label);
+            let store = StateStore::new(root);
+            let mut record = store.load_cell(cell_id).unwrap();
+            record.phase = phase;
+            record.state = state;
+            record.last_error = Some(label);
+            store.save_cell(&record).unwrap();
+            std::process::exit(77);
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let cell_id = CellId::new();
+        store.save_cell(&test_cell_record(&store, cell_id)).unwrap();
+
+        for label in [
+            "intent",
+            "overlay",
+            "provider_created",
+            "provider_claimed",
+            "ready",
+            "destroying_provisioning",
+            "destroying",
+            "destroyed",
+        ] {
+            let baseline = store.load_cell(cell_id).unwrap();
+            let before = subprocess_for(
+                "state::tests::manifest_phase_transitions_survive_real_process_abort_at_atomic_boundaries",
+            )
+            .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+            .env("VMCELL_TEST_ABORT_AT", "before_manifest_rename")
+            .env("VMCELL_TEST_STATE_ROOT", store.root())
+            .env("VMCELL_TEST_CELL_ID", cell_id.to_string())
+            .env("VMCELL_TEST_TARGET_PHASE", label)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+            assert!(!before.success());
+            assert_ne!(before.code(), Some(77));
+            assert_eq!(store.load_cell(cell_id).unwrap(), baseline);
+
+            let after = subprocess_for(
+                "state::tests::manifest_phase_transitions_survive_real_process_abort_at_atomic_boundaries",
+            )
+            .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+            .env("VMCELL_TEST_ABORT_AT", "after_manifest_rename")
+            .env("VMCELL_TEST_STATE_ROOT", store.root())
+            .env("VMCELL_TEST_CELL_ID", cell_id.to_string())
+            .env("VMCELL_TEST_TARGET_PHASE", label)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+            assert!(!after.success());
+            assert_ne!(after.code(), Some(77));
+            let committed = store.load_cell(cell_id).unwrap();
+            let (phase, state) = phase_and_state(label);
+            assert_eq!(committed.phase, phase);
+            assert_eq!(committed.state, state);
+            assert_eq!(committed.last_error.as_deref(), Some(label));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mutation_guard_blocks_cross_process_duplicate_root_and_directory_replacement() {
+        if let Some(mode) = std::env::var_os("VMCELL_TEST_MUTATION_GUARD_CHILD") {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let store = StateStore::new(root);
+            match mode.to_string_lossy().as_ref() {
+                "busy" => assert!(store.acquire_mutation_lock().is_err()),
+                "available" => drop(store.acquire_mutation_lock().unwrap()),
+                "rename" => {
+                    let moved = store.root().join("cells-moved-by-child");
+                    assert!(fs::rename(store.root().join("cells"), moved).is_err());
+                }
+                value => panic!("unknown child mode {value}"),
+            }
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let guard = store.acquire_mutation_lock().unwrap();
+        for mode in ["busy", "rename"] {
+            let output = subprocess_for(
+                "state::tests::mutation_guard_blocks_cross_process_duplicate_root_and_directory_replacement",
+            )
+            .env("VMCELL_TEST_MUTATION_GUARD_CHILD", mode)
+            .env("VMCELL_TEST_STATE_ROOT", store.root())
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "child mode {mode} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        drop(guard);
+
+        let status = subprocess_for(
+            "state::tests::mutation_guard_blocks_cross_process_duplicate_root_and_directory_replacement",
+        )
+        .env("VMCELL_TEST_MUTATION_GUARD_CHILD", "available")
+        .env("VMCELL_TEST_STATE_ROOT", store.root())
+        .status()
+        .unwrap();
+        assert!(status.success());
     }
 
     #[cfg(windows)]

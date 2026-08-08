@@ -30,8 +30,9 @@ M0 probes remain read-only. M1 Hyper-V mutation is reachable only through owners
 ## M1 validation tiers
 
 1. Unit and contract tests use a mocked provider/executor and temporary state roots.
-2. Core CI runs format, Clippy, and all non-destructive tests.
-3. Real Hyper-V acceptance is a separately authorized activity on a dedicated host with a disposable VHDX, an isolated state root, and pre/post foreign-VM and switch checks.
+2. Windows safety tests use real subprocess aborts and cross-process filesystem contention to exercise manifest crash atomicity, duplicate-root locking, and state-directory replacement resistance without invoking Hyper-V.
+3. Core CI runs format, Clippy, and all non-destructive tests.
+4. Real Hyper-V acceptance is a separately authorized activity on a dedicated host with a disposable VHDX, an isolated state root, and pre/post foreign-VM and switch checks.
 
 ## Platform boundaries
 
