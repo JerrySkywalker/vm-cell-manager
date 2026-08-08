@@ -872,6 +872,9 @@ fn prove_creation_identity(
     if vm.memory_mib != record.spec.memory_mib {
         reasons.push("memory configuration mismatch");
     }
+    if vm.network_adapter_count > 1 {
+        reasons.push("new provider object has unexpected network adapters");
+    }
     if vm.power_state != ProviderPowerState::Off {
         reasons.push("new provider object is not off");
     }

@@ -32,7 +32,7 @@ if ([string]$vm.Id -ne [string]$expected.id -or
     $disks.Count -ne $expectedDisks.Count -or
     $disks.Count -ne 1 -or
     (ConvertTo-PathIdentity $disks[0]) -ne (ConvertTo-PathIdentity ([string]$expectedDisks[0])) -or
-    $adapters.Count -gt 1 -or
+    ($adapters.Count -ne [uint32]$expected.network_adapter_count -and $adapters.Count -ne 0) -or
     ([uint16]$processor.Count -ne [uint16]$expected.cpu_count -and
       [uint16]$processor.Count -ne [uint16]$request.cpu_count) -or
     [uint64]($memory.Startup / 1MB) -ne [uint64]$expected.memory_mib) {
