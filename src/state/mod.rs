@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::core::cell::{CellId, CellRecord};
-use crate::core::image::{ImageId, ImageRecord};
+use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellRecord};
+use crate::core::image::{IMAGE_SCHEMA_VERSION, ImageId, ImageRecord};
+use crate::core::ownership::OWNERSHIP_MARKER_SCHEMA;
 
-const INSTALL_SCHEMA_VERSION: u32 = 1;
+pub const INSTALL_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct StateStore {
@@ -53,6 +54,14 @@ pub enum StateError {
 
     #[error("refusing unsafe runtime path: {0}")]
     UnsafeRuntimePath(PathBuf),
+
+    #[error("unsupported {kind} schema version in {path}: expected {expected}, found {actual}")]
+    UnsupportedSchema {
+        kind: &'static str,
+        path: PathBuf,
+        expected: u32,
+        actual: u32,
+    },
 }
 
 pub struct MutationGuard {
@@ -96,7 +105,7 @@ impl StateStore {
 
     pub fn acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
         let lock_dir = self.root.join("locks");
-        create_dir_all(&lock_dir)?;
+        ensure_directory(&lock_dir)?;
         let process_key = self
             .root
             .canonicalize()
@@ -140,9 +149,10 @@ impl StateStore {
     pub fn installation(&self) -> Result<InstallationRecord, StateError> {
         let path = self.root.join("installation.json");
         if path.exists() {
-            return read_json(&path);
+            return self.load_installation();
         }
 
+        ensure_directory(&self.root)?;
         let record = InstallationRecord {
             schema_version: INSTALL_SCHEMA_VERSION,
             install_id: Uuid::new_v4(),
@@ -151,28 +161,51 @@ impl StateStore {
         Ok(record)
     }
 
+    /// Load the existing installation identity without creating a replacement.
+    pub fn load_installation(&self) -> Result<InstallationRecord, StateError> {
+        let path = self.root.join("installation.json");
+        let record: InstallationRecord = read_json(&path)?;
+        ensure_schema(
+            &path,
+            "installation record",
+            record.schema_version,
+            INSTALL_SCHEMA_VERSION,
+        )?;
+        Ok(record)
+    }
+
     pub fn save_image_new(&self, record: &ImageRecord) -> Result<(), StateError> {
-        write_json_new(&self.image_path(&record.id), record)
+        let path = self.image_path(&record.id);
+        validate_image_schema(&path, record)?;
+        write_json_new(&path, record)
     }
 
     pub fn load_image(&self, image_id: &ImageId) -> Result<ImageRecord, StateError> {
-        read_json(&self.image_path(image_id))
+        let path = self.image_path(image_id);
+        let record = read_json(&path)?;
+        validate_image_schema(&path, &record)?;
+        Ok(record)
     }
 
     pub fn list_images(&self) -> Result<Vec<ImageRecord>, StateError> {
-        read_json_directory(&self.root.join("images"))
+        read_json_directory(&self.root.join("images"), validate_image_schema)
     }
 
     pub fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
-        write_json_atomic(&self.cell_path(record.id), record)
+        let path = self.cell_path(record.id);
+        validate_cell_schema(&path, record)?;
+        write_json_atomic(&path, record)
     }
 
     pub fn load_cell(&self, cell_id: CellId) -> Result<CellRecord, StateError> {
-        read_json(&self.cell_path(cell_id))
+        let path = self.cell_path(cell_id);
+        let record = read_json(&path)?;
+        validate_cell_schema(&path, &record)?;
+        Ok(record)
     }
 
     pub fn list_cells(&self) -> Result<Vec<CellRecord>, StateError> {
-        read_json_directory(&self.root.join("cells"))
+        read_json_directory(&self.root.join("cells"), validate_cell_schema)
     }
 
     #[must_use]
@@ -192,35 +225,42 @@ impl StateStore {
 
     pub fn ensure_cell_runtime(&self, cell_id: CellId) -> Result<PathBuf, StateError> {
         let path = self.cell_runtime_root(cell_id);
-        create_dir_all(&path)?;
+        ensure_directory(&path)?;
+        validate_runtime_chain(&self.root, &path)?;
         Ok(path)
     }
 
-    pub fn remove_cell_runtime(&self, cell_id: CellId) -> Result<(), StateError> {
+    pub(crate) fn remove_cell_runtime(&self, cell_id: CellId) -> Result<(), StateError> {
         let runtime_root = self.root.join("runtime");
         let cell_root = self.cell_runtime_root(cell_id);
         if !cell_root.exists() {
             return Ok(());
         }
 
-        if is_reparse_point(&cell_root)? {
-            return Err(StateError::UnsafeRuntimePath(cell_root));
-        }
+        validate_runtime_chain(&self.root, &cell_root)?;
 
-        let runtime_root = runtime_root
+        let physical_state_root = self
+            .root
+            .canonicalize()
+            .map_err(|source| io_error(&self.root, source))?;
+        let physical_runtime_root = runtime_root
             .canonicalize()
             .map_err(|source| io_error(&runtime_root, source))?;
-        let cell_root = cell_root
+        let physical_cell_root = cell_root
             .canonicalize()
             .map_err(|source| io_error(&cell_root, source))?;
 
-        if cell_root.parent() != Some(runtime_root.as_path()) {
+        if physical_runtime_root.parent() != Some(physical_state_root.as_path())
+            || physical_cell_root.parent() != Some(physical_runtime_root.as_path())
+        {
             return Err(StateError::UnsafeRuntimePath(cell_root));
         }
 
-        ensure_no_reparse_tree(&cell_root)?;
+        ensure_no_reparse_tree(&physical_cell_root)?;
+        validate_runtime_chain(&self.root, &cell_root)?;
 
-        fs::remove_dir_all(&cell_root).map_err(|source| io_error(&cell_root, source))
+        fs::remove_dir_all(&physical_cell_root)
+            .map_err(|source| io_error(&physical_cell_root, source))
     }
 
     fn image_path(&self, image_id: &ImageId) -> PathBuf {
@@ -245,7 +285,10 @@ fn release_process_mutation_root(root: &Path) {
     }
 }
 
-fn read_json_directory<T: DeserializeOwned>(directory: &Path) -> Result<Vec<T>, StateError> {
+fn read_json_directory<T: DeserializeOwned>(
+    directory: &Path,
+    validate: fn(&Path, &T) -> Result<(), StateError>,
+) -> Result<Vec<T>, StateError> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
@@ -260,7 +303,14 @@ fn read_json_directory<T: DeserializeOwned>(directory: &Path) -> Result<Vec<T>, 
             .is_some_and(|extension| extension == "json")
     });
     paths.sort();
-    paths.into_iter().map(|path| read_json(&path)).collect()
+    paths
+        .into_iter()
+        .map(|path| {
+            let value = read_json(&path)?;
+            validate(&path, &value)?;
+            Ok(value)
+        })
+        .collect()
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StateError> {
@@ -289,7 +339,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
     let parent = path
         .parent()
         .ok_or_else(|| StateError::UnsafeRuntimePath(path.to_path_buf()))?;
-    create_dir_all(parent)?;
+    ensure_directory(parent)?;
 
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| StateError::Json {
         path: path.to_path_buf(),
@@ -325,8 +375,74 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
     result
 }
 
-fn create_dir_all(path: &Path) -> Result<(), StateError> {
-    fs::create_dir_all(path).map_err(|source| io_error(path, source))
+fn ensure_directory(path: &Path) -> Result<(), StateError> {
+    ensure_existing_ancestors_are_ordinary(path)?;
+    fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
+    ensure_existing_ancestors_are_ordinary(path)
+}
+
+fn validate_image_schema(path: &Path, record: &ImageRecord) -> Result<(), StateError> {
+    ensure_schema(
+        path,
+        "image record",
+        record.schema_version,
+        IMAGE_SCHEMA_VERSION,
+    )
+}
+
+fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateError> {
+    ensure_schema(
+        path,
+        "cell record",
+        record.schema_version,
+        CELL_SCHEMA_VERSION,
+    )?;
+    ensure_schema(
+        path,
+        "cell ownership",
+        record.ownership.schema_version,
+        OWNERSHIP_MARKER_SCHEMA,
+    )
+}
+
+fn ensure_schema(
+    path: &Path,
+    kind: &'static str,
+    actual: u32,
+    expected: u32,
+) -> Result<(), StateError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(StateError::UnsupportedSchema {
+            kind,
+            path: path.to_path_buf(),
+            expected,
+            actual,
+        })
+    }
+}
+
+fn validate_runtime_chain(state_root: &Path, cell_root: &Path) -> Result<(), StateError> {
+    let runtime_root = state_root.join("runtime");
+    if cell_root.parent() != Some(runtime_root.as_path()) {
+        return Err(StateError::UnsafeRuntimePath(cell_root.to_path_buf()));
+    }
+    ensure_existing_ancestors_are_ordinary(cell_root)
+}
+
+fn ensure_existing_ancestors_are_ordinary(path: &Path) -> Result<(), StateError> {
+    let mut ancestors: Vec<&Path> = path.ancestors().collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        if ancestor.as_os_str().is_empty() || !ancestor.exists() {
+            continue;
+        }
+        if is_reparse_point(ancestor)? {
+            return Err(StateError::UnsafeRuntimePath(ancestor.to_path_buf()));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_no_reparse_tree(path: &Path) -> Result<(), StateError> {
@@ -388,6 +504,18 @@ mod tests {
         let second = store.installation().unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn loading_installation_never_creates_a_replacement() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+
+        assert!(matches!(
+            store.load_installation(),
+            Err(StateError::NotFound(_))
+        ));
+        assert!(!store.root().join("installation.json").exists());
     }
 
     #[test]
@@ -487,5 +615,147 @@ mod tests {
 
         assert!(!store.cell_runtime_root(first).exists());
         assert!(store.cell_runtime_root(second).exists());
+    }
+
+    #[test]
+    fn unsupported_persisted_schemas_are_rejected() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let mut installation = store.installation().unwrap();
+        installation.schema_version += 1;
+        fs::write(
+            store.root().join("installation.json"),
+            serde_json::to_vec(&installation).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_installation(),
+            Err(StateError::UnsupportedSchema {
+                kind: "installation record",
+                ..
+            })
+        ));
+
+        let image_id = ImageId::parse("unsupported-image").unwrap();
+        let image_path = store.image_path(&image_id);
+        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        let image = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION + 1,
+            id: image_id.clone(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        fs::write(&image_path, serde_json::to_vec(&image).unwrap()).unwrap();
+        assert!(matches!(
+            store.load_image(&image_id),
+            Err(StateError::UnsupportedSchema {
+                kind: "image record",
+                ..
+            })
+        ));
+
+        let cell_id = CellId::new();
+        let cell_path = store.cell_path(cell_id);
+        fs::create_dir_all(cell_path.parent().unwrap()).unwrap();
+        let ownership = CellOwnership::new(
+            Uuid::new_v4(),
+            cell_id,
+            Uuid::new_v4(),
+            store.cell_configuration_path(cell_id),
+            store.cell_overlay_path(cell_id),
+        );
+        let mut cell = CellRecord {
+            schema_version: CELL_SCHEMA_VERSION + 1,
+            id: cell_id,
+            provider: "hyperv".to_owned(),
+            spec: CellSpec {
+                image: image_id.clone(),
+                provider: Some("hyperv".to_owned()),
+                cpu_count: 2,
+                memory_mib: 4096,
+                ttl_seconds: None,
+            },
+            image: ImageBinding {
+                image_id,
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: directory.path().join("base.vhdx"),
+                sha256: "abc".to_owned(),
+                file_size: 42,
+            },
+            ownership,
+            provider_object: None,
+            state: CellState::Creating,
+            phase: CellPhase::IntentRecorded,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            expires_at: None,
+            last_error: None,
+        };
+        fs::write(&cell_path, serde_json::to_vec(&cell).unwrap()).unwrap();
+        assert!(matches!(
+            store.load_cell(cell_id),
+            Err(StateError::UnsupportedSchema {
+                kind: "cell record",
+                ..
+            })
+        ));
+
+        cell.schema_version = CELL_SCHEMA_VERSION;
+        cell.ownership.schema_version = OWNERSHIP_MARKER_SCHEMA + 1;
+        fs::write(&cell_path, serde_json::to_vec(&cell).unwrap()).unwrap();
+        assert!(matches!(
+            store.load_cell(cell_id),
+            Err(StateError::UnsupportedSchema {
+                kind: "cell ownership",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn runtime_reparse_ancestor_never_creates_or_deletes_outside_state_root() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let external = directory.path().join("external");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        let runtime = state_root.join("runtime");
+        if create_directory_link(&external, &runtime).is_err() {
+            // Windows may require Developer Mode or symlink privilege.
+            return;
+        }
+
+        let store = StateStore::new(state_root);
+        let cell_id = CellId::new();
+        assert!(matches!(
+            store.ensure_cell_runtime(cell_id),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert!(!external.join(cell_id.0.to_string()).exists());
+
+        let external_cell = external.join(cell_id.0.to_string());
+        fs::create_dir_all(&external_cell).unwrap();
+        fs::write(external_cell.join("foreign"), b"preserve").unwrap();
+        assert!(matches!(
+            store.remove_cell_runtime(cell_id),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(
+            fs::read(external_cell.join("foreign")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(not(windows))]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
     }
 }

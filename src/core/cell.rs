@@ -9,6 +9,8 @@ use uuid::Uuid;
 use super::image::{ImageBinding, ImageId};
 use super::ownership::{CellOwnership, ProviderObjectIdentity};
 
+pub const CELL_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CellId(pub Uuid);
@@ -61,6 +63,7 @@ pub enum CellPhase {
     IntentRecorded,
     OverlayCreated,
     ProviderObjectCreated,
+    ProviderObjectClaimed,
     Ready,
     Destroying,
     Destroyed,

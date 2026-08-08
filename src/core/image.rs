@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const IMAGE_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ImageId(String);
 

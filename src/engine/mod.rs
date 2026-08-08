@@ -8,17 +8,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::core::cell::{CellId, CellPhase, CellRecord, CellSpec, CellState};
-use crate::core::image::{Architecture, GuestOs, ImageBinding, ImageId, ImageRecord, ImageVariant};
+use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState};
+use crate::core::image::{
+    Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
+};
 use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObjectIdentity};
 use crate::providers::{
-    CreateOverlayRequest, CreateVmRequest, LocalVmProvider, ProviderError, ProviderImageInfo,
-    ProviderPowerState, ProviderVm, VmLookup,
+    ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
+    ProviderError, ProviderImageInfo, ProviderPowerState, ProviderVm, VmLookup,
 };
 use crate::state::{StateError, StateStore};
 
-const IMAGE_SCHEMA_VERSION: u32 = 1;
-const CELL_SCHEMA_VERSION: u32 = 1;
 const MIN_MEMORY_MIB: u64 = 512;
 const MAX_MEMORY_MIB: u64 = 1_048_576;
 const MAX_CPU_COUNT: u16 = 64;
@@ -67,6 +67,9 @@ pub enum ReconciliationStatus {
     StateDrift {
         manifest_state: CellState,
         provider_state: ProviderPowerState,
+    },
+    Provisioning {
+        phase: CellPhase,
     },
     Destroyed,
 }
@@ -241,26 +244,39 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.state.save_cell(&record)?;
         drop(parent_handle);
 
-        let provider_vm = match self.provider.create_vm(&CreateVmRequest {
+        let provider_identity = match self.provider.create_vm(&CreateVmRequest {
             name: record.ownership.provider_object_name.clone(),
             configuration_path: record.ownership.configuration_path.clone(),
             overlay_path: record.ownership.overlay_path.clone(),
-            ownership_marker: record.ownership.provider_marker.clone(),
-            cpu_count: record.spec.cpu_count,
             memory_mib: record.spec.memory_mib,
         }) {
-            Ok(provider_vm) => provider_vm,
+            Ok(provider_identity) => provider_identity,
             Err(error) => return self.fail_record(record, error.into()),
         };
         record.provider_object = Some(ProviderObjectIdentity {
-            id: provider_vm.id.clone(),
-            name: provider_vm.name.clone(),
+            id: provider_identity.id.clone(),
+            name: provider_identity.name.clone(),
         });
         record.phase = CellPhase::ProviderObjectCreated;
         record.updated_at = Utc::now();
         self.state.save_cell(&record)?;
 
-        if let Err(error) = prove_ownership(&record, &provider_vm) {
+        let provider_vm = match self
+            .provider
+            .inspect_vm(&VmLookup::Id(provider_identity.id.clone()))?
+        {
+            Some(provider_vm) => provider_vm,
+            None => {
+                return self.fail_record(
+                    record,
+                    EngineError::ProviderDrift(
+                        "new provider object disappeared after its id was persisted".to_owned(),
+                    ),
+                );
+            }
+        };
+
+        if let Err(error) = prove_creation_identity(&record, &provider_vm, false) {
             return self.fail_record(record, error);
         }
         if provider_vm.power_state != ProviderPowerState::Off {
@@ -268,6 +284,31 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 record,
                 EngineError::UnexpectedPowerState(provider_vm.power_state),
             );
+        }
+
+        let claimed_vm = match self.provider.claim_vm(&ClaimVmRequest {
+            expected: provider_vm,
+            ownership_marker: record.ownership.provider_marker.clone(),
+        }) {
+            Ok(provider_vm) => provider_vm,
+            Err(error) => return self.fail_record(record, error.into()),
+        };
+        if let Err(error) = prove_creation_identity(&record, &claimed_vm, true) {
+            return self.fail_record(record, error);
+        }
+        record.phase = CellPhase::ProviderObjectClaimed;
+        record.updated_at = Utc::now();
+        self.state.save_cell(&record)?;
+
+        let provider_vm = match self.provider.configure_vm(&ConfigureVmRequest {
+            expected: claimed_vm,
+            cpu_count: record.spec.cpu_count,
+        }) {
+            Ok(provider_vm) => provider_vm,
+            Err(error) => return self.fail_record(record, error.into()),
+        };
+        if let Err(error) = prove_ownership(&record, &provider_vm) {
+            return self.fail_record(record, error);
         }
 
         record.state = CellState::Stopped;
@@ -307,7 +348,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 Ok(operation_report(&record, changed))
             }
             ProviderPowerState::Off if record.state != CellState::Destroyed => {
-                self.provider.start_vm(&before.id)?;
+                self.validate_local_ownership(&record)?;
+                self.provider.start_vm(&before)?;
                 let after = self.exact_owned_vm(&record)?;
                 if after.power_state != ProviderPowerState::Running {
                     return Err(EngineError::UnexpectedPowerState(after.power_state));
@@ -337,7 +379,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 Ok(operation_report(&record, changed))
             }
             ProviderPowerState::Running => {
-                self.provider.stop_vm(&before.id)?;
+                self.validate_local_ownership(&record)?;
+                self.provider.stop_vm(&before)?;
                 let after = self.exact_owned_vm(&record)?;
                 if after.power_state != ProviderPowerState::Off {
                     return Err(EngineError::UnexpectedPowerState(after.power_state));
@@ -391,7 +434,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
             self.state.save_cell(&record)?;
 
             if vm.power_state != ProviderPowerState::Off {
-                self.provider.stop_vm(&vm.id)?;
+                self.validate_local_ownership(&record)?;
+                self.provider.stop_vm(&vm)?;
                 vm = self
                     .provider
                     .inspect_vm(&VmLookup::Id(vm.id.clone()))?
@@ -405,7 +449,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     return Err(EngineError::UnexpectedPowerState(vm.power_state));
                 }
             }
-            self.provider.remove_vm(&vm.id)?;
+            self.validate_local_ownership(&record)?;
+            self.provider.remove_vm(&vm)?;
             if self
                 .provider
                 .inspect_vm(&VmLookup::Id(vm.id.clone()))?
@@ -427,6 +472,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             }
         }
 
+        self.validate_local_ownership(&record)?;
         self.state.remove_cell_runtime(cell_id)?;
         record.state = CellState::Destroyed;
         record.phase = CellPhase::Destroyed;
@@ -544,6 +590,24 @@ impl<P: LocalVmProvider> CellEngine<P> {
             return Ok((None, ReconciliationStatus::ProviderMissing));
         };
         let reasons = ownership_drift(record, &vm);
+        if matches!(
+            record.phase,
+            CellPhase::ProviderObjectCreated | CellPhase::ProviderObjectClaimed
+        ) && prove_creation_identity(
+            record,
+            &vm,
+            record.phase == CellPhase::ProviderObjectClaimed
+                || vm.ownership_marker == record.ownership.provider_marker,
+        )
+        .is_ok()
+        {
+            return Ok((
+                Some(vm),
+                ReconciliationStatus::Provisioning {
+                    phase: record.phase,
+                },
+            ));
+        }
         if !reasons.is_empty() {
             return Ok((
                 Some(vm),
@@ -563,6 +627,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
     }
 
     fn validate_local_ownership(&self, record: &CellRecord) -> Result<(), EngineError> {
+        let installation = self.state.load_installation()?;
+        if record.ownership.install_id != installation.install_id {
+            return Err(EngineError::OwnershipNotProven(
+                "cell installation identity does not match the current state store".to_owned(),
+            ));
+        }
         if record.provider != "hyperv"
             || record.spec.provider.as_deref() != Some("hyperv")
             || record.image.provider != "hyperv"
@@ -767,6 +837,51 @@ fn prove_ownership(record: &CellRecord, vm: &ProviderVm) -> Result<(), EngineErr
     }
 }
 
+fn prove_creation_identity(
+    record: &CellRecord,
+    vm: &ProviderVm,
+    require_marker: bool,
+) -> Result<(), EngineError> {
+    let mut reasons = Vec::new();
+    match &record.provider_object {
+        Some(identity) if identity.id != vm.id => reasons.push("provider id mismatch"),
+        Some(identity) if identity.name != vm.name => reasons.push("recorded name mismatch"),
+        None => reasons.push("provider id is not recorded"),
+        _ => {}
+    }
+    if vm.name != record.ownership.provider_object_name {
+        reasons.push("ownership name mismatch");
+    }
+    if require_marker && vm.ownership_marker != record.ownership.provider_marker {
+        reasons.push("ownership marker mismatch");
+    }
+    if !require_marker
+        && !vm.ownership_marker.is_empty()
+        && vm.ownership_marker != record.ownership.provider_marker
+    {
+        reasons.push("unexpected ownership marker");
+    }
+    if !paths_equal(&vm.configuration_path, &record.ownership.configuration_path) {
+        reasons.push("configuration path mismatch");
+    }
+    if vm.attached_disks.len() != 1
+        || !paths_equal(&vm.attached_disks[0], &record.ownership.overlay_path)
+    {
+        reasons.push("attached disk mismatch");
+    }
+    if vm.memory_mib != record.spec.memory_mib {
+        reasons.push("memory configuration mismatch");
+    }
+    if vm.power_state != ProviderPowerState::Off {
+        reasons.push("new provider object is not off");
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::OwnershipNotProven(reasons.join("; ")))
+    }
+}
+
 fn ownership_drift(record: &CellRecord, vm: &ProviderVm) -> Vec<String> {
     let mut reasons = Vec::new();
     match &record.provider_object {
@@ -849,14 +964,29 @@ fn operation_report(record: &CellRecord, changed: bool) -> OperationReport {
 fn paths_equal(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+        windows_path_identity(left).eq_ignore_ascii_case(&windows_path_identity(right))
     }
     #[cfg(not(windows))]
     {
         left == right
     }
+}
+
+#[cfg(windows)]
+fn windows_path_identity(path: &Path) -> String {
+    let mut value = path.to_string_lossy().replace('/', "\\");
+    if value
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        value = format!(r"\\{}", &value[8..]);
+    } else if value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
+    {
+        value = value[4..].to_owned();
+    }
+    value.trim_end_matches('\\').to_owned()
 }
 
 #[cfg(windows)]
@@ -880,17 +1010,46 @@ mod tests {
 
     use super::*;
     use crate::core::capability::ProviderCapabilities;
-    use crate::providers::ProviderProbe;
+    use crate::providers::{ProviderProbe, ProviderVmIdentity};
+
+    #[cfg(windows)]
+    fn alternate_windows_path(path: &Path) -> PathBuf {
+        let value = path.to_string_lossy().replace('/', "\\");
+        if value
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+        {
+            PathBuf::from(format!(r"\\{}", &value[8..]))
+        } else if value
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
+        {
+            PathBuf::from(&value[4..])
+        } else if let Some(rest) = value.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{rest}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{value}"))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn alternate_windows_path(path: &Path) -> PathBuf {
+        path.to_path_buf()
+    }
 
     #[derive(Debug, Default)]
     struct MockState {
         vm: Option<ProviderVm>,
         calls: Vec<&'static str>,
         remove_calls: usize,
+        drift_before_mutation: bool,
+        fail_claim: bool,
+        fail_configure: bool,
     }
 
     struct MockHyperV {
         base_size: u64,
+        use_path_aliases: bool,
         state: Mutex<MockState>,
     }
 
@@ -899,7 +1058,23 @@ mod tests {
             let base_size = fs::metadata(&base_path).unwrap().len();
             Self {
                 base_size,
+                use_path_aliases: false,
                 state: Mutex::new(MockState::default()),
+            }
+        }
+
+        #[cfg(windows)]
+        fn with_path_aliases(base_path: PathBuf) -> Self {
+            let mut provider = Self::new(base_path);
+            provider.use_path_aliases = true;
+            provider
+        }
+
+        fn provider_path(&self, path: &Path) -> PathBuf {
+            if self.use_path_aliases {
+                alternate_windows_path(path)
+            } else {
+                path.to_path_buf()
             }
         }
 
@@ -911,6 +1086,10 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .ownership_marker = "foreign".to_owned();
+        }
+
+        fn drift_before_mutation(&self) {
+            self.state.lock().unwrap().drift_before_mutation = true;
         }
     }
 
@@ -931,7 +1110,7 @@ mod tests {
         fn inspect_image(&self, path: PathBuf) -> Result<ProviderImageInfo, ProviderError> {
             self.state.lock().unwrap().calls.push("inspect_image");
             Ok(ProviderImageInfo {
-                path,
+                path: self.provider_path(&path),
                 disk_format: "vhdx".to_owned(),
                 disk_type: "dynamic".to_owned(),
                 parent_path: None,
@@ -947,31 +1126,72 @@ mod tests {
             self.state.lock().unwrap().calls.push("create_overlay");
             fs::write(&request.overlay_path, b"overlay").unwrap();
             Ok(ProviderImageInfo {
-                path: request.overlay_path.clone(),
+                path: self.provider_path(&request.overlay_path),
                 disk_format: "vhdx".to_owned(),
                 disk_type: "differencing".to_owned(),
-                parent_path: Some(request.parent_path.clone()),
+                parent_path: Some(self.provider_path(&request.parent_path)),
                 file_size: 7,
                 virtual_size: 1024 * 1024,
             })
         }
 
-        fn create_vm(&self, request: &CreateVmRequest) -> Result<ProviderVm, ProviderError> {
+        fn create_vm(
+            &self,
+            request: &CreateVmRequest,
+        ) -> Result<ProviderVmIdentity, ProviderError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push("create_vm");
             let vm = ProviderVm {
                 id: Uuid::new_v4().to_string(),
                 name: request.name.clone(),
                 power_state: ProviderPowerState::Off,
-                ownership_marker: request.ownership_marker.clone(),
-                configuration_path: request.configuration_path.clone(),
-                attached_disks: vec![request.overlay_path.clone()],
-                network_adapter_count: 0,
-                cpu_count: request.cpu_count,
+                ownership_marker: String::new(),
+                configuration_path: self.provider_path(&request.configuration_path),
+                attached_disks: vec![self.provider_path(&request.overlay_path)],
+                network_adapter_count: 1,
+                cpu_count: 1,
                 memory_mib: request.memory_mib,
             };
             state.vm = Some(vm.clone());
-            Ok(vm)
+            Ok(ProviderVmIdentity {
+                id: vm.id,
+                name: vm.name,
+            })
+        }
+
+        fn claim_vm(&self, request: &ClaimVmRequest) -> Result<ProviderVm, ProviderError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("claim_vm");
+            if state.fail_claim {
+                return Err(ProviderError::Command("injected claim failure".to_owned()));
+            }
+            if state.vm.as_ref() != Some(&request.expected) {
+                return Err(ProviderError::OwnershipChanged(
+                    "creation receipt changed".to_owned(),
+                ));
+            }
+            let vm = state.vm.as_mut().unwrap();
+            vm.ownership_marker = request.ownership_marker.clone();
+            Ok(vm.clone())
+        }
+
+        fn configure_vm(&self, request: &ConfigureVmRequest) -> Result<ProviderVm, ProviderError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("configure_vm");
+            if state.fail_configure {
+                return Err(ProviderError::Command(
+                    "injected configure failure".to_owned(),
+                ));
+            }
+            if state.vm.as_ref() != Some(&request.expected) {
+                return Err(ProviderError::OwnershipChanged(
+                    "claimed VM changed".to_owned(),
+                ));
+            }
+            let vm = state.vm.as_mut().unwrap();
+            vm.network_adapter_count = 0;
+            vm.cpu_count = request.cpu_count;
+            Ok(vm.clone())
         }
 
         fn inspect_vm(&self, lookup: &VmLookup) -> Result<Option<ProviderVm>, ProviderError> {
@@ -983,33 +1203,57 @@ mod tests {
             }))
         }
 
-        fn start_vm(&self, id: &str) -> Result<(), ProviderError> {
+        fn start_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push("start_vm");
+            if state.drift_before_mutation {
+                state.vm.as_mut().unwrap().ownership_marker = "foreign-race".to_owned();
+                state.drift_before_mutation = false;
+            }
+            if state.vm.as_ref() != Some(expected) {
+                return Err(ProviderError::OwnershipChanged(
+                    "VM changed before start".to_owned(),
+                ));
+            }
             let vm = state
                 .vm
                 .as_mut()
-                .ok_or_else(|| ProviderError::NotFound(id.to_owned()))?;
+                .ok_or_else(|| ProviderError::NotFound(expected.id.clone()))?;
             vm.power_state = ProviderPowerState::Running;
             Ok(())
         }
 
-        fn stop_vm(&self, id: &str) -> Result<(), ProviderError> {
+        fn stop_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push("stop_vm");
+            if state.drift_before_mutation {
+                state.vm.as_mut().unwrap().ownership_marker = "foreign-race".to_owned();
+                state.drift_before_mutation = false;
+            }
+            if state.vm.as_ref() != Some(expected) {
+                return Err(ProviderError::OwnershipChanged(
+                    "VM changed before stop".to_owned(),
+                ));
+            }
             let vm = state
                 .vm
                 .as_mut()
-                .ok_or_else(|| ProviderError::NotFound(id.to_owned()))?;
+                .ok_or_else(|| ProviderError::NotFound(expected.id.clone()))?;
             vm.power_state = ProviderPowerState::Off;
             Ok(())
         }
 
-        fn remove_vm(&self, id: &str) -> Result<(), ProviderError> {
+        fn remove_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push("remove_vm");
-            if state.vm.as_ref().is_none_or(|vm| vm.id != id) {
-                return Err(ProviderError::NotFound(id.to_owned()));
+            if state.drift_before_mutation {
+                state.vm.as_mut().unwrap().ownership_marker = "foreign-race".to_owned();
+                state.drift_before_mutation = false;
+            }
+            if state.vm.as_ref() != Some(expected) {
+                return Err(ProviderError::OwnershipChanged(
+                    "VM changed before remove".to_owned(),
+                ));
             }
             state.remove_calls += 1;
             state.vm = None;
@@ -1129,6 +1373,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_id_persistence_crash_window_remains_name_only_fail_closed() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let mut interrupted = engine.state.load_cell(cell.id).unwrap();
+        interrupted.provider_object = None;
+        interrupted.phase = CellPhase::OverlayCreated;
+        interrupted.state = CellState::Failed;
+        engine.state.save_cell(&interrupted).unwrap();
+
+        let inspection = engine.reconcile_cell(cell.id).unwrap();
+        assert!(matches!(
+            inspection.reconciliation,
+            ReconciliationStatus::UnprovenProviderObject { .. }
+        ));
+        assert!(matches!(
+            engine.destroy_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 0);
+        assert!(engine.state.cell_runtime_root(cell.id).exists());
+    }
+
+    #[test]
     fn tampered_runtime_path_blocks_start_before_provider_mutation() {
         let (directory, engine, image_id) = fixture();
         let cell = engine.create_cell(spec(image_id)).unwrap();
@@ -1182,6 +1449,272 @@ mod tests {
                 .unwrap()
                 .calls
                 .contains(&"create_overlay")
+        );
+    }
+
+    #[test]
+    fn installation_rotation_blocks_all_cell_authority_before_provider_access() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+        let replacement = crate::state::InstallationRecord {
+            schema_version: crate::state::INSTALL_SCHEMA_VERSION,
+            install_id: Uuid::new_v4(),
+        };
+        fs::write(
+            engine.state.root().join("installation.json"),
+            serde_json::to_vec(&replacement).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            engine.start_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert!(matches!(
+            engine.stop_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert!(matches!(
+            engine.destroy_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        let inspection = engine.reconcile_cell(cell.id).unwrap();
+        assert!(matches!(
+            inspection.reconciliation,
+            ReconciliationStatus::OwnershipMismatch { .. }
+        ));
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+        assert!(engine.state.cell_runtime_root(cell.id).exists());
+    }
+
+    #[test]
+    fn missing_installation_blocks_destroy_and_runtime_deletion() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+        fs::remove_file(engine.state.root().join("installation.json")).unwrap();
+
+        assert!(matches!(
+            engine.destroy_cell(cell.id),
+            Err(EngineError::State(StateError::NotFound(_)))
+        ));
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+        assert!(engine.state.cell_runtime_root(cell.id).exists());
+        assert!(!engine.state.root().join("installation.json").exists());
+    }
+
+    #[test]
+    fn cell_schema_drift_is_rejected_before_provider_access() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let mut record = engine.state.load_cell(cell.id).unwrap();
+        record.schema_version += 1;
+        let path = engine
+            .state
+            .root()
+            .join("cells")
+            .join(format!("{}.json", cell.id.0));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+
+        assert!(matches!(
+            engine.start_cell(cell.id),
+            Err(EngineError::State(StateError::UnsupportedSchema {
+                kind: "cell record",
+                ..
+            }))
+        ));
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+
+        record.schema_version = CELL_SCHEMA_VERSION;
+        record.ownership.schema_version += 1;
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(matches!(
+            engine.destroy_cell(cell.id),
+            Err(EngineError::State(StateError::UnsupportedSchema {
+                kind: "cell ownership",
+                ..
+            }))
+        ));
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+    }
+
+    #[test]
+    fn image_schema_drift_is_rejected_before_overlay_creation() {
+        let (_directory, engine, image_id) = fixture();
+        let mut image = engine.state.load_image(&image_id).unwrap();
+        image.schema_version += 1;
+        let path = engine
+            .state
+            .root()
+            .join("images")
+            .join(format!("{}.json", image_id.as_str()));
+        fs::write(&path, serde_json::to_vec(&image).unwrap()).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+
+        assert!(matches!(
+            engine.create_cell(spec(image_id)),
+            Err(EngineError::State(StateError::UnsupportedSchema {
+                kind: "image record",
+                ..
+            }))
+        ));
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+    }
+
+    #[test]
+    fn provider_action_envelope_rejects_race_drift_before_mutation() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        engine.provider.drift_before_mutation();
+
+        assert!(matches!(
+            engine.start_cell(cell.id),
+            Err(EngineError::Provider(ProviderError::OwnershipChanged(_)))
+        ));
+        assert_eq!(
+            engine
+                .provider
+                .state
+                .lock()
+                .unwrap()
+                .vm
+                .as_ref()
+                .unwrap()
+                .power_state,
+            ProviderPowerState::Off
+        );
+    }
+
+    #[test]
+    fn stop_action_envelope_rejects_race_drift_before_mutation() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        engine.start_cell(cell.id).unwrap();
+        engine.provider.drift_before_mutation();
+
+        assert!(matches!(
+            engine.stop_cell(cell.id),
+            Err(EngineError::Provider(ProviderError::OwnershipChanged(_)))
+        ));
+        assert_eq!(
+            engine
+                .provider
+                .state
+                .lock()
+                .unwrap()
+                .vm
+                .as_ref()
+                .unwrap()
+                .power_state,
+            ProviderPowerState::Running
+        );
+    }
+
+    #[test]
+    fn remove_action_envelope_rejects_race_drift_before_mutation() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        engine.provider.drift_before_mutation();
+
+        assert!(matches!(
+            engine.destroy_cell(cell.id),
+            Err(EngineError::Provider(ProviderError::OwnershipChanged(_)))
+        ));
+        let provider = engine.provider.state.lock().unwrap();
+        assert!(provider.vm.is_some());
+        assert_eq!(provider.remove_calls, 0);
+        assert!(engine.state.cell_runtime_root(cell.id).exists());
+    }
+
+    #[test]
+    fn provider_id_is_persisted_before_claim_failure() {
+        let (_directory, engine, image_id) = fixture();
+        engine.provider.state.lock().unwrap().fail_claim = true;
+
+        assert!(engine.create_cell(spec(image_id)).is_err());
+        let cell = engine.state.list_cells().unwrap().pop().unwrap();
+        assert_eq!(cell.phase, CellPhase::ProviderObjectCreated);
+        assert!(cell.provider_object.is_some());
+        let inspection = engine.reconcile_cell(cell.id).unwrap();
+        assert!(matches!(
+            inspection.reconciliation,
+            ReconciliationStatus::Provisioning {
+                phase: CellPhase::ProviderObjectCreated
+            }
+        ));
+        assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 0);
+    }
+
+    #[test]
+    fn claimed_partial_configuration_is_deterministically_reconciled() {
+        let (_directory, engine, image_id) = fixture();
+        engine.provider.state.lock().unwrap().fail_configure = true;
+
+        assert!(engine.create_cell(spec(image_id)).is_err());
+        let cell = engine.state.list_cells().unwrap().pop().unwrap();
+        assert_eq!(cell.phase, CellPhase::ProviderObjectClaimed);
+        assert!(cell.provider_object.is_some());
+        let inspection = engine.reconcile_cell(cell.id).unwrap();
+        assert!(matches!(
+            inspection.reconciliation,
+            ReconciliationStatus::Provisioning {
+                phase: CellPhase::ProviderObjectClaimed
+            }
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_and_ordinary_paths_share_one_identity() {
+        assert!(paths_equal(
+            Path::new(r"C:\vmcell\base.vhdx"),
+            Path::new(r"\\?\C:\vmcell\base.vhdx")
+        ));
+        assert!(paths_equal(
+            Path::new(r"\\server\share\base.vhdx"),
+            Path::new(r"\\?\UNC\server\share\base.vhdx")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_path_aliases_reconcile_as_exact_identity() {
+        let directory = tempdir().unwrap();
+        let base_path = directory.path().join("base.vhdx");
+        fs::write(&base_path, b"immutable base").unwrap();
+        let provider = MockHyperV::with_path_aliases(base_path.clone());
+        let engine = CellEngine::new(StateStore::new(directory.path().join("state")), provider);
+        let image_id = ImageId::parse("windows-alias").unwrap();
+        engine
+            .register_image(RegisterImageRequest {
+                id: image_id.clone(),
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                path: base_path,
+            })
+            .unwrap();
+
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        assert_eq!(
+            engine.reconcile_cell(cell.id).unwrap().reconciliation,
+            ReconciliationStatus::ExactOwned
         );
     }
 }

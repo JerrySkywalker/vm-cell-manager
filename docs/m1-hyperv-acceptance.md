@@ -7,6 +7,7 @@ Implementation does not authorize real Hyper-V mutation. Real acceptance require
 - exact feature-branch SHA and clean checkout;
 - dedicated integration identity and isolated state/runtime root;
 - disposable ordinary non-reparse base VHDX with recorded SHA-256;
+- ordinary non-reparse state/runtime ancestry with physical containment recorded;
 - no VM or switch name collision;
 - inventory of foreign VMs and switches captured read-only;
 - explicit operator authorization for this exact run.
@@ -22,3 +23,5 @@ Implementation does not authorize real Hyper-V mutation. Real acceptance require
 7. verify the base hash, foreign VM inventory, host features, and switch inventory are unchanged.
 
 Any ownership mismatch, unexpected provider object, image drift, extra disk, network adapter, or state ambiguity is a terminal fail-closed result. The acceptance process must not adopt, repair, or delete ambiguous provider state.
+
+Acceptance also verifies that provider-side start, stop, and remove preconditions reject an injected expected-state mismatch before the Hyper-V verb. A deliberately interrupted create may only be cleaned automatically after its provider id and complete ownership proof are durable; name-only or pre-marker objects require operator quarantine and remain outside automatic mutation authority.

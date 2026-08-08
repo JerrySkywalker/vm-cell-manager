@@ -29,10 +29,24 @@ pub trait LocalVmProvider: Send + Sync {
         })
     }
 
-    fn create_vm(&self, _request: &CreateVmRequest) -> Result<ProviderVm, ProviderError> {
+    fn create_vm(&self, _request: &CreateVmRequest) -> Result<ProviderVmIdentity, ProviderError> {
         Err(ProviderError::Unsupported {
             provider: self.name(),
             operation: "create_vm",
+        })
+    }
+
+    fn claim_vm(&self, _request: &ClaimVmRequest) -> Result<ProviderVm, ProviderError> {
+        Err(ProviderError::Unsupported {
+            provider: self.name(),
+            operation: "claim_vm",
+        })
+    }
+
+    fn configure_vm(&self, _request: &ConfigureVmRequest) -> Result<ProviderVm, ProviderError> {
+        Err(ProviderError::Unsupported {
+            provider: self.name(),
+            operation: "configure_vm",
         })
     }
 
@@ -43,21 +57,21 @@ pub trait LocalVmProvider: Send + Sync {
         })
     }
 
-    fn start_vm(&self, _id: &str) -> Result<(), ProviderError> {
+    fn start_vm(&self, _expected: &ProviderVm) -> Result<(), ProviderError> {
         Err(ProviderError::Unsupported {
             provider: self.name(),
             operation: "start_vm",
         })
     }
 
-    fn stop_vm(&self, _id: &str) -> Result<(), ProviderError> {
+    fn stop_vm(&self, _expected: &ProviderVm) -> Result<(), ProviderError> {
         Err(ProviderError::Unsupported {
             provider: self.name(),
             operation: "stop_vm",
         })
     }
 
-    fn remove_vm(&self, _id: &str) -> Result<(), ProviderError> {
+    fn remove_vm(&self, _expected: &ProviderVm) -> Result<(), ProviderError> {
         Err(ProviderError::Unsupported {
             provider: self.name(),
             operation: "remove_vm",
@@ -94,9 +108,25 @@ pub struct CreateVmRequest {
     pub name: String,
     pub configuration_path: PathBuf,
     pub overlay_path: PathBuf,
-    pub ownership_marker: String,
-    pub cpu_count: u16,
     pub memory_mib: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimVmRequest {
+    pub expected: ProviderVm,
+    pub ownership_marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureVmRequest {
+    pub expected: ProviderVm,
+    pub cpu_count: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderVmIdentity {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +209,9 @@ pub enum ProviderError {
 
     #[error("provider object collision: {0}")]
     Collision(String),
+
+    #[error("provider ownership precondition changed: {0}")]
+    OwnershipChanged(String),
 }
 
 #[must_use]

@@ -78,10 +78,16 @@ write durable Creating ownership intent
 create exactly one writable overlay
    │
    ▼
-provider creates a networkless VM with marker
+provider creates the smallest VM object and returns its immutable id
    │
    ▼
-record provider id and reconcile ownership
+record provider id durably
+   │
+   ▼
+claim by id, then configure networkless CPU state
+   │
+   ▼
+reconcile complete ownership
    │
    ▼
 Cell = stopped/ready
@@ -118,7 +124,11 @@ A cell mutation should require both:
 1. a local manifest proving `vmcell` ownership; and
 2. provider identity that still matches the manifest.
 
-M1 makes that rule concrete: a generated installation id, CellId, operation id, provider VM id, provider marker, configuration path, and single attached overlay are checked before start, stop, or destroy. Provider drift is reported without automatic adoption or repair.
+M1 makes that rule concrete: the current persisted installation id, CellId, operation id, provider VM id, provider marker, configuration path, and single attached overlay are checked before start, stop, or destroy. Privileged provider verbs receive the already-proven provider snapshot and revalidate it immediately before mutation. Provider drift is reported without automatic adoption or repair.
+
+Persisted installation, image, cell, and ownership schemas are rejected when their versions are unsupported. A missing installation identity is never recreated by a lifecycle authorization path.
+
+On Windows, path identity treats ordinary drive and UNC paths as equivalent to their verbatim `\\?\` forms for provider reconciliation. This alias normalization is not used for containment: state and runtime creation/deletion separately reject reparse points throughout the existing ancestor chain and require the physical CellId directory to be a direct child of the physical runtime root.
 
 The state store is not intended to become a distributed database. If multi-host scheduling is required, it belongs above this project.
 

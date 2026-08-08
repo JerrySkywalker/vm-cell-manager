@@ -6,8 +6,8 @@ use serde::Deserialize;
 
 use crate::core::capability::ProviderCapabilities;
 use crate::providers::{
-    CreateOverlayRequest, CreateVmRequest, LocalVmProvider, ProviderError, ProviderImageInfo,
-    ProviderProbe, ProviderVm, VmLookup,
+    ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
+    ProviderError, ProviderImageInfo, ProviderProbe, ProviderVm, ProviderVmIdentity, VmLookup,
 };
 
 pub use executor::{HyperVAction, HyperVCommandExecutor, PowerShellHyperVExecutor};
@@ -106,8 +106,20 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
         })
     }
 
-    fn create_vm(&self, request: &CreateVmRequest) -> Result<ProviderVm, ProviderError> {
+    fn create_vm(&self, request: &CreateVmRequest) -> Result<ProviderVmIdentity, ProviderError> {
         self.execute(HyperVAction::CreateVm {
+            request: request.clone(),
+        })
+    }
+
+    fn claim_vm(&self, request: &ClaimVmRequest) -> Result<ProviderVm, ProviderError> {
+        self.execute(HyperVAction::ClaimVm {
+            request: request.clone(),
+        })
+    }
+
+    fn configure_vm(&self, request: &ConfigureVmRequest) -> Result<ProviderVm, ProviderError> {
+        self.execute(HyperVAction::ConfigureVm {
             request: request.clone(),
         })
     }
@@ -119,18 +131,24 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
         Ok(response.vm)
     }
 
-    fn start_vm(&self, id: &str) -> Result<(), ProviderError> {
-        let _: EmptyResponse = self.execute(HyperVAction::StartVm { id: id.to_owned() })?;
+    fn start_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
+        let _: EmptyResponse = self.execute(HyperVAction::StartVm {
+            expected: expected.clone(),
+        })?;
         Ok(())
     }
 
-    fn stop_vm(&self, id: &str) -> Result<(), ProviderError> {
-        let _: EmptyResponse = self.execute(HyperVAction::StopVm { id: id.to_owned() })?;
+    fn stop_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
+        let _: EmptyResponse = self.execute(HyperVAction::StopVm {
+            expected: expected.clone(),
+        })?;
         Ok(())
     }
 
-    fn remove_vm(&self, id: &str) -> Result<(), ProviderError> {
-        let _: EmptyResponse = self.execute(HyperVAction::RemoveVm { id: id.to_owned() })?;
+    fn remove_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
+        let _: EmptyResponse = self.execute(HyperVAction::RemoveVm {
+            expected: expected.clone(),
+        })?;
         Ok(())
     }
 }
@@ -159,8 +177,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::providers::ProviderPowerState;
-
     struct RecordingExecutor {
         actions: Mutex<Vec<HyperVAction>>,
         response: serde_json::Value,
@@ -179,14 +195,7 @@ mod tests {
             actions: Mutex::new(Vec::new()),
             response: json!({
                 "id": "11111111-1111-1111-1111-111111111111",
-                "name": "vmcell-test",
-                "power_state": "off",
-                "ownership_marker": "vmcell:v1:test",
-                "configuration_path": "C:\\vmcell\\config",
-                "attached_disks": ["C:\\vmcell\\cell.vhdx"],
-                "network_adapter_count": 0,
-                "cpu_count": 2,
-                "memory_mib": 4096
+                "name": "vmcell-test"
             }),
         };
         let provider = HyperVProvider::new(executor);
@@ -194,14 +203,12 @@ mod tests {
             name: "vmcell-test".to_owned(),
             configuration_path: PathBuf::from(r"C:\vmcell\config"),
             overlay_path: PathBuf::from(r"C:\vmcell\cell.vhdx"),
-            ownership_marker: "vmcell:v1:test".to_owned(),
-            cpu_count: 2,
             memory_mib: 4096,
         };
 
-        let vm = provider.create_vm(&request).unwrap();
+        let identity = provider.create_vm(&request).unwrap();
 
-        assert_eq!(vm.power_state, ProviderPowerState::Off);
+        assert_eq!(identity.name, "vmcell-test");
         assert_eq!(
             provider.executor.actions.lock().unwrap().as_slice(),
             &[HyperVAction::CreateVm { request }]

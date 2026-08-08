@@ -87,12 +87,25 @@ fn probe_qemu() -> ProviderProbe {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
-    use crate::providers::ProviderError;
+    use crate::providers::{ProviderError, ProviderPowerState, ProviderVm};
 
     #[test]
     fn m1_qemu_mutation_is_explicitly_unsupported() {
-        let error = QemuProvider.start_vm("not-a-qemu-object").unwrap_err();
+        let expected = ProviderVm {
+            id: "not-a-qemu-object".to_owned(),
+            name: "not-a-qemu-object".to_owned(),
+            power_state: ProviderPowerState::Off,
+            ownership_marker: String::new(),
+            configuration_path: PathBuf::new(),
+            attached_disks: Vec::new(),
+            network_adapter_count: 0,
+            cpu_count: 1,
+            memory_mib: 512,
+        };
+        let error = QemuProvider.start_vm(&expected).unwrap_err();
         assert!(matches!(
             error,
             ProviderError::Unsupported {
