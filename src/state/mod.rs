@@ -450,9 +450,13 @@ fn read_json_directory<T: DeserializeOwned>(
     directory: &Path,
     validate: fn(&Path, &T) -> Result<(), StateError>,
 ) -> Result<Vec<T>, StateError> {
-    if !directory.exists() {
-        return Ok(Vec::new());
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !is_reparse_point(directory)? => {}
+        Ok(_) => return Err(StateError::UnsafeRuntimePath(directory.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(io_error(directory, source)),
     }
+    let _directory_handle = open_ordinary_directory(directory)?;
 
     let mut paths = fs::read_dir(directory)
         .map_err(|source| io_error(directory, source))?
@@ -935,6 +939,24 @@ mod tests {
         ));
         assert!(matches!(
             store.acquire_installation_authority(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+    }
+
+    #[test]
+    fn state_list_directory_reparse_is_never_followed() {
+        let directory = tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let external = directory.path().join("external-images");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        if create_directory_link(&external, &state_root.join("images")).is_err() {
+            return;
+        }
+
+        let store = StateStore::new(state_root);
+        assert!(matches!(
+            store.list_images(),
             Err(StateError::UnsafeRuntimePath(_))
         ));
     }

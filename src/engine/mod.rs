@@ -16,7 +16,7 @@ use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObj
 use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
     ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderPowerState, ProviderVm,
-    VmLookup,
+    ProviderVmIdentity, VmLookup,
 };
 use crate::state::{InstallationAuthority, StateError, StateStore};
 
@@ -198,7 +198,6 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         let cell_id = CellId::new();
-        let runtime_authority = self.state.prepare_cell_runtime(cell_id)?;
         let now = Utc::now();
         let ownership = CellOwnership::new(
             installation.install_id,
@@ -226,6 +225,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
             last_error: None,
         };
         self.state.save_cell(&record)?;
+        let runtime_authority = match self.state.prepare_cell_runtime(cell_id) {
+            Ok(runtime) => runtime,
+            Err(error) => return self.fail_record(record, error.into()),
+        };
 
         if let Some(existing) = self.provider.inspect_vm(&VmLookup::Name(
             record.ownership.provider_object_name.clone(),
@@ -269,6 +272,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
             Ok(provider_identity) => provider_identity,
             Err(error) => return self.fail_record(record, error.into()),
         };
+        if let Err(error) = validate_provider_identity(&record, &provider_identity) {
+            return self.fail_record(record, error);
+        }
         record.provider_object = Some(ProviderObjectIdentity {
             id: provider_identity.id.clone(),
             name: provider_identity.name.clone(),
@@ -1010,6 +1016,23 @@ fn validate_overlay(record: &CellRecord, info: &ProviderImageInfo) -> Result<(),
     Ok(())
 }
 
+fn validate_provider_identity(
+    record: &CellRecord,
+    identity: &ProviderVmIdentity,
+) -> Result<(), EngineError> {
+    if Uuid::parse_str(&identity.id).is_err() {
+        return Err(EngineError::ProviderDrift(
+            "Hyper-V create response did not contain a GUID provider id".to_owned(),
+        ));
+    }
+    if identity.name != record.ownership.provider_object_name {
+        return Err(EngineError::ProviderDrift(
+            "Hyper-V create response name did not match the requested CellId name".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn prove_ownership(record: &CellRecord, vm: &ProviderVm) -> Result<(), EngineError> {
     let reasons = ownership_drift(record, vm);
     if reasons.is_empty() {
@@ -1263,6 +1286,7 @@ mod tests {
         fail_claim: bool,
         fail_configure: bool,
         fail_configure_after_network: bool,
+        malformed_create_identity: bool,
         installation_rotation_path: Option<PathBuf>,
         installation_rotation_blocked: bool,
     }
@@ -1369,7 +1393,11 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.calls.push("create_vm");
             let vm = ProviderVm {
-                id: Uuid::new_v4().to_string(),
+                id: if state.malformed_create_identity {
+                    "not-a-guid".to_owned()
+                } else {
+                    Uuid::new_v4().to_string()
+                },
                 name: request.name.clone(),
                 power_state: ProviderPowerState::Off,
                 ownership_marker: String::new(),
@@ -1950,6 +1978,30 @@ mod tests {
             }
         ));
         assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 0);
+    }
+
+    #[test]
+    fn malformed_create_identity_is_quarantined_before_claim_or_configuration() {
+        let (_directory, engine, image_id) = fixture();
+        engine
+            .provider
+            .state
+            .lock()
+            .unwrap()
+            .malformed_create_identity = true;
+
+        assert!(matches!(
+            engine.create_cell(spec(image_id)),
+            Err(EngineError::ProviderDrift(_))
+        ));
+        let cell = engine.state.list_cells().unwrap().pop().unwrap();
+        assert_eq!(cell.state, CellState::Failed);
+        assert_eq!(cell.phase, CellPhase::OverlayCreated);
+        assert!(cell.provider_object.is_none());
+        let provider = engine.provider.state.lock().unwrap();
+        assert!(provider.calls.contains(&"create_vm"));
+        assert!(!provider.calls.contains(&"claim_vm"));
+        assert!(!provider.calls.contains(&"configure_vm"));
     }
 
     #[test]
