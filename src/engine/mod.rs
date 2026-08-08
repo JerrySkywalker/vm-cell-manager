@@ -251,12 +251,13 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let canonical = canonical_vhdx_path(&request.path)?;
         let mut handle = open_immutable_parent(&canonical)?;
         let file_size = handle
+            .file
             .metadata()
             .map_err(|error| EngineError::InvalidImage(error.to_string()))?
             .len();
         let provider_info = self.provider.inspect_image(canonical.clone())?;
         validate_base_vhdx(&canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle)?;
+        let sha256 = sha256_file(&mut handle.file)?;
 
         let variant = ImageVariant {
             provider: "hyperv".to_owned(),
@@ -1008,7 +1009,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
     }
 
-    fn verify_registered_image(&self, variant: &ImageVariant) -> Result<File, EngineError> {
+    fn verify_registered_image(
+        &self,
+        variant: &ImageVariant,
+    ) -> Result<ImmutableParentGuard, EngineError> {
         let canonical = canonical_vhdx_path(&variant.path)?;
         if !paths_equal(&canonical, &variant.path) {
             return Err(EngineError::InvalidImage(
@@ -1017,6 +1021,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         let mut handle = open_immutable_parent(&canonical)?;
         let file_size = handle
+            .file
             .metadata()
             .map_err(|error| EngineError::InvalidImage(error.to_string()))?
             .len();
@@ -1027,7 +1032,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         let provider_info = self.provider.inspect_image(canonical.clone())?;
         validate_base_vhdx(&canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle)?;
+        let sha256 = sha256_file(&mut handle.file)?;
         if sha256 != variant.sha256 {
             return Err(EngineError::InvalidImage(
                 "registered image SHA-256 changed".to_owned(),
@@ -1743,7 +1748,20 @@ fn canonical_vhdx_path(path: &Path) -> Result<PathBuf, EngineError> {
         .map_err(|error| EngineError::InvalidImage(error.to_string()))
 }
 
-fn open_immutable_parent(path: &Path) -> Result<File, EngineError> {
+struct ImmutableParentGuard {
+    file: File,
+    _ancestor_handles: Vec<File>,
+}
+
+fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineError> {
+    #[cfg(windows)]
+    let ancestor_handles = pin_ordinary_copy_source_ancestors(path).map_err(|_| {
+        EngineError::InvalidImage(
+            "base image ancestors could not be pinned as ordinary directories".to_owned(),
+        )
+    })?;
+    #[cfg(not(windows))]
+    let ancestor_handles = Vec::new();
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -1751,11 +1769,35 @@ fn open_immutable_parent(path: &Path) -> Result<File, EngineError> {
         use std::os::windows::fs::OpenOptionsExt;
 
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        options.share_mode(FILE_SHARE_READ);
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    options
+    let file = options
         .open(path)
-        .map_err(|error| EngineError::InvalidImage(format!("{}: {error}", path.display())))
+        .map_err(|error| EngineError::InvalidImage(format!("{}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| EngineError::InvalidImage(error.to_string()))?;
+    if !metadata.is_file() || is_reparse_point(&metadata) {
+        return Err(EngineError::InvalidImage(
+            "base image handle is not an ordinary file".to_owned(),
+        ));
+    }
+    if path
+        .canonicalize()
+        .map(|rechecked| !paths_equal(&rechecked, path))
+        .unwrap_or(true)
+    {
+        return Err(EngineError::InvalidImage(
+            "base image identity changed while acquiring its immutable handle".to_owned(),
+        ));
+    }
+    Ok(ImmutableParentGuard {
+        file,
+        _ancestor_handles: ancestor_handles,
+    })
 }
 
 fn sha256_file(file: &mut File) -> Result<String, EngineError> {
