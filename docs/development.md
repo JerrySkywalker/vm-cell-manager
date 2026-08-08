@@ -12,15 +12,22 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-Because provider integration depends on host virtualization capabilities, generic CI validates portable Rust code while dedicated provider acceptance will later run on hosts that explicitly expose Hyper-V, KVM, HVF, or WHPX.
+Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
 
-## Bootstrap safety rule
+## Provider safety rule
 
-M0 provider code is read-only. A change that creates, starts, stops, destroys, enables, reconfigures, or otherwise mutates host virtualization state belongs to a later milestone and should not be disguised as a probe or discovery change.
+M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.
+
+## M1 validation tiers
+
+1. Unit and contract tests use a mocked provider/executor and temporary state roots.
+2. Core CI runs format, Clippy, and all non-destructive tests.
+3. Real Hyper-V acceptance is a separately authorized activity on a dedicated host with a disposable VHDX, an isolated state root, and pre/post foreign-VM and switch checks.
 
 ## Platform boundaries
 
 - Windows-native lifecycle work belongs under `src/providers/hyperv`.
+- Provider-neutral mutation ordering and ownership proof belong under `src/engine`.
 - Portable QEMU lifecycle work belongs under `src/providers/qemu`; KVM/HVF/WHPX are accelerators, not separate top-level providers.
 - PowerShell Direct, QGA, and SSH belong under `src/guest`.
 - Application-specific tooling does not belong in provider or guest-transport modules.

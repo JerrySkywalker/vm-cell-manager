@@ -72,6 +72,13 @@ impl Drop for MutationGuard {
 impl StateStore {
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .map(|directory| directory.join(&root))
+                .unwrap_or(root)
+        };
         Self { root }
     }
 
@@ -196,6 +203,10 @@ impl StateStore {
             return Ok(());
         }
 
+        if is_reparse_point(&cell_root)? {
+            return Err(StateError::UnsafeRuntimePath(cell_root));
+        }
+
         let runtime_root = runtime_root
             .canonicalize()
             .map_err(|source| io_error(&runtime_root, source))?;
@@ -203,9 +214,11 @@ impl StateStore {
             .canonicalize()
             .map_err(|source| io_error(&cell_root, source))?;
 
-        if cell_root.parent() != Some(runtime_root.as_path()) || is_reparse_point(&cell_root)? {
+        if cell_root.parent() != Some(runtime_root.as_path()) {
             return Err(StateError::UnsafeRuntimePath(cell_root));
         }
+
+        ensure_no_reparse_tree(&cell_root)?;
 
         fs::remove_dir_all(&cell_root).map_err(|source| io_error(&cell_root, source))
     }
@@ -314,6 +327,24 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
 
 fn create_dir_all(path: &Path) -> Result<(), StateError> {
     fs::create_dir_all(path).map_err(|source| io_error(path, source))
+}
+
+fn ensure_no_reparse_tree(path: &Path) -> Result<(), StateError> {
+    for entry in fs::read_dir(path).map_err(|source| io_error(path, source))? {
+        let entry = entry.map_err(|source| io_error(path, source))?;
+        let entry_path = entry.path();
+        if is_reparse_point(&entry_path)? {
+            return Err(StateError::UnsafeRuntimePath(entry_path));
+        }
+        if entry
+            .file_type()
+            .map_err(|source| io_error(&entry_path, source))?
+            .is_dir()
+        {
+            ensure_no_reparse_tree(&entry_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> StateError {

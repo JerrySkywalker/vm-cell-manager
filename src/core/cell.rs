@@ -1,5 +1,9 @@
+use std::fmt;
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
 
 use super::image::{ImageBinding, ImageId};
@@ -21,6 +25,24 @@ impl Default for CellId {
         Self::new()
     }
 }
+
+impl fmt::Display for CellId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for CellId {
+    type Err = CellIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self).map_err(CellIdError)
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("invalid cell id: {0}")]
+pub struct CellIdError(#[source] uuid::Error);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

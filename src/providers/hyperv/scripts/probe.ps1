@@ -5,6 +5,7 @@ trap { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
 
 $required = @(
   'Get-VM',
+  'Get-VMHost',
   'Get-VHD',
   'New-VHD',
   'New-VM',
@@ -21,10 +22,16 @@ $required = @(
 )
 $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
 $available = $missing.Count -eq 0
-$detail = if ($available) {
-  'Hyper-V PowerShell lifecycle commands detected'
-} else {
+$detail = if (-not $available) {
   'Missing Hyper-V PowerShell commands: ' + ($missing -join ', ')
+} else {
+  try {
+    Get-VMHost -ErrorAction Stop | Out-Null
+    'Hyper-V host and PowerShell lifecycle commands are available'
+  } catch {
+    $available = $false
+    'Hyper-V host is not available to this identity: ' + $_.Exception.Message
+  }
 }
 
 [pscustomobject]@{

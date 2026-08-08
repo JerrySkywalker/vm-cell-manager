@@ -4,12 +4,12 @@ The roadmap is capability-driven. Milestones are intentionally narrow so the pro
 
 ## M0 — Architecture bootstrap
 
-Status: active in the initial bootstrap PR.
+Status: complete.
 
 Acceptance:
 
 - Rust 2024 workspace/binary skeleton;
-- cross-platform CI on Windows, Linux, and macOS;
+- local-first Rust CI on a dedicated self-hosted Windows runner;
 - read-only `vmcell doctor` and provider probing;
 - provider-neutral `Cell`, `Image`, `ProviderCapabilities`, and lifecycle model;
 - Hyper-V and QEMU provider modules without VM mutation;
@@ -21,6 +21,8 @@ No VM creation is authorized by M0.
 ## M1 — Hyper-V cell foundation
 
 Goal: first useful Windows-native disposable full-system cell.
+
+Status: implementation review candidate; dedicated real Hyper-V acceptance remains pending.
 
 Planned acceptance:
 
@@ -46,7 +48,7 @@ Planned acceptance:
 - copy-in and copy-out semantics;
 - artifact collection;
 - TTL model and explicit `vmcell gc`;
-- crash/restart reconciliation between manifest and Hyper-V state.
+- guest-control recovery layered on the M1 ownership reconciliation model.
 
 ## M3 — QEMU reference provider
 
@@ -86,7 +88,7 @@ Planned acceptance:
 - stable ownership/reconciliation semantics;
 - machine-readable `doctor` capability reports;
 - deterministic failure categories;
-- concurrency locks for local state mutation;
+- concurrency-lock hardening beyond the narrow M1 exclusive mutation lock;
 - artifact/log retention policy.
 
 ## Later candidates

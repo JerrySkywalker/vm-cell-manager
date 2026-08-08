@@ -2,7 +2,7 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha / architecture bootstrap. The current code is intentionally read-only: it can probe the host and built-in providers, but it does not yet create, modify, or destroy virtual machines.
+> **Status:** pre-alpha / M1 review candidate. M0 discovery remains read-only, and M1 now implements an ownership-checked Hyper-V lifecycle. Real destructive Hyper-V acceptance is separately gated and is not run by core CI.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -117,40 +117,31 @@ Cross-architecture emulation is not treated as equivalent to hardware virtualiza
 
 ## Current CLI
 
-The bootstrap release exposes only read-only discovery:
+Read-only discovery remains available:
 
 ```text
 vmcell doctor [--json]
 vmcell provider-list [--json]
 ```
 
-The intended lifecycle surface is:
+M1 adds the following Hyper-V surface:
 
 ```text
 vmcell doctor
-
-vmcell provider list
-vmcell provider inspect
-
+vmcell provider-list
+vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
 vmcell image list
-vmcell image add
-vmcell image inspect
-
-vmcell create
+vmcell image inspect IMAGE
+vmcell create --image IMAGE --cpu-count 2 --memory-mib 4096
 vmcell list
-vmcell inspect
-vmcell start
-vmcell stop
-
-vmcell exec
-vmcell copy-in
-vmcell copy-out
-
-vmcell destroy
-vmcell gc
+vmcell inspect CELL_ID
+vmcell start CELL_ID
+vmcell stop CELL_ID
+vmcell destroy CELL_ID
+vmcell reconcile [CELL_ID]
 ```
 
-The public CLI will grow only as the corresponding lifecycle semantics become real. Planned commands are documentation, not a claim that mutation is implemented today.
+All commands support global `--json` and `--state-root PATH` options. Guest execution, file transfer, TTL/GC, and QEMU mutation remain later milestones.
 
 ## Safety and ownership
 
@@ -238,6 +229,7 @@ Higher-level systems may compose `vmcell` with those capabilities without moving
 src/
 ├─ cli/            # human CLI and versioned machine-readable output
 ├─ core/           # cell, image, capability, lifecycle domain model
+├─ engine/         # Rust-owned lifecycle, ownership, and reconciliation
 ├─ providers/      # Hyper-V, QEMU, future local VM providers
 ├─ guest/          # PowerShell Direct, QGA, SSH transports
 └─ state/          # local manifests, locks, logs, ownership metadata
@@ -249,8 +241,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the design contract and [
 
 The first milestones are intentionally incremental:
 
-- **M0 — Architecture bootstrap:** read-only provider discovery, domain model, documentation, cross-platform Rust CI.
-- **M1 — Hyper-V cell foundation:** image registration, single-level differencing disk, create/start/stop/destroy, ownership checks.
+- **M0 — Architecture bootstrap:** complete; read-only provider discovery, domain model, documentation, and local-first self-hosted Windows CI.
+- **M1 — Hyper-V cell foundation:** implementation review candidate; image registration, single-level differencing disk, create/start/inspect/stop/destroy, and ownership reconciliation are implemented, with real-provider acceptance still gated.
 - **M2 — Windows guest control:** PowerShell Direct exec and file transfer, TTL cleanup, artifact collection.
 - **M3 — QEMU provider:** QMP lifecycle, QCOW2 overlay, QGA transport, WHPX reference validation on Windows.
 - **M4 — Linux/macOS portability:** KVM and HVF acceptance, packaging and path/state semantics.
@@ -270,7 +262,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-CI runs Rust checks on Ubuntu, Windows, and macOS. Provider integration tests will be added separately because generic hosted runners do not necessarily expose nested virtualization or Hyper-V/KVM/HVF capabilities.
+Core CI runs Rust checks on a dedicated self-hosted Windows runner with no Hyper-V mutation responsibilities. Real provider integration belongs on a separate explicitly privileged and isolated runner; the existing `core` runner must never be repurposed for it.
 
 ## License
 

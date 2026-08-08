@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::core::cell::{CellId, CellPhase, CellRecord, CellSpec, CellState};
 use crate::core::image::{Architecture, GuestOs, ImageBinding, ImageId, ImageRecord, ImageVariant};
-use crate::core::ownership::{CellOwnership, ProviderObjectIdentity};
+use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObjectIdentity};
 use crate::providers::{
     CreateOverlayRequest, CreateVmRequest, LocalVmProvider, ProviderError, ProviderImageInfo,
     ProviderPowerState, ProviderVm, VmLookup,
@@ -157,6 +157,22 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     pub fn list_images(&self) -> Result<Vec<ImageRecord>, EngineError> {
         Ok(self.state.list_images()?)
+    }
+
+    pub fn inspect_image(&self, image_id: &ImageId) -> Result<ImageRecord, EngineError> {
+        Ok(self.state.load_image(image_id)?)
+    }
+
+    pub fn list_cells(&self) -> Result<Vec<CellRecord>, EngineError> {
+        Ok(self.state.list_cells()?)
+    }
+
+    pub fn reconcile_all(&self) -> Result<Vec<CellInspection>, EngineError> {
+        self.state
+            .list_cells()?
+            .into_iter()
+            .map(|record| self.inspect_cell(record.id))
+            .collect()
     }
 
     pub fn create_cell(&self, spec: CellSpec) -> Result<CellRecord, EngineError> {
@@ -340,8 +356,16 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let _guard = self.state.acquire_mutation_lock()?;
         let mut record = self.state.load_cell(cell_id)?;
         if record.state == CellState::Destroyed {
-            return Ok(operation_report(&record, false));
+            let (_, reconciliation) = self.reconcile_record(&record)?;
+            return if reconciliation == ReconciliationStatus::Destroyed {
+                Ok(operation_report(&record, false))
+            } else {
+                Err(EngineError::ProviderDrift(format!(
+                    "destroyed tombstone does not reconcile: {reconciliation:?}"
+                )))
+            };
         }
+        self.validate_local_ownership(&record)?;
 
         let provider_vm = if let Some(identity) = &record.provider_object {
             self.provider
@@ -454,6 +478,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 "cell is already destroyed".to_owned(),
             ));
         }
+        self.validate_local_ownership(record)?;
         let identity = record.provider_object.as_ref().ok_or_else(|| {
             EngineError::OwnershipNotProven("provider object id is not recorded".to_owned())
         })?;
@@ -471,7 +496,31 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         record: &CellRecord,
     ) -> Result<(Option<ProviderVm>, ReconciliationStatus), EngineError> {
+        if let Err(error) = self.validate_local_ownership(record) {
+            return Ok((
+                None,
+                ReconciliationStatus::OwnershipMismatch {
+                    reasons: vec![error.to_string()],
+                },
+            ));
+        }
+
         if record.state == CellState::Destroyed {
+            if let Some(identity) = &record.provider_object {
+                if let Some(vm) = self
+                    .provider
+                    .inspect_vm(&VmLookup::Id(identity.id.clone()))?
+                {
+                    return Ok((
+                        Some(vm),
+                        ReconciliationStatus::OwnershipMismatch {
+                            reasons: vec![
+                                "provider object exists after the cell was tombstoned".to_owned(),
+                            ],
+                        },
+                    ));
+                }
+            }
             return Ok((None, ReconciliationStatus::Destroyed));
         }
 
@@ -511,6 +560,52 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         Ok((Some(vm), ReconciliationStatus::ExactOwned))
+    }
+
+    fn validate_local_ownership(&self, record: &CellRecord) -> Result<(), EngineError> {
+        if record.provider != "hyperv"
+            || record.spec.provider.as_deref() != Some("hyperv")
+            || record.image.provider != "hyperv"
+        {
+            return Err(EngineError::OwnershipNotProven(
+                "manifest provider binding is not Hyper-V".to_owned(),
+            ));
+        }
+        let expected_name = format!("vmcell-{}", record.id.0);
+        if record.ownership.provider_object_name != expected_name {
+            return Err(EngineError::OwnershipNotProven(
+                "manifest provider name is not derived from the CellId".to_owned(),
+            ));
+        }
+        if record.ownership.schema_version != OWNERSHIP_MARKER_SCHEMA {
+            return Err(EngineError::OwnershipNotProven(
+                "unsupported ownership marker schema".to_owned(),
+            ));
+        }
+        let expected_marker = format!(
+            "vmcell:v{}:{}:{}:{}",
+            OWNERSHIP_MARKER_SCHEMA,
+            record.ownership.install_id,
+            record.id.0,
+            record.ownership.operation_id
+        );
+        if record.ownership.provider_marker != expected_marker {
+            return Err(EngineError::OwnershipNotProven(
+                "manifest ownership marker is internally inconsistent".to_owned(),
+            ));
+        }
+        if !paths_equal(
+            &record.ownership.configuration_path,
+            &self.state.cell_configuration_path(record.id),
+        ) || !paths_equal(
+            &record.ownership.overlay_path,
+            &self.state.cell_overlay_path(record.id),
+        ) {
+            return Err(EngineError::OwnershipNotProven(
+                "manifest runtime paths are outside the CellId-scoped root".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn fail_record<T>(&self, mut record: CellRecord, error: EngineError) -> Result<T, EngineError> {
@@ -1031,6 +1126,44 @@ mod tests {
 
         assert!(matches!(error, EngineError::OwnershipNotProven(_)));
         assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 0);
+    }
+
+    #[test]
+    fn tampered_runtime_path_blocks_start_before_provider_mutation() {
+        let (directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let mut tampered = engine.state.load_cell(cell.id).unwrap();
+        tampered.ownership.overlay_path = directory.path().join("foreign.vhdx");
+        engine.state.save_cell(&tampered).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+
+        let error = engine.start_cell(cell.id).unwrap_err();
+
+        assert!(matches!(error, EngineError::OwnershipNotProven(_)));
+        let provider = engine.provider.state.lock().unwrap();
+        assert_eq!(provider.calls.len(), calls_before);
+        assert_eq!(
+            provider.vm.as_ref().unwrap().power_state,
+            ProviderPowerState::Off
+        );
+    }
+
+    #[test]
+    fn destroyed_tombstone_reports_provider_reappearance() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let snapshot = engine.provider.state.lock().unwrap().vm.clone().unwrap();
+        engine.destroy_cell(cell.id).unwrap();
+        engine.provider.state.lock().unwrap().vm = Some(snapshot);
+
+        let inspection = engine.reconcile_cell(cell.id).unwrap();
+
+        assert!(matches!(
+            inspection.reconciliation,
+            ReconciliationStatus::OwnershipMismatch { .. }
+        ));
+        assert!(engine.destroy_cell(cell.id).is_err());
+        assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 1);
     }
 
     #[test]

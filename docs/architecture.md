@@ -45,18 +45,19 @@ The core selects or validates a local provider. It does not schedule across host
 └─────────────────────────────────────────┘
 ```
 
-The six implementation areas map to Rust modules rather than services:
+The implementation areas map to Rust modules rather than services:
 
 - `cli`: human-facing CLI and versioned JSON output;
 - `core`: provider-neutral cell/image/capability/lifecycle model;
+- `engine`: Rust-owned mutation ordering, ownership proof, and reconciliation;
 - `providers`: local hypervisor implementations;
 - `guest`: PowerShell Direct, QGA, SSH, and future guest transports;
 - `state`: local manifests, locks, ownership metadata, and logs;
-- the cell engine is composed from `core`, `providers`, and `state` rather than implemented as a daemon.
+- the cell engine composes `core`, `providers`, and `state` in-process rather than running as a daemon.
 
 ## Control flow
 
-A future create flow is expected to be:
+The M1 create flow is:
 
 ```text
 CLI request
@@ -65,28 +66,28 @@ CLI request
 validate CellSpec
    │
    ▼
-resolve local ProviderCapability
+acquire one local mutation lock
    │
    ▼
-resolve Image Variant
+resolve and re-verify immutable Image Variant
    │
    ▼
-create writable overlay
+write durable Creating ownership intent
    │
    ▼
-provider creates VM
+create exactly one writable overlay
    │
    ▼
-write ownership manifest
+provider creates a networkless VM with marker
    │
    ▼
-optional GuestTransport readiness
+record provider id and reconcile ownership
    │
    ▼
-Cell = ready/running
+Cell = stopped/ready
 ```
 
-Destroy is the reverse only for resources whose ownership is proven. Foreign VM discovery must never imply mutation authority.
+Durable intent precedes the first provider mutation. Destroy reverses the flow only after the local manifest, provider id, ownership marker, configuration path, disk attachment, and bounded VM configuration all agree. Foreign VM discovery or a name match never implies mutation authority.
 
 ## Why Provider and Guest I/O are separate
 
@@ -116,6 +117,8 @@ A cell mutation should require both:
 
 1. a local manifest proving `vmcell` ownership; and
 2. provider identity that still matches the manifest.
+
+M1 makes that rule concrete: a generated installation id, CellId, operation id, provider VM id, provider marker, configuration path, and single attached overlay are checked before start, stop, or destroy. Provider drift is reported without automatic adoption or repair.
 
 The state store is not intended to become a distributed database. If multi-host scheduling is required, it belongs above this project.
 
