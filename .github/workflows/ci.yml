@@ -34,6 +34,9 @@ jobs:
     timeout-minutes: 15
 
     env:
+      CARGO_HOME: C:\ProgramData\jerry-ci\cargo
+      RUSTUP_HOME: C:\ProgramData\jerry-ci\rustup
+      RUSTUP_TOOLCHAIN: 1.97.1-x86_64-pc-windows-msvc
       EXPECTED_RUNNER_NAME: jerry-ci-win-01-vm-cell-manager
       EXPECTED_GIT: C:\ProgramData\jerry-ci\git\cmd\git.exe
       EXPECTED_CARGO_HOME: C:\ProgramData\jerry-ci\cargo
@@ -57,12 +60,12 @@ jobs:
           $actualSha = (git rev-parse HEAD).Trim()
           $identity = (whoami).Trim().ToLowerInvariant()
 
-          $git = (Get-Command git -CommandType Application -ErrorAction Stop).Source
-          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
-          $rustc = (Get-Command rustc -CommandType Application -ErrorAction Stop).Source
-          $rustup = (Get-Command rustup -CommandType Application -ErrorAction Stop).Source
-          $rustfmt = (Get-Command rustfmt -CommandType Application -ErrorAction Stop).Source
-          $clippy = (Get-Command cargo-clippy -CommandType Application -ErrorAction Stop).Source
+          $git = (@(Get-Command git -CommandType Application -ErrorAction Stop)[0]).Source
+          $cargo = (@(Get-Command cargo -CommandType Application -ErrorAction Stop)[0]).Source
+          $rustc = (@(Get-Command rustc -CommandType Application -ErrorAction Stop)[0]).Source
+          $rustup = (@(Get-Command rustup -CommandType Application -ErrorAction Stop)[0]).Source
+          $rustfmt = (@(Get-Command rustfmt -CommandType Application -ErrorAction Stop)[0]).Source
+          $clippy = (@(Get-Command cargo-clippy -CommandType Application -ErrorAction Stop)[0]).Source
 
           Write-Host "expected_sha=$expectedSha"
           Write-Host "actual_sha=$actualSha"
@@ -178,3 +181,4 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           cargo test --all-targets --all-features
+
