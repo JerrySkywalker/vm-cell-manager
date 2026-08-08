@@ -32,7 +32,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!(
                         "{}\t{}\t{}",
                         probe.name,
-                        if probe.available { "available" } else { "unavailable" },
+                        if probe.available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
                         probe.detail
                     );
                 }
