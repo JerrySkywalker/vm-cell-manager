@@ -1835,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_state_root_cannot_authorize_a_cell_from_another_installation() {
+    fn distinct_or_cloned_state_root_cannot_authorize_another_roots_cell() {
         let directory = tempdir().unwrap();
         let base_path = directory.path().join("base.vhdx");
         fs::write(&base_path, b"immutable base").unwrap();
@@ -1855,7 +1855,10 @@ mod tests {
             .unwrap();
         let cell = first.create_cell(spec(image_id)).unwrap();
 
-        let second = CellEngine::new(StateStore::new(directory.path().join("state-b")), provider);
+        let second = CellEngine::new(
+            StateStore::new(directory.path().join("state-b")),
+            provider.clone(),
+        );
         let second_installation = second.state.installation().unwrap();
         assert_ne!(second_installation.install_id, cell.ownership.install_id);
         let second_manifest = second
@@ -1892,6 +1895,42 @@ mod tests {
             calls_before
         );
         assert!(second.provider.state.lock().unwrap().vm.is_some());
+
+        let cloned_root = directory.path().join("state-cloned");
+        fs::create_dir_all(cloned_root.join("cells")).unwrap();
+        fs::copy(
+            first.state.root().join("installation.json"),
+            cloned_root.join("installation.json"),
+        )
+        .unwrap();
+        fs::copy(
+            first
+                .state
+                .root()
+                .join("cells")
+                .join(format!("{}.json", cell.id)),
+            cloned_root.join("cells").join(format!("{}.json", cell.id)),
+        )
+        .unwrap();
+        let cloned = CellEngine::new(StateStore::new(cloned_root), provider);
+        assert_eq!(
+            cloned.state.load_installation().unwrap().install_id,
+            cell.ownership.install_id
+        );
+        let cloned_calls_before = cloned.provider.state.lock().unwrap().calls.len();
+        assert!(matches!(
+            cloned.destroy_cell(cell.id),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert!(matches!(
+            cloned.reconcile_cell(cell.id).unwrap().reconciliation,
+            ReconciliationStatus::OwnershipMismatch { .. }
+        ));
+        assert_eq!(
+            cloned.provider.state.lock().unwrap().calls.len(),
+            cloned_calls_before
+        );
+        assert!(cloned.provider.state.lock().unwrap().vm.is_some());
     }
 
     #[test]
