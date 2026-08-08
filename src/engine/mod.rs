@@ -272,9 +272,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
             Ok(provider_identity) => provider_identity,
             Err(error) => return self.fail_record(record, error.into()),
         };
-        if let Err(error) = validate_provider_identity(&record, &provider_identity) {
-            return self.fail_record(record, error);
-        }
+        let provider_identity = match normalize_provider_identity(&record, provider_identity) {
+            Ok(identity) => identity,
+            Err(error) => return self.fail_record(record, error),
+        };
         record.provider_object = Some(ProviderObjectIdentity {
             id: provider_identity.id.clone(),
             name: provider_identity.name.clone(),
@@ -1016,21 +1017,26 @@ fn validate_overlay(record: &CellRecord, info: &ProviderImageInfo) -> Result<(),
     Ok(())
 }
 
-fn validate_provider_identity(
+fn normalize_provider_identity(
     record: &CellRecord,
-    identity: &ProviderVmIdentity,
-) -> Result<(), EngineError> {
-    if Uuid::parse_str(&identity.id).is_err() {
-        return Err(EngineError::ProviderDrift(
-            "Hyper-V create response did not contain a GUID provider id".to_owned(),
-        ));
-    }
+    identity: ProviderVmIdentity,
+) -> Result<ProviderVmIdentity, EngineError> {
+    let id = Uuid::parse_str(&identity.id)
+        .map_err(|_| {
+            EngineError::ProviderDrift(
+                "Hyper-V create response did not contain a GUID provider id".to_owned(),
+            )
+        })?
+        .to_string();
     if identity.name != record.ownership.provider_object_name {
         return Err(EngineError::ProviderDrift(
             "Hyper-V create response name did not match the requested CellId name".to_owned(),
         ));
     }
-    Ok(())
+    Ok(ProviderVmIdentity {
+        id,
+        name: identity.name,
+    })
 }
 
 fn prove_ownership(record: &CellRecord, vm: &ProviderVm) -> Result<(), EngineError> {
@@ -1287,6 +1293,7 @@ mod tests {
         fail_configure: bool,
         fail_configure_after_network: bool,
         malformed_create_identity: bool,
+        noncanonical_create_identity: bool,
         installation_rotation_path: Option<PathBuf>,
         installation_rotation_blocked: bool,
     }
@@ -1392,11 +1399,19 @@ mod tests {
         ) -> Result<ProviderVmIdentity, ProviderError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push("create_vm");
+            let canonical_id = Uuid::new_v4().to_string();
+            let returned_id = if state.malformed_create_identity {
+                "not-a-guid".to_owned()
+            } else if state.noncanonical_create_identity {
+                format!("{{{canonical_id}}}")
+            } else {
+                canonical_id.clone()
+            };
             let vm = ProviderVm {
                 id: if state.malformed_create_identity {
-                    "not-a-guid".to_owned()
+                    returned_id.clone()
                 } else {
-                    Uuid::new_v4().to_string()
+                    canonical_id
                 },
                 name: request.name.clone(),
                 power_state: ProviderPowerState::Off,
@@ -1409,7 +1424,7 @@ mod tests {
             };
             state.vm = Some(vm.clone());
             Ok(ProviderVmIdentity {
-                id: vm.id,
+                id: returned_id,
                 name: vm.name,
             })
         }
@@ -2002,6 +2017,25 @@ mod tests {
         assert!(provider.calls.contains(&"create_vm"));
         assert!(!provider.calls.contains(&"claim_vm"));
         assert!(!provider.calls.contains(&"configure_vm"));
+    }
+
+    #[test]
+    fn noncanonical_create_guid_is_normalized_before_persistence_and_lifecycle() {
+        let (_directory, engine, image_id) = fixture();
+        engine
+            .provider
+            .state
+            .lock()
+            .unwrap()
+            .noncanonical_create_identity = true;
+
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        let persisted = cell.provider_object.as_ref().unwrap();
+        assert_eq!(
+            persisted.id,
+            Uuid::parse_str(&persisted.id).unwrap().to_string()
+        );
+        assert!(engine.destroy_cell(cell.id).unwrap().changed);
     }
 
     #[test]

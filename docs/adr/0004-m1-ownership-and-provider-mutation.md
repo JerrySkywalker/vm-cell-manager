@@ -15,7 +15,7 @@ Hyper-V integration uses fixed, single-purpose Windows PowerShell scriptlets wit
 
 Provider mutators require an engine-issued authority token that cannot be constructed by a library caller. The token borrows a pinned current-installation handle and pinned ordinary state/runtime directory handles, and binds one CellId, marker, configuration path, and overlay path. The provider rejects a request that does not match that authority before launching PowerShell.
 
-Start, stop, and destroy require agreement across:
+Ready-state start, stop, and destroy require agreement across:
 
 - the local cell manifest;
 - the recorded Hyper-V VM id and name;
@@ -32,6 +32,7 @@ Name-only discovery is classified as unproven and is never mutated. Reconciliati
 - A crash can leave an incomplete manifest, overlay, or provider object, but ambiguity fails closed instead of adopting or deleting it.
 - Once the provider id and exact creation receipt are durable, an interrupted claim may be retried by id and the object may then be destroyed. Claimed but partially configured objects use a narrower exact-owned destroy proof. Pre-id/name-only ambiguity remains terminal quarantine and is never automatically deleted.
 - Lifecycle authorization binds the cell marker to the current persisted installation identity, and unsupported state schemas fail before provider or runtime mutation.
+- The image manifest schema is consumed and gated during registration/create. Existing-cell lifecycle authorization consumes the durable cell image binding rather than reopening the mutable image catalog record.
 - Installation identity and ordinary state/runtime directories remain pinned with no-delete handles across provider mutation. Runtime creation/deletion rejects redirected ancestor chains; Windows provider path aliases are normalized only for identity comparison, never to weaken containment. Recursive removal relies on Rust's handle-relative, reparse-safe Windows implementation while the physical runtime parent remains pinned.
 - Persisted image/cell IDs must match their manifest filenames; manifest files and existing ancestors must be ordinary non-reparse objects.
 - Exact-owned destroy is idempotent and removes only the recorded VM plus the CellId-scoped runtime directory.
