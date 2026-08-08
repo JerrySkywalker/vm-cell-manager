@@ -53,8 +53,6 @@ mod tests {
 
     #[test]
     fn destroyed_cells_are_terminal() {
-        assert!(
-            validate_transition(CellState::Destroyed, CellState::Running).is_err()
-        );
+        assert!(validate_transition(CellState::Destroyed, CellState::Running).is_err());
     }
 }
