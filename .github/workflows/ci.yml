@@ -10,6 +10,31 @@ permissions:
   contents: read
 
 jobs:
+  bootstrap-lock:
+    name: Bootstrap Cargo.lock
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate and commit lockfile if missing
+        shell: bash
+        run: |
+          if test -f Cargo.lock; then
+            echo 'Cargo.lock already exists; nothing to bootstrap.'
+            exit 0
+          fi
+          cargo generate-lockfile
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'chore: add generated Cargo.lock'
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+
   rust:
     name: Rust / ${{ matrix.os }}
     strategy:
@@ -30,10 +55,3 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
-      - name: Emit bootstrap Cargo.lock
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          echo '---VMCELL_CARGO_LOCK_BEGIN---'
-          cat Cargo.lock
-          echo '---VMCELL_CARGO_LOCK_END---'
