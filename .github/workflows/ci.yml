@@ -170,6 +170,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           cargo fmt --all -- --check
 
+      - name: PowerShell AST and static safety
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\check-powershell.ps1
+
       - name: Clippy
         shell: pwsh
         run: |
