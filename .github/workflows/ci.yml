@@ -30,3 +30,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
+      - name: Emit bootstrap Cargo.lock
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo '---VMCELL_CARGO_LOCK_BEGIN---'
+          cat Cargo.lock
+          echo '---VMCELL_CARGO_LOCK_END---'
