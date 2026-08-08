@@ -90,10 +90,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::providers::{ProviderError, ProviderPowerState, ProviderVm};
+    use crate::providers::{
+        ProviderError, ProviderMutationAuthority, ProviderPowerState, ProviderVm,
+    };
 
     #[test]
     fn m1_qemu_mutation_is_explicitly_unsupported() {
+        let (_directory, _state, installation, runtime, record) =
+            crate::providers::test_mutation_fixture();
         let expected = ProviderVm {
             id: "not-a-qemu-object".to_owned(),
             name: "not-a-qemu-object".to_owned(),
@@ -105,7 +109,8 @@ mod tests {
             cpu_count: 1,
             memory_mib: 512,
         };
-        let error = QemuProvider.start_vm(&expected).unwrap_err();
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+        let error = QemuProvider.start_vm(&authority, &expected).unwrap_err();
         assert!(matches!(
             error,
             ProviderError::Unsupported {

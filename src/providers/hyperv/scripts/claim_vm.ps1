@@ -5,6 +5,8 @@ trap { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
 
 $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $expected = $request.expected
+$providerMutex = [System.Threading.Mutex]::new($false, 'Global\vmcell-hyperv-provider-v1')
+$providerMutexHeld = $false
 
 function ConvertTo-PathIdentity([string]$Value) {
   $identity = $Value.Replace('/', '\')
@@ -16,6 +18,11 @@ function ConvertTo-PathIdentity([string]$Value) {
   return $identity.TrimEnd('\').ToLowerInvariant()
 }
 
+try {
+try { $providerMutexHeld = $providerMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $providerMutexHeld = $true }
+if (-not $providerMutexHeld) {
+  throw 'OWNERSHIP_CHANGED: another vmcell Hyper-V mutation is active'
+}
 $vm = Get-VM -Id ([guid]$expected.id) -ErrorAction Stop
 $configurationPath = if ($vm.ConfigurationLocation) { [string]$vm.ConfigurationLocation } else { [string]$vm.Path }
 $disks = @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | ForEach-Object { [string]$_.Path })
@@ -57,3 +64,7 @@ $configurationPath = if ($vm.ConfigurationLocation) { [string]$vm.ConfigurationL
   cpu_count = [uint16](Get-VMProcessor -VM $vm -ErrorAction Stop).Count
   memory_mib = [uint64]((Get-VMMemory -VM $vm -ErrorAction Stop).Startup / 1MB)
 } | ConvertTo-Json -Compress -Depth 5
+} finally {
+  if ($providerMutexHeld) { $providerMutex.ReleaseMutex() }
+  $providerMutex.Dispose()
+}

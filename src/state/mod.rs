@@ -55,6 +55,13 @@ pub enum StateError {
     #[error("refusing unsafe runtime path: {0}")]
     UnsafeRuntimePath(PathBuf),
 
+    #[error("persisted {kind} identity in {path} does not match requested id {expected}")]
+    IdentityMismatch {
+        kind: &'static str,
+        path: PathBuf,
+        expected: String,
+    },
+
     #[error("unsupported {kind} schema version in {path}: expected {expected}, found {actual}")]
     UnsupportedSchema {
         kind: &'static str,
@@ -66,7 +73,45 @@ pub enum StateError {
 
 pub struct MutationGuard {
     file: File,
+    _state_root: File,
     process_key: PathBuf,
+}
+
+pub(crate) struct InstallationAuthority {
+    _file: File,
+    record: InstallationRecord,
+}
+
+impl InstallationAuthority {
+    pub(crate) fn record(&self) -> &InstallationRecord {
+        &self.record
+    }
+}
+
+pub(crate) struct CellRuntimeGuard {
+    cell_id: CellId,
+    state_root: PathBuf,
+    runtime_root: PathBuf,
+    cell_root: PathBuf,
+    configuration_path: PathBuf,
+    overlay_path: PathBuf,
+    _state_handle: File,
+    _runtime_handle: File,
+    cell_handle: Option<File>,
+}
+
+impl CellRuntimeGuard {
+    pub(crate) fn cell_id(&self) -> CellId {
+        self.cell_id
+    }
+
+    pub(crate) fn configuration_path(&self) -> &Path {
+        &self.configuration_path
+    }
+
+    pub(crate) fn overlay_path(&self) -> &Path {
+        &self.overlay_path
+    }
 }
 
 impl Drop for MutationGuard {
@@ -104,6 +149,8 @@ impl StateStore {
     }
 
     pub fn acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
+        ensure_directory(&self.root)?;
+        let state_root_handle = open_ordinary_directory(&self.root)?;
         let lock_dir = self.root.join("locks");
         ensure_directory(&lock_dir)?;
         let process_key = self
@@ -143,7 +190,11 @@ impl StateStore {
             }
         }
 
-        Ok(MutationGuard { file, process_key })
+        Ok(MutationGuard {
+            file,
+            _state_root: state_root_handle,
+            process_key,
+        })
     }
 
     pub fn installation(&self) -> Result<InstallationRecord, StateError> {
@@ -174,6 +225,24 @@ impl StateStore {
         Ok(record)
     }
 
+    pub(crate) fn acquire_installation_authority(
+        &self,
+    ) -> Result<InstallationAuthority, StateError> {
+        let path = self.root.join("installation.json");
+        let mut file = open_state_file_for_authority(&path)?;
+        let record: InstallationRecord = read_json_from_file(&path, &mut file)?;
+        ensure_schema(
+            &path,
+            "installation record",
+            record.schema_version,
+            INSTALL_SCHEMA_VERSION,
+        )?;
+        Ok(InstallationAuthority {
+            _file: file,
+            record,
+        })
+    }
+
     pub fn save_image_new(&self, record: &ImageRecord) -> Result<(), StateError> {
         let path = self.image_path(&record.id);
         validate_image_schema(&path, record)?;
@@ -184,6 +253,13 @@ impl StateStore {
         let path = self.image_path(image_id);
         let record = read_json(&path)?;
         validate_image_schema(&path, &record)?;
+        if &record.id != image_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "image record",
+                path,
+                expected: image_id.to_string(),
+            });
+        }
         Ok(record)
     }
 
@@ -201,6 +277,13 @@ impl StateStore {
         let path = self.cell_path(cell_id);
         let record = read_json(&path)?;
         validate_cell_schema(&path, &record)?;
+        if record.id != cell_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "cell record",
+                path,
+                expected: cell_id.to_string(),
+            });
+        }
         Ok(record)
     }
 
@@ -224,15 +307,81 @@ impl StateStore {
     }
 
     pub fn ensure_cell_runtime(&self, cell_id: CellId) -> Result<PathBuf, StateError> {
-        let path = self.cell_runtime_root(cell_id);
-        ensure_directory(&path)?;
-        validate_runtime_chain(&self.root, &path)?;
-        Ok(path)
+        let guard = self.prepare_cell_runtime(cell_id)?;
+        Ok(guard.cell_root.clone())
     }
 
-    pub(crate) fn remove_cell_runtime(&self, cell_id: CellId) -> Result<(), StateError> {
+    pub(crate) fn prepare_cell_runtime(
+        &self,
+        cell_id: CellId,
+    ) -> Result<CellRuntimeGuard, StateError> {
+        ensure_directory(&self.root)?;
+        let state_handle = open_ordinary_directory(&self.root)?;
+        let runtime_root = self.root.join("runtime");
+        create_direct_child_directory(&runtime_root)?;
+        let runtime_handle = open_ordinary_directory(&runtime_root)?;
+        let cell_root = self.cell_runtime_root(cell_id);
+        create_direct_child_directory(&cell_root)?;
+        let cell_handle = open_ordinary_directory(&cell_root)?;
+        validate_runtime_chain(&self.root, &cell_root)?;
+        ensure_no_reparse_tree(&cell_root)?;
+        Ok(CellRuntimeGuard {
+            cell_id,
+            state_root: self.root.clone(),
+            runtime_root,
+            configuration_path: self.cell_configuration_path(cell_id),
+            overlay_path: self.cell_overlay_path(cell_id),
+            cell_root,
+            _state_handle: state_handle,
+            _runtime_handle: runtime_handle,
+            cell_handle: Some(cell_handle),
+        })
+    }
+
+    pub(crate) fn pin_cell_runtime(&self, cell_id: CellId) -> Result<CellRuntimeGuard, StateError> {
+        let state_handle = open_ordinary_directory(&self.root)?;
+        let runtime_root = self.root.join("runtime");
+        let runtime_handle = open_ordinary_directory(&runtime_root)?;
+        let cell_root = self.cell_runtime_root(cell_id);
+        let cell_handle = open_ordinary_directory(&cell_root)?;
+        validate_runtime_chain(&self.root, &cell_root)?;
+        ensure_no_reparse_tree(&cell_root)?;
+        Ok(CellRuntimeGuard {
+            cell_id,
+            state_root: self.root.clone(),
+            runtime_root,
+            configuration_path: self.cell_configuration_path(cell_id),
+            overlay_path: self.cell_overlay_path(cell_id),
+            cell_root,
+            _state_handle: state_handle,
+            _runtime_handle: runtime_handle,
+            cell_handle: Some(cell_handle),
+        })
+    }
+
+    pub(crate) fn runtime_entry_exists(&self, cell_id: CellId) -> Result<bool, StateError> {
+        let path = self.cell_runtime_root(cell_id);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(io_error(&path, source)),
+        }
+    }
+
+    pub(crate) fn remove_cell_runtime(
+        &self,
+        cell_id: CellId,
+        mut guard: CellRuntimeGuard,
+    ) -> Result<(), StateError> {
         let runtime_root = self.root.join("runtime");
         let cell_root = self.cell_runtime_root(cell_id);
+        if guard.cell_id != cell_id
+            || guard.state_root != self.root
+            || guard.runtime_root != runtime_root
+            || guard.cell_root != cell_root
+        {
+            return Err(StateError::UnsafeRuntimePath(cell_root));
+        }
         if !cell_root.exists() {
             return Ok(());
         }
@@ -258,7 +407,11 @@ impl StateStore {
 
         ensure_no_reparse_tree(&physical_cell_root)?;
         validate_runtime_chain(&self.root, &cell_root)?;
+        drop(guard.cell_handle.take());
 
+        // Rust's Windows implementation performs handle-relative recursive
+        // removal and does not follow a child swapped to a reparse point. The
+        // pinned runtime-root handle prevents an ancestor swap while it runs.
         fs::remove_dir_all(&physical_cell_root)
             .map_err(|source| io_error(&physical_cell_root, source))
     }
@@ -314,11 +467,11 @@ fn read_json_directory<T: DeserializeOwned>(
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StateError> {
-    if !path.exists() {
-        return Err(StateError::NotFound(path.to_path_buf()));
-    }
+    let mut file = open_state_file_read(path)?;
+    read_json_from_file(path, &mut file)
+}
 
-    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+fn read_json_from_file<T: DeserializeOwned>(path: &Path, file: &mut File) -> Result<T, StateError> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|source| io_error(path, source))?;
@@ -326,6 +479,47 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StateError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn open_state_file_read(path: &Path) -> Result<File, StateError> {
+    open_state_file(path, false)
+}
+
+fn open_state_file_for_authority(path: &Path) -> Result<File, StateError> {
+    open_state_file(path, true)
+}
+
+fn open_state_file(path: &Path, pin_identity: bool) -> Result<File, StateError> {
+    ensure_existing_ancestors_are_ordinary(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.share_mode(if pin_identity {
+            FILE_SHARE_READ
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        });
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StateError::NotFound(path.to_path_buf()));
+        }
+        Err(source) => return Err(io_error(path, source)),
+    };
+    if file_metadata_is_reparse(&file).map_err(|source| io_error(path, source))? {
+        return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
+    }
+    ensure_existing_ancestors_are_ordinary(path)?;
+    Ok(file)
 }
 
 fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<(), StateError> {
@@ -356,9 +550,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
     ));
 
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+            options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+        }
+        let mut file = options
             .open(&temporary)
             .map_err(|source| io_error(&temporary, source))?;
         file.write_all(&bytes)
@@ -366,7 +567,19 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
         file.sync_all()
             .map_err(|source| io_error(&temporary, source))?;
         drop(file);
-        fs::rename(&temporary, path).map_err(|source| io_error(path, source))
+        fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+        #[cfg(not(windows))]
+        {
+            let committed = open_state_file_read(path)?;
+            committed
+                .sync_all()
+                .map_err(|source| io_error(path, source))?;
+            let directory = File::open(parent).map_err(|source| io_error(parent, source))?;
+            directory
+                .sync_all()
+                .map_err(|source| io_error(parent, source))?;
+        }
+        Ok(())
     })();
 
     if result.is_err() {
@@ -381,13 +594,83 @@ fn ensure_directory(path: &Path) -> Result<(), StateError> {
     ensure_existing_ancestors_are_ordinary(path)
 }
 
+fn create_direct_child_directory(path: &Path) -> Result<(), StateError> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if is_reparse_point(path)?
+                || !fs::symlink_metadata(path)
+                    .map_err(|source| io_error(path, source))?
+                    .is_dir()
+            {
+                Err(StateError::UnsafeRuntimePath(path.to_path_buf()))
+            } else {
+                Ok(())
+            }
+        }
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
+fn open_ordinary_directory(path: &Path) -> Result<File, StateError> {
+    ensure_existing_ancestors_are_ordinary(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        // Deliberately deny FILE_SHARE_DELETE while the guard is live so an
+        // ancestor cannot be renamed/replaced between proof and provider use.
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.is_dir()
+        || file_metadata_is_reparse(&file).map_err(|source| io_error(path, source))?
+    {
+        return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
+    }
+    ensure_existing_ancestors_are_ordinary(path)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn file_metadata_is_reparse(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    Ok(file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(not(windows))]
+fn file_metadata_is_reparse(file: &File) -> std::io::Result<bool> {
+    Ok(file.metadata()?.file_type().is_symlink())
+}
+
 fn validate_image_schema(path: &Path, record: &ImageRecord) -> Result<(), StateError> {
     ensure_schema(
         path,
         "image record",
         record.schema_version,
         IMAGE_SCHEMA_VERSION,
-    )
+    )?;
+    let expected = path.file_stem().and_then(|value| value.to_str());
+    if expected != Some(record.id.as_str()) {
+        return Err(StateError::IdentityMismatch {
+            kind: "image record",
+            path: path.to_path_buf(),
+            expected: expected.unwrap_or("<non-utf8>").to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateError> {
@@ -402,7 +685,17 @@ fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateErr
         "cell ownership",
         record.ownership.schema_version,
         OWNERSHIP_MARKER_SCHEMA,
-    )
+    )?;
+    let expected = path.file_stem().and_then(|value| value.to_str());
+    let record_id = record.id.to_string();
+    if expected != Some(record_id.as_str()) {
+        return Err(StateError::IdentityMismatch {
+            kind: "cell record",
+            path: path.to_path_buf(),
+            expected: expected.unwrap_or("<non-utf8>").to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn ensure_schema(
@@ -582,6 +875,63 @@ mod tests {
     }
 
     #[test]
+    fn manifest_filename_must_match_persisted_identity() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let persisted_id = ImageId::parse("persisted").unwrap();
+        let requested_id = ImageId::parse("requested").unwrap();
+        let record = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: persisted_id,
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        let path = store.image_path(&requested_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        assert!(matches!(
+            store.load_image(&requested_id),
+            Err(StateError::IdentityMismatch {
+                kind: "image record",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.list_images(),
+            Err(StateError::IdentityMismatch {
+                kind: "image record",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn state_manifest_reparse_is_never_followed() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let installation = store.installation().unwrap();
+        let external = directory.path().join("external-installation.json");
+        fs::write(&external, serde_json::to_vec(&installation).unwrap()).unwrap();
+        let manifest = store.root().join("installation.json");
+        fs::remove_file(&manifest).unwrap();
+        if create_file_link(&external, &manifest).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            store.load_installation(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert!(matches!(
+            store.acquire_installation_authority(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+    }
+
+    #[test]
     fn mutation_lock_is_exclusive() {
         let directory = tempdir().unwrap();
         let store = StateStore::new(directory.path().join("state"));
@@ -611,7 +961,8 @@ mod tests {
         )
         .unwrap();
 
-        store.remove_cell_runtime(first).unwrap();
+        let guard = store.pin_cell_runtime(first).unwrap();
+        store.remove_cell_runtime(first, guard).unwrap();
 
         assert!(!store.cell_runtime_root(first).exists());
         assert!(store.cell_runtime_root(second).exists());
@@ -740,7 +1091,7 @@ mod tests {
         fs::create_dir_all(&external_cell).unwrap();
         fs::write(external_cell.join("foreign"), b"preserve").unwrap();
         assert!(matches!(
-            store.remove_cell_runtime(cell_id),
+            store.pin_cell_runtime(cell_id),
             Err(StateError::UnsafeRuntimePath(_))
         ));
         assert_eq!(
@@ -756,6 +1107,16 @@ mod tests {
 
     #[cfg(not(windows))]
     fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(not(windows))]
+    fn create_file_link(target: &Path, link: &Path) -> std::io::Result<()> {
         std::os::unix::fs::symlink(target, link)
     }
 }

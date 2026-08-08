@@ -7,10 +7,12 @@ use serde::Deserialize;
 use crate::core::capability::ProviderCapabilities;
 use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
-    ProviderError, ProviderImageInfo, ProviderProbe, ProviderVm, ProviderVmIdentity, VmLookup,
+    ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderProbe, ProviderVm,
+    ProviderVmIdentity, VmLookup,
 };
 
-pub use executor::{HyperVAction, HyperVCommandExecutor, PowerShellHyperVExecutor};
+pub use executor::PowerShellHyperVExecutor;
+pub(crate) use executor::{HyperVAction, HyperVCommandExecutor};
 
 pub struct HyperVProvider<E = PowerShellHyperVExecutor> {
     executor: E,
@@ -25,7 +27,7 @@ impl HyperVProvider<PowerShellHyperVExecutor> {
 
 impl<E> HyperVProvider<E> {
     #[must_use]
-    pub fn new(executor: E) -> Self {
+    pub(crate) fn new(executor: E) -> Self {
         Self { executor }
     }
 }
@@ -98,27 +100,44 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
 
     fn create_overlay(
         &self,
+        authority: &ProviderMutationAuthority<'_>,
         request: &CreateOverlayRequest,
     ) -> Result<ProviderImageInfo, ProviderError> {
+        authority.validate_overlay_request(request)?;
         self.execute(HyperVAction::CreateDifferencingVhd {
             parent_path: request.parent_path.clone(),
             overlay_path: request.overlay_path.clone(),
         })
     }
 
-    fn create_vm(&self, request: &CreateVmRequest) -> Result<ProviderVmIdentity, ProviderError> {
+    fn create_vm(
+        &self,
+        authority: &ProviderMutationAuthority<'_>,
+        request: &CreateVmRequest,
+    ) -> Result<ProviderVmIdentity, ProviderError> {
+        authority.validate_create_request(request)?;
         self.execute(HyperVAction::CreateVm {
             request: request.clone(),
         })
     }
 
-    fn claim_vm(&self, request: &ClaimVmRequest) -> Result<ProviderVm, ProviderError> {
+    fn claim_vm(
+        &self,
+        authority: &ProviderMutationAuthority<'_>,
+        request: &ClaimVmRequest,
+    ) -> Result<ProviderVm, ProviderError> {
+        authority.validate_claim_request(request)?;
         self.execute(HyperVAction::ClaimVm {
             request: request.clone(),
         })
     }
 
-    fn configure_vm(&self, request: &ConfigureVmRequest) -> Result<ProviderVm, ProviderError> {
+    fn configure_vm(
+        &self,
+        authority: &ProviderMutationAuthority<'_>,
+        request: &ConfigureVmRequest,
+    ) -> Result<ProviderVm, ProviderError> {
+        authority.validate_vm(&request.expected)?;
         self.execute(HyperVAction::ConfigureVm {
             request: request.clone(),
         })
@@ -131,21 +150,36 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
         Ok(response.vm)
     }
 
-    fn start_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
+    fn start_vm(
+        &self,
+        authority: &ProviderMutationAuthority<'_>,
+        expected: &ProviderVm,
+    ) -> Result<(), ProviderError> {
+        authority.validate_vm(expected)?;
         let _: EmptyResponse = self.execute(HyperVAction::StartVm {
             expected: expected.clone(),
         })?;
         Ok(())
     }
 
-    fn stop_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
+    fn stop_vm(
+        &self,
+        authority: &ProviderMutationAuthority<'_>,
+        expected: &ProviderVm,
+    ) -> Result<(), ProviderError> {
+        authority.validate_vm(expected)?;
         let _: EmptyResponse = self.execute(HyperVAction::StopVm {
             expected: expected.clone(),
         })?;
         Ok(())
     }
 
-    fn remove_vm(&self, expected: &ProviderVm) -> Result<(), ProviderError> {
+    fn remove_vm(
+        &self,
+        authority: &ProviderMutationAuthority<'_>,
+        expected: &ProviderVm,
+    ) -> Result<(), ProviderError> {
+        authority.validate_vm(expected)?;
         let _: EmptyResponse = self.execute(HyperVAction::RemoveVm {
             expected: expected.clone(),
         })?;
@@ -191,27 +225,54 @@ mod tests {
 
     #[test]
     fn create_vm_uses_one_typed_executor_action() {
+        let (_directory, _state, installation, runtime, record) =
+            crate::providers::test_mutation_fixture();
         let executor = RecordingExecutor {
             actions: Mutex::new(Vec::new()),
             response: json!({
                 "id": "11111111-1111-1111-1111-111111111111",
-                "name": "vmcell-test"
+                "name": record.ownership.provider_object_name.clone()
             }),
         };
         let provider = HyperVProvider::new(executor);
         let request = CreateVmRequest {
-            name: "vmcell-test".to_owned(),
-            configuration_path: PathBuf::from(r"C:\vmcell\config"),
-            overlay_path: PathBuf::from(r"C:\vmcell\cell.vhdx"),
+            name: record.ownership.provider_object_name.clone(),
+            configuration_path: record.ownership.configuration_path.clone(),
+            overlay_path: record.ownership.overlay_path.clone(),
             memory_mib: 4096,
         };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
 
-        let identity = provider.create_vm(&request).unwrap();
+        let identity = provider.create_vm(&authority, &request).unwrap();
 
-        assert_eq!(identity.name, "vmcell-test");
+        assert_eq!(identity.name, request.name);
         assert_eq!(
             provider.executor.actions.lock().unwrap().as_slice(),
             &[HyperVAction::CreateVm { request }]
         );
+    }
+
+    #[test]
+    fn mutation_authority_rejects_out_of_cell_provider_path() {
+        let (_directory, _state, installation, runtime, record) =
+            crate::providers::test_mutation_fixture();
+        let executor = RecordingExecutor {
+            actions: Mutex::new(Vec::new()),
+            response: json!(null),
+        };
+        let provider = HyperVProvider::new(executor);
+        let request = CreateVmRequest {
+            name: record.ownership.provider_object_name.clone(),
+            configuration_path: PathBuf::from(r"C:\foreign"),
+            overlay_path: record.ownership.overlay_path.clone(),
+            memory_mib: 4096,
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+
+        assert!(matches!(
+            provider.create_vm(&authority, &request),
+            Err(ProviderError::Authority(_))
+        ));
+        assert!(provider.executor.actions.lock().unwrap().is_empty());
     }
 }

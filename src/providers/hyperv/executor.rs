@@ -223,6 +223,28 @@ mod tests {
                     "ownership precondition {token} must precede {verb}"
                 );
             }
+            assert!(
+                script.matches("Assert-ExpectedVm $expected").count() >= 2,
+                "{verb} must use a fresh second ownership snapshot immediately before mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mutating_script_uses_the_cross_process_provider_mutex() {
+        for script in [
+            CREATE_DIFFERENCING_VHD_SCRIPT,
+            CREATE_VM_SCRIPT,
+            CLAIM_VM_SCRIPT,
+            CONFIGURE_VM_SCRIPT,
+            START_VM_SCRIPT,
+            STOP_VM_SCRIPT,
+            REMOVE_VM_SCRIPT,
+        ] {
+            assert!(script.contains("Global\\vmcell-hyperv-provider-v1"));
+            assert!(script.contains("WaitOne(0)"));
+            assert!(script.contains("AbandonedMutexException"));
+            assert!(script.contains("ReleaseMutex"));
         }
     }
 }

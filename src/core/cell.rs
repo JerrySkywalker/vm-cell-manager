@@ -66,6 +66,7 @@ pub enum CellPhase {
     ProviderObjectClaimed,
     Ready,
     Destroying,
+    DestroyingProvisioning,
     Destroyed,
 }
 

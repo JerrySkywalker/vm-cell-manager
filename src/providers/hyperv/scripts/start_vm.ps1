@@ -5,6 +5,8 @@ trap { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
 
 $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $expected = $request.expected
+$providerMutex = [System.Threading.Mutex]::new($false, 'Global\vmcell-hyperv-provider-v1')
+$providerMutexHeld = $false
 
 function ConvertTo-PathIdentity([string]$Value) {
   $identity = $Value.Replace('/', '\')
@@ -41,6 +43,16 @@ function Assert-ExpectedVm($Expected) {
   return $vm
 }
 
-$vm = Assert-ExpectedVm $expected
-Start-VM -VM $vm -ErrorAction Stop | Out-Null
-[pscustomobject]@{ ok = $true } | ConvertTo-Json -Compress
+try {
+  try { $providerMutexHeld = $providerMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $providerMutexHeld = $true }
+  if (-not $providerMutexHeld) {
+    throw 'OWNERSHIP_CHANGED: another vmcell Hyper-V mutation is active'
+  }
+  $null = Assert-ExpectedVm $expected
+  $vm = Assert-ExpectedVm $expected
+  Start-VM -VM $vm -ErrorAction Stop | Out-Null
+  [pscustomobject]@{ ok = $true } | ConvertTo-Json -Compress
+} finally {
+  if ($providerMutexHeld) { $providerMutex.ReleaseMutex() }
+  $providerMutex.Dispose()
+}
