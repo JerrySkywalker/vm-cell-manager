@@ -181,4 +181,3 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           cargo test --all-targets --all-features
-

@@ -1,0 +1,6 @@
+# Canonical repository text format.
+* text=auto eol=lf
+
+# Native Windows command scripts are the exception.
+*.cmd text eol=crlf
+*.bat text eol=crlf
