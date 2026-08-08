@@ -20,6 +20,7 @@ concurrency:
 jobs:
   windows-core:
     name: Windows Core / Self-hosted
+
     runs-on:
       - self-hosted
       - Windows
@@ -32,38 +33,148 @@ jobs:
 
     timeout-minutes: 15
 
+    env:
+      EXPECTED_RUNNER_NAME: jerry-ci-win-01-vm-cell-manager
+      EXPECTED_GIT: C:\ProgramData\jerry-ci\git\cmd\git.exe
+      EXPECTED_CARGO_HOME: C:\ProgramData\jerry-ci\cargo
+      EXPECTED_RUSTUP_HOME: C:\ProgramData\jerry-ci\rustup
+      EXPECTED_RUSTUP_TOOLCHAIN: 1.97.1-x86_64-pc-windows-msvc
+
     steps:
-      - name: Checkout
+      - name: Checkout exact SHA
         uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
 
-      - name: Runner diagnostics
+      - name: Verify runner identity and dedicated toolchain
         shell: pwsh
         run: |
-          Write-Host "identity=$(whoami)"
-          Write-Host "computer=$env:COMPUTERNAME"
+          $ErrorActionPreference = 'Stop'
 
-          Get-Command git |
-            Select-Object Name, Source |
-            Format-Table -AutoSize
+          $expectedSha = '${{ github.sha }}'
+          $actualSha = (git rev-parse HEAD).Trim()
+          $identity = (whoami).Trim().ToLowerInvariant()
 
-          Get-Command cargo |
-            Select-Object Name, Source |
-            Format-Table -AutoSize
+          $git = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
+          $rustc = (Get-Command rustc -CommandType Application -ErrorAction Stop).Source
+          $rustup = (Get-Command rustup -CommandType Application -ErrorAction Stop).Source
+          $rustfmt = (Get-Command rustfmt -CommandType Application -ErrorAction Stop).Source
+          $clippy = (Get-Command cargo-clippy -CommandType Application -ErrorAction Stop).Source
+
+          Write-Host "expected_sha=$expectedSha"
+          Write-Host "actual_sha=$actualSha"
+          Write-Host "runner_name=$env:RUNNER_NAME"
+          Write-Host "runner_os=$env:RUNNER_OS"
+          Write-Host "runner_arch=$env:RUNNER_ARCH"
+          Write-Host "identity=$identity"
+
+          Write-Host "git=$git"
+          Write-Host "cargo=$cargo"
+          Write-Host "rustc=$rustc"
+          Write-Host "rustup=$rustup"
+          Write-Host "rustfmt=$rustfmt"
+          Write-Host "clippy=$clippy"
+
+          Write-Host "cargo_home=$env:CARGO_HOME"
+          Write-Host "rustup_home=$env:RUSTUP_HOME"
+          Write-Host "rustup_toolchain=$env:RUSTUP_TOOLCHAIN"
 
           git --version
           rustc --version
           cargo --version
+          rustup show active-toolchain
+          rustfmt --version
+          cargo-clippy --version
+
+          if ($actualSha -ne $expectedSha) {
+            throw 'checkout SHA mismatch'
+          }
+
+          if ($env:RUNNER_NAME -ne $env:EXPECTED_RUNNER_NAME) {
+            throw 'runner name mismatch'
+          }
+
+          if ($env:RUNNER_OS -ne 'Windows') {
+            throw 'runner OS mismatch'
+          }
+
+          if ($env:RUNNER_ARCH -ne 'X64') {
+            throw 'runner architecture mismatch'
+          }
+
+          if ($identity -ne 'nt authority\network service') {
+            throw 'runner service identity mismatch'
+          }
+
+          if (-not [string]::Equals(
+              $git,
+              $env:EXPECTED_GIT,
+              [System.StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw 'dedicated Git path mismatch'
+          }
+
+          if ($env:CARGO_HOME -ne $env:EXPECTED_CARGO_HOME) {
+            throw 'CARGO_HOME mismatch'
+          }
+
+          if ($env:RUSTUP_HOME -ne $env:EXPECTED_RUSTUP_HOME) {
+            throw 'RUSTUP_HOME mismatch'
+          }
+
+          if ($env:RUSTUP_TOOLCHAIN -ne $env:EXPECTED_RUSTUP_TOOLCHAIN) {
+            throw 'RUSTUP_TOOLCHAIN mismatch'
+          }
+
+          $expectedCargoBin = Join-Path $env:EXPECTED_CARGO_HOME 'bin'
+
+          foreach ($path in @($cargo, $rustc, $rustup, $rustfmt, $clippy)) {
+            if (-not $path.StartsWith(
+                "$expectedCargoBin\",
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+              throw "dedicated Rust executable path mismatch: $path"
+            }
+          }
+
+      - name: Bind bounded Cargo target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $target = Join-Path $env:RUNNER_TEMP 'vmcell-cargo-target'
+
+          New-Item `
+            -ItemType Directory `
+            -Path $target `
+            -Force |
+            Out-Null
+
+          "CARGO_TARGET_DIR=$target" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "cargo_target_dir=$target"
 
       - name: Format
-        run: cargo fmt --all -- --check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets --all-features
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --all-targets --all-features
