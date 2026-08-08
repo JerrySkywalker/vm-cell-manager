@@ -50,6 +50,11 @@ Planned acceptance:
 - TTL model and explicit `vmcell gc`;
 - guest-control recovery layered on the M1 ownership reconciliation model.
 
+Architecture admission is complete on the stacked M2 branch. Repository-local
+implementation and mock/fault validation do not constitute real PowerShell
+Direct acceptance; that remains a dedicated-host gate after M1 real-provider
+acceptance.
+
 ## M3 — QEMU reference provider
 
 Goal: validate the provider abstraction against an independent VMM.

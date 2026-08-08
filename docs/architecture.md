@@ -55,6 +55,24 @@ The implementation areas map to Rust modules rather than services:
 - `state`: local manifests, locks, ownership metadata, and logs;
 - the cell engine composes `core`, `providers`, and `state` in-process rather than running as a daemon.
 
+M2 guest actions use a second, narrower authority flow:
+
+```text
+CLI/library request + ephemeral credential
+   -> CellEngine acquires the local mutation lock
+   -> current installation + exact-owned running VM proof
+   -> pinned state/runtime handles
+   -> opaque GuestActionAuthority
+   -> PowerShell Direct takes the provider mutex and rechecks by GUID
+   -> readiness / exec / copy
+   -> non-secret operation result + atomic artifact commit
+```
+
+Guest credentials are not durable state. Guest operation records intentionally
+omit command arguments, output, raw transport errors, and authentication
+material. An unknown operation is evidence of possible guest side effects, not
+permission to replay it.
+
 ## Control flow
 
 The M1 create flow is:
