@@ -74,7 +74,7 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
                         accelerators: vec!["hyper-v".to_owned()],
                         guest_os: vec!["windows".to_owned(), "linux".to_owned()],
                         guest_arch: vec![std::env::consts::ARCH.to_owned()],
-                        guest_transports: vec!["powershell-direct".to_owned(), "ssh".to_owned()],
+                        guest_transports: vec!["powershell-direct".to_owned()],
                         networkless_guest_exec: true,
                     },
                 },

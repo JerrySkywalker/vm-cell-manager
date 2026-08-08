@@ -11,6 +11,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellRecord};
+use crate::core::guest::{
+    ARTIFACT_SCHEMA_VERSION, ArtifactRecord, GUEST_OPERATION_SCHEMA_VERSION, GuestOperationId,
+    GuestOperationRecord,
+};
 use crate::core::image::{IMAGE_SCHEMA_VERSION, ImageId, ImageRecord};
 use crate::core::ownership::OWNERSHIP_MARKER_SCHEMA;
 
@@ -101,6 +105,18 @@ pub(crate) struct CellRuntimeGuard {
     cell_handle: Option<File>,
 }
 
+pub(crate) struct ArtifactGuard {
+    cell_id: CellId,
+    operation_id: GuestOperationId,
+    root: PathBuf,
+    files_root: PathBuf,
+    _state_handle: File,
+    _artifacts_handle: File,
+    _cell_handle: File,
+    _operation_handle: File,
+    _files_handle: File,
+}
+
 impl CellRuntimeGuard {
     pub(crate) fn cell_id(&self) -> CellId {
         self.cell_id
@@ -153,7 +169,14 @@ impl StateStore {
         ensure_directory(&self.root)?;
         let state_root_handle = open_ordinary_directory(&self.root)?;
         let mut state_directories = Vec::new();
-        for name in ["locks", "images", "cells", "runtime"] {
+        for name in [
+            "locks",
+            "images",
+            "cells",
+            "runtime",
+            "operations",
+            "artifacts",
+        ] {
             let directory = self.root.join(name);
             create_direct_child_directory(&directory)?;
             state_directories.push(open_ordinary_directory(&directory)?);
@@ -298,6 +321,136 @@ impl StateStore {
         read_json_directory(&self.root.join("cells"), validate_cell_schema)
     }
 
+    pub(crate) fn save_guest_operation(
+        &self,
+        record: &GuestOperationRecord,
+    ) -> Result<(), StateError> {
+        let path = self.guest_operation_path(record.id);
+        validate_guest_operation_schema(&path, record)?;
+        write_json_atomic(&path, record)
+    }
+
+    pub fn load_guest_operation(
+        &self,
+        operation_id: GuestOperationId,
+    ) -> Result<GuestOperationRecord, StateError> {
+        let path = self.guest_operation_path(operation_id);
+        let record = read_json(&path)?;
+        validate_guest_operation_schema(&path, &record)?;
+        if record.id != operation_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "guest operation record",
+                path,
+                expected: operation_id.to_string(),
+            });
+        }
+        Ok(record)
+    }
+
+    pub fn list_guest_operations(&self) -> Result<Vec<GuestOperationRecord>, StateError> {
+        read_json_directory(
+            &self.root.join("operations"),
+            validate_guest_operation_schema,
+        )
+    }
+
+    pub(crate) fn prepare_artifact_root(
+        &self,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<ArtifactGuard, StateError> {
+        let state_handle = open_ordinary_directory(&self.root)?;
+        let artifacts = self.root.join("artifacts");
+        create_direct_child_directory(&artifacts)?;
+        let artifacts_handle = open_ordinary_directory(&artifacts)?;
+        let cell_root = artifacts.join(cell_id.to_string());
+        create_direct_child_directory(&cell_root)?;
+        let cell_handle = open_ordinary_directory(&cell_root)?;
+        let root = cell_root.join(operation_id.to_string());
+        create_direct_child_directory(&root)?;
+        let operation_handle = open_ordinary_directory(&root)?;
+        let files_root = root.join("files");
+        create_direct_child_directory(&files_root)?;
+        let files_handle = open_ordinary_directory(&files_root)?;
+        ensure_existing_ancestors_are_ordinary(&files_root)?;
+        ensure_no_reparse_tree(&root)?;
+        Ok(ArtifactGuard {
+            cell_id,
+            operation_id,
+            root,
+            files_root,
+            _state_handle: state_handle,
+            _artifacts_handle: artifacts_handle,
+            _cell_handle: cell_handle,
+            _operation_handle: operation_handle,
+            _files_handle: files_handle,
+        })
+    }
+
+    pub(crate) fn write_artifact_file(
+        &self,
+        guard: &ArtifactGuard,
+        index: usize,
+        bytes: &[u8],
+    ) -> Result<String, StateError> {
+        self.validate_artifact_guard(guard)?;
+        let name = format!("{index:04}.bin");
+        let path = guard.files_root.join(&name);
+        write_bytes_new_atomic(&path, bytes)?;
+        self.validate_artifact_guard(guard)?;
+        Ok(format!(
+            "artifacts/{}/{}/files/{name}",
+            guard.cell_id, guard.operation_id
+        ))
+    }
+
+    pub(crate) fn save_artifact_new(
+        &self,
+        guard: &ArtifactGuard,
+        record: &ArtifactRecord,
+    ) -> Result<(), StateError> {
+        self.validate_artifact_guard(guard)?;
+        let path = guard.root.join("manifest.json");
+        validate_artifact_schema(&path, record)?;
+        if record.id != guard.operation_id || record.cell_id != guard.cell_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "artifact record",
+                path,
+                expected: format!("{}/{}", guard.cell_id, guard.operation_id),
+            });
+        }
+        let expected_prefix = format!("artifacts/{}/{}/files/", guard.cell_id, guard.operation_id);
+        if record.entries.iter().any(|entry| {
+            !entry.host_relative_path.starts_with(&expected_prefix)
+                || entry.host_relative_path[expected_prefix.len()..].contains('/')
+        }) {
+            return Err(StateError::UnsafeRuntimePath(path));
+        }
+        write_json_new(&path, record)?;
+        self.validate_artifact_guard(guard)
+    }
+
+    pub fn load_artifact(
+        &self,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<ArtifactRecord, StateError> {
+        let root = self.artifact_root(cell_id, operation_id);
+        ensure_existing_ancestors_are_ordinary(&root)?;
+        let _root_handle = open_ordinary_directory(&root)?;
+        let path = root.join("manifest.json");
+        let record = read_json(&path)?;
+        validate_artifact_schema(&path, &record)?;
+        if record.id != operation_id || record.cell_id != cell_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "artifact record",
+                path,
+                expected: format!("{cell_id}/{operation_id}"),
+            });
+        }
+        Ok(record)
+    }
+
     #[must_use]
     pub fn cell_runtime_root(&self, cell_id: CellId) -> PathBuf {
         self.root.join("runtime").join(cell_id.0.to_string())
@@ -432,6 +585,28 @@ impl StateStore {
 
     fn cell_path(&self, cell_id: CellId) -> PathBuf {
         self.root.join("cells").join(format!("{}.json", cell_id.0))
+    }
+
+    fn guest_operation_path(&self, operation_id: GuestOperationId) -> PathBuf {
+        self.root
+            .join("operations")
+            .join(format!("{}.json", operation_id.0))
+    }
+
+    fn artifact_root(&self, cell_id: CellId, operation_id: GuestOperationId) -> PathBuf {
+        self.root
+            .join("artifacts")
+            .join(cell_id.to_string())
+            .join(operation_id.to_string())
+    }
+
+    fn validate_artifact_guard(&self, guard: &ArtifactGuard) -> Result<(), StateError> {
+        let expected_root = self.artifact_root(guard.cell_id, guard.operation_id);
+        if guard.root != expected_root || guard.files_root != expected_root.join("files") {
+            return Err(StateError::UnsafeRuntimePath(guard.root.clone()));
+        }
+        ensure_existing_ancestors_are_ordinary(&guard.files_root)?;
+        ensure_no_reparse_tree(&guard.root)
     }
 }
 
@@ -604,6 +779,53 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
     result
 }
 
+fn write_bytes_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
+    if path.exists() {
+        return Err(StateError::AlreadyExists(path.to_path_buf()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| StateError::UnsafeRuntimePath(path.to_path_buf()))?;
+    ensure_existing_ancestors_are_ordinary(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("artifact"),
+        Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+            options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|source| io_error(&temporary, source))?;
+        file.write_all(bytes)
+            .map_err(|source| io_error(&temporary, source))?;
+        file.sync_all()
+            .map_err(|source| io_error(&temporary, source))?;
+        drop(file);
+        #[cfg(test)]
+        abort_at_test_checkpoint("before_artifact_rename");
+        fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+        #[cfg(test)]
+        abort_at_test_checkpoint("after_artifact_rename");
+        ensure_existing_ancestors_are_ordinary(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 fn abort_at_test_checkpoint(checkpoint: &str) {
     let is_child =
@@ -725,6 +947,37 @@ fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateErr
     Ok(())
 }
 
+fn validate_guest_operation_schema(
+    path: &Path,
+    record: &GuestOperationRecord,
+) -> Result<(), StateError> {
+    ensure_schema(
+        path,
+        "guest operation record",
+        record.schema_version,
+        GUEST_OPERATION_SCHEMA_VERSION,
+    )?;
+    let expected = path.file_stem().and_then(|value| value.to_str());
+    let record_id = record.id.to_string();
+    if expected != Some(record_id.as_str()) {
+        return Err(StateError::IdentityMismatch {
+            kind: "guest operation record",
+            path: path.to_path_buf(),
+            expected: expected.unwrap_or("<non-utf8>").to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_artifact_schema(path: &Path, record: &ArtifactRecord) -> Result<(), StateError> {
+    ensure_schema(
+        path,
+        "artifact record",
+        record.schema_version,
+        ARTIFACT_SCHEMA_VERSION,
+    )
+}
+
 fn ensure_schema(
     path: &Path,
     kind: &'static str,
@@ -815,6 +1068,9 @@ mod tests {
 
     use super::*;
     use crate::core::cell::{CellPhase, CellSpec, CellState};
+    use crate::core::guest::{
+        ArtifactEntry, GuestFailureClass, GuestOperationKind, GuestOperationPhase,
+    };
     use crate::core::image::{Architecture, GuestOs, ImageBinding, ImageVariant};
     use crate::core::ownership::CellOwnership;
 
@@ -839,7 +1095,7 @@ mod tests {
                 memory_mib: 4096,
                 ttl_seconds: None,
             },
-            image: ImageBinding::from_variant(image_id, &variant),
+            image: ImageBinding::from_variant(image_id, GuestOs::Windows, &variant),
             ownership: CellOwnership::new(
                 Uuid::new_v4(),
                 cell_id,
@@ -942,7 +1198,7 @@ mod tests {
                 memory_mib: 4096,
                 ttl_seconds: None,
             },
-            image: ImageBinding::from_variant(image_id, &image.variants[0]),
+            image: ImageBinding::from_variant(image_id, image.guest_os, &image.variants[0]),
             ownership,
             provider_object: None,
             state: CellState::Creating,
@@ -961,6 +1217,247 @@ mod tests {
             store.load_cell(cell_id).unwrap().last_error.as_deref(),
             Some("updated atomically")
         );
+    }
+
+    #[test]
+    fn guest_operation_and_artifact_records_are_identity_bound_and_secret_free() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let _mutation = store.acquire_mutation_lock().unwrap();
+        let cell_id = CellId::new();
+        let now = Utc::now();
+        let mut operation = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
+        operation.phase = GuestOperationPhase::Failed;
+        operation.failure = Some(GuestFailureClass::Authentication);
+        store.save_guest_operation(&operation).unwrap();
+        assert_eq!(store.load_guest_operation(operation.id).unwrap(), operation);
+        let operation_json = fs::read_to_string(store.guest_operation_path(operation.id)).unwrap();
+        assert!(!operation_json.contains("credential-sentinel"));
+        assert!(!operation_json.contains("argument-sentinel"));
+
+        let artifact_id = GuestOperationId::new();
+        let guard = store.prepare_artifact_root(cell_id, artifact_id).unwrap();
+        let relative = store
+            .write_artifact_file(&guard, 0, b"bounded-artifact")
+            .unwrap();
+        let artifact = ArtifactRecord {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            id: artifact_id,
+            cell_id,
+            created_at: now,
+            entries: vec![ArtifactEntry {
+                guest_path: "results/output.bin".to_owned(),
+                host_relative_path: relative,
+                sha256: "frozen-test-hash".to_owned(),
+                size: 16,
+            }],
+        };
+        store.save_artifact_new(&guard, &artifact).unwrap();
+        assert_eq!(store.load_artifact(cell_id, artifact_id).unwrap(), artifact);
+
+        let mut unsupported = artifact;
+        unsupported.schema_version = ARTIFACT_SCHEMA_VERSION + 1;
+        fs::write(
+            guard.root.join("manifest.json"),
+            serde_json::to_vec(&unsupported).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_artifact(cell_id, artifact_id),
+            Err(StateError::UnsupportedSchema {
+                kind: "artifact record",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guest_operation_schema_and_filename_identity_are_gated() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        drop(store.acquire_mutation_lock().unwrap());
+        let cell_id = CellId::new();
+        let requested_id = GuestOperationId::new();
+        let mut operation =
+            GuestOperationRecord::intent(cell_id, GuestOperationKind::CopyIn, Utc::now());
+        let operations = store.root().join("operations");
+        fs::create_dir_all(&operations).unwrap();
+        fs::write(
+            operations.join(format!("{requested_id}.json")),
+            serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_guest_operation(requested_id),
+            Err(StateError::IdentityMismatch {
+                kind: "guest operation record",
+                ..
+            })
+        ));
+
+        operation.id = requested_id;
+        operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION + 1;
+        fs::write(
+            operations.join(format!("{requested_id}.json")),
+            serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_guest_operation(requested_id),
+            Err(StateError::UnsupportedSchema {
+                kind: "guest operation record",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn artifact_bytes_survive_real_process_abort_only_after_atomic_rename() {
+        if std::env::var_os("VMCELL_TEST_ARTIFACT_CRASH_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let cell_id =
+                CellId::from_str(std::env::var("VMCELL_TEST_CELL_ID").unwrap().as_str()).unwrap();
+            let operation_id = GuestOperationId::from_str(
+                std::env::var("VMCELL_TEST_OPERATION_ID").unwrap().as_str(),
+            )
+            .unwrap();
+            let store = StateStore::new(root);
+            let guard = store.prepare_artifact_root(cell_id, operation_id).unwrap();
+            store
+                .write_artifact_file(&guard, 0, b"atomic-artifact")
+                .unwrap();
+            std::process::exit(77);
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        drop(store.acquire_mutation_lock().unwrap());
+        let cell_id = CellId::new();
+        for (checkpoint, should_exist) in [
+            ("before_artifact_rename", false),
+            ("after_artifact_rename", true),
+        ] {
+            let operation_id = GuestOperationId::new();
+            let output = subprocess_for(
+                "state::tests::artifact_bytes_survive_real_process_abort_only_after_atomic_rename",
+            )
+            .env("VMCELL_TEST_ARTIFACT_CRASH_CHILD", "1")
+            .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+            .env("VMCELL_TEST_ABORT_AT", checkpoint)
+            .env("VMCELL_TEST_STATE_ROOT", store.root())
+            .env("VMCELL_TEST_CELL_ID", cell_id.to_string())
+            .env("VMCELL_TEST_OPERATION_ID", operation_id.to_string())
+            .output()
+            .unwrap();
+            assert!(
+                !output.status.success(),
+                "child unexpectedly succeeded: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_ne!(
+                output.status.code(),
+                Some(77),
+                "child missed checkpoint: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let committed = store
+                .artifact_root(cell_id, operation_id)
+                .join("files")
+                .join("0000.bin");
+            if should_exist {
+                for _ in 0..100 {
+                    if committed.exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let present = fs::read_dir(committed.parent().unwrap())
+                .map(|entries| {
+                    entries
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                committed.exists(),
+                should_exist,
+                "checkpoint {checkpoint} left {present:?} under {}; child stderr: {}",
+                committed.parent().unwrap().display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if should_exist {
+                assert_eq!(fs::read(committed).unwrap(), b"atomic-artifact");
+            }
+        }
+    }
+
+    #[test]
+    fn guest_operation_unknown_and_artifact_boundaries_survive_process_abort() {
+        if std::env::var_os("VMCELL_TEST_GUEST_OPERATION_CRASH_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let operation_id = GuestOperationId::from_str(
+                std::env::var("VMCELL_TEST_OPERATION_ID").unwrap().as_str(),
+            )
+            .unwrap();
+            let phase = std::env::var("VMCELL_TEST_GUEST_PHASE").unwrap();
+            let store = StateStore::new(root);
+            let mut operation = store.load_guest_operation(operation_id).unwrap();
+            operation.phase = match phase.as_str() {
+                "transport_active" => GuestOperationPhase::TransportActive,
+                "artifact_committed" => GuestOperationPhase::ArtifactCommitted,
+                value => panic!("unknown guest phase {value}"),
+            };
+            operation.updated_at = Utc::now();
+            store.save_guest_operation(&operation).unwrap();
+            std::process::exit(77);
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        drop(store.acquire_mutation_lock().unwrap());
+        let operation = GuestOperationRecord::intent(
+            CellId::new(),
+            GuestOperationKind::ArtifactCollect,
+            Utc::now(),
+        );
+        store.save_guest_operation(&operation).unwrap();
+
+        for phase in ["transport_active", "artifact_committed"] {
+            let baseline = store.load_guest_operation(operation.id).unwrap();
+            for (checkpoint, committed) in [
+                ("before_manifest_rename", false),
+                ("after_manifest_rename", true),
+            ] {
+                let status = subprocess_for(
+                    "state::tests::guest_operation_unknown_and_artifact_boundaries_survive_process_abort",
+                )
+                .env("VMCELL_TEST_GUEST_OPERATION_CRASH_CHILD", "1")
+                .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+                .env("VMCELL_TEST_ABORT_AT", checkpoint)
+                .env("VMCELL_TEST_STATE_ROOT", store.root())
+                .env("VMCELL_TEST_OPERATION_ID", operation.id.to_string())
+                .env("VMCELL_TEST_GUEST_PHASE", phase)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+                assert!(!status.success());
+                assert_ne!(status.code(), Some(77));
+                let persisted = store.load_guest_operation(operation.id).unwrap();
+                if committed {
+                    let expected = match phase {
+                        "transport_active" => GuestOperationPhase::TransportActive,
+                        "artifact_committed" => GuestOperationPhase::ArtifactCommitted,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(persisted.phase, expected);
+                    assert!(!persisted.phase.is_terminal());
+                } else {
+                    assert_eq!(persisted, baseline);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1175,13 +1672,26 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = StateStore::new(directory.path().join("state"));
         let guard = store.acquire_mutation_lock().unwrap();
-        let cells = store.root().join("cells");
-        let moved = store.root().join("cells-moved");
-
-        assert!(fs::rename(&cells, &moved).is_err());
-        assert!(cells.is_dir());
+        for name in [
+            "locks",
+            "images",
+            "cells",
+            "runtime",
+            "operations",
+            "artifacts",
+        ] {
+            let source = store.root().join(name);
+            let moved = store.root().join(format!("{name}-moved"));
+            assert!(
+                fs::rename(&source, &moved).is_err(),
+                "{name} was replaceable"
+            );
+            assert!(source.is_dir());
+        }
 
         drop(guard);
+        let cells = store.root().join("cells");
+        let moved = store.root().join("cells-moved");
         fs::rename(&cells, &moved).unwrap();
         assert!(moved.is_dir());
     }
@@ -1272,6 +1782,7 @@ mod tests {
             },
             image: ImageBinding {
                 image_id,
+                guest_os: Some(GuestOs::Windows),
                 provider: "hyperv".to_owned(),
                 disk_format: "vhdx".to_owned(),
                 path: directory.path().join("base.vhdx"),

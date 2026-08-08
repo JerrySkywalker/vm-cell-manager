@@ -106,6 +106,8 @@ pub struct ImageRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBinding {
     pub image_id: ImageId,
+    #[serde(default)]
+    pub guest_os: Option<GuestOs>,
     pub provider: String,
     pub disk_format: String,
     pub path: PathBuf,
@@ -115,9 +117,10 @@ pub struct ImageBinding {
 
 impl ImageBinding {
     #[must_use]
-    pub fn from_variant(image_id: ImageId, variant: &ImageVariant) -> Self {
+    pub fn from_variant(image_id: ImageId, guest_os: GuestOs, variant: &ImageVariant) -> Self {
         Self {
             image_id,
+            guest_os: Some(guest_os),
             provider: variant.provider.clone(),
             disk_format: variant.disk_format.clone(),
             path: variant.path.clone(),

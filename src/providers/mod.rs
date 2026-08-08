@@ -440,6 +440,7 @@ pub(crate) fn test_mutation_fixture() -> (
         },
         image: ImageBinding {
             image_id,
+            guest_os: Some(crate::core::image::GuestOs::Windows),
             provider: "hyperv".to_owned(),
             disk_format: "vhdx".to_owned(),
             path: directory.path().join("base.vhdx"),
