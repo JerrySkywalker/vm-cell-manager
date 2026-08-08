@@ -12,11 +12,20 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
+The declared compiler floor is proved separately with an isolated Rust 1.85.0 toolchain and the locked graph:
+
+```bash
+cargo metadata --locked --offline --all-features --format-version 1
+cargo check --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-features --doc
+```
+
 Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
 
 ## Provider safety rule
 
-M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.
+M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands carrying an engine-issued installation/runtime authority and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.
 
 ## M1 validation tiers
 

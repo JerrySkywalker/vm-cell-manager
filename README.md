@@ -154,6 +154,8 @@ Initial implementation rules:
 - do not create or rewrite host-global virtual networking implicitly;
 - do not mutate foreign VMs by default;
 - only destroy a VM after ownership and local manifest identity agree;
+- require an engine-issued, current-installation/runtime authority for every provider mutation;
+- quarantine pre-ID/name-only crash remnants instead of adopting or deleting them;
 - keep base images immutable after registration;
 - make cleanup idempotent where practical;
 - expose stable JSON output and explicit exit codes for automation.

@@ -9,6 +9,7 @@ Implementation does not authorize real Hyper-V mutation. Real acceptance require
 - disposable ordinary non-reparse base VHDX with recorded SHA-256;
 - ordinary non-reparse state/runtime ancestry with physical containment recorded;
 - no VM or switch name collision;
+- exclusive operator control of Hyper-V for the bounded acceptance window; no concurrent Hyper-V Manager, PowerShell, WMI, or other provider writer;
 - inventory of foreign VMs and switches captured read-only;
 - explicit operator authorization for this exact run.
 
@@ -24,4 +25,4 @@ Implementation does not authorize real Hyper-V mutation. Real acceptance require
 
 Any ownership mismatch, unexpected provider object, image drift, extra disk, network adapter, or state ambiguity is a terminal fail-closed result. The acceptance process must not adopt, repair, or delete ambiguous provider state.
 
-Acceptance also verifies that provider-side start, stop, and remove preconditions reject an injected expected-state mismatch before the Hyper-V verb. A deliberately interrupted create may only be cleaned automatically after its provider id and complete ownership proof are durable; name-only or pre-marker objects require operator quarantine and remain outside automatic mutation authority.
+Acceptance also verifies that provider-side start, stop, and remove preconditions reject an injected expected-state mismatch before the Hyper-V verb. A deliberately interrupted create may be recovered only after its immutable provider id and exact creation receipt are durable. Rust may idempotently claim that exact object and then apply exact-owned destroy; a claimed but partially configured object may also be destroyed with phase-specific proof. Name-only/pre-id objects require operator quarantine and remain outside automatic mutation authority.
