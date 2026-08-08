@@ -32,9 +32,11 @@ pub enum Command {
     /// Probe the host and built-in providers without mutating host state.
     Doctor,
 
-    /// List built-in provider probes.
-    #[command(name = "provider-list")]
-    ProviderList,
+    /// Inspect built-in local providers.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
 
     /// Register and inspect immutable images.
     Image {
@@ -95,6 +97,12 @@ pub enum ImageCommand {
 
     /// Inspect one registered image manifest.
     Inspect { id: ImageId },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// List built-in provider probes.
+    List,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -226,5 +234,17 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_nested_provider_list_surface() {
+        let cli = Cli::try_parse_from(["vmcell", "provider", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Provider {
+                command: ProviderCommand::List
+            }
+        ));
+        assert!(Cli::try_parse_from(["vmcell", "provider-list"]).is_err());
     }
 }

@@ -5,6 +5,7 @@ use clap::Parser;
 use serde::Serialize;
 use vm_cell_manager::cli::{
     Cli, Command, DoctorReport, ErrorBody, ErrorEnvelope, ImageCommand, ListEnvelope,
+    ProviderCommand,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{CellEngine, RegisterImageRequest};
@@ -58,7 +59,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 }
             })?;
         }
-        Command::ProviderList => {
+        Command::Provider {
+            command: ProviderCommand::List,
+        } => {
             let response = ListEnvelope::new(builtin_provider_probes());
             emit(&response, cli.json, || {
                 for probe in &response.items {
@@ -177,7 +180,9 @@ fn run_m1(
                 })?;
             }
         }
-        Command::Doctor | Command::ProviderList => unreachable!("handled before engine creation"),
+        Command::Doctor | Command::Provider { .. } => {
+            unreachable!("handled before engine creation")
+        }
     }
     Ok(())
 }

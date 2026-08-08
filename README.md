@@ -121,14 +121,14 @@ Read-only discovery remains available:
 
 ```text
 vmcell doctor [--json]
-vmcell provider-list [--json]
+vmcell provider list [--json]
 ```
 
 M1 adds the following Hyper-V surface:
 
 ```text
 vmcell doctor
-vmcell provider-list
+vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
 vmcell image list
 vmcell image inspect IMAGE

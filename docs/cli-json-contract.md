@@ -6,7 +6,7 @@ M1 CLI output is pre-stable but explicitly versioned. `--json` is global and cau
 
 ```text
 vmcell doctor
-vmcell provider-list
+vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
 vmcell image list
 vmcell image inspect IMAGE
