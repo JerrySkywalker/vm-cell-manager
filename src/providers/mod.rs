@@ -25,5 +25,8 @@ pub fn builtin_provider_probes() -> Vec<ProviderProbe> {
         Box::new(qemu::QemuProvider),
     ];
 
-    providers.into_iter().map(|provider| provider.probe()).collect()
+    providers
+        .into_iter()
+        .map(|provider| provider.probe())
+        .collect()
 }
