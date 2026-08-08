@@ -1,30 +1,69 @@
 name: CI
 
 on:
-  pull_request:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+      - 'fix/**'
+      - 'chore/**'
+      - 'ci/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: vmcell-core-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  rust:
-    name: Rust / ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  windows-core:
+    name: Windows Core / Self-hosted
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+      - jerry-ci
+      - jerry-ci-win
+      - vm-cell-manager
+      - core
+      - trusted
+
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Runner diagnostics
+        shell: pwsh
+        run: |
+          Write-Host "identity=$(whoami)"
+          Write-Host "computer=$env:COMPUTERNAME"
+
+          Get-Command git |
+            Select-Object Name, Source |
+            Format-Table -AutoSize
+
+          Get-Command cargo |
+            Select-Object Name, Source |
+            Format-Table -AutoSize
+
+          git --version
+          rustc --version
+          cargo --version
+
       - name: Format
-        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Test
         run: cargo test --all-targets --all-features
