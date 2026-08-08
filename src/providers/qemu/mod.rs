@@ -61,11 +61,12 @@ fn probe_qemu() -> ProviderProbe {
         _ => "",
     };
 
-    let detected_accelerators = if !wanted.is_empty() && accel_text.lines().any(|line| line.trim() == wanted) {
-        vec![wanted.to_owned()]
-    } else {
-        Vec::new()
-    };
+    let detected_accelerators =
+        if !wanted.is_empty() && accel_text.lines().any(|line| line.trim() == wanted) {
+            vec![wanted.to_owned()]
+        } else {
+            Vec::new()
+        };
 
     ProviderProbe {
         name: "qemu",
