@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a scoped capability or provider improvement
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the concrete local VM execution problem.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Primary scope
+      options:
+        - Core model
+        - Hyper-V provider
+        - QEMU provider
+        - Guest transport
+        - Image/state handling
+        - Documentation/tooling
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals / boundaries
+      description: Explain how the proposal avoids turning vmcell into a cloud controller, agent framework, or general VM GUI.
