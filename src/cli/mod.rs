@@ -7,7 +7,11 @@ use crate::providers::{ProviderProbe, builtin_provider_probes};
 use crate::state::StateStore;
 
 #[derive(Debug, Parser)]
-#[command(name = "vmcell", version, about = "Local disposable VM execution cells")]
+#[command(
+    name = "vmcell",
+    version,
+    about = "Local disposable VM execution cells"
+)]
 pub struct Cli {
     /// Emit machine-readable JSON where supported.
     #[arg(long, global = true)]
