@@ -53,7 +53,7 @@ pub struct CellSpec {
     pub ttl_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellRecord {
     pub schema_version: u32,
     pub id: CellId,

@@ -84,3 +84,21 @@ fn probe_qemu() -> ProviderProbe {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ProviderError;
+
+    #[test]
+    fn m1_qemu_mutation_is_explicitly_unsupported() {
+        let error = QemuProvider.start_vm("not-a-qemu-object").unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::Unsupported {
+                provider: "qemu",
+                operation: "start_vm"
+            }
+        ));
+    }
+}
