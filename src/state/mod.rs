@@ -74,6 +74,7 @@ pub enum StateError {
 pub struct MutationGuard {
     file: File,
     _state_root: File,
+    _state_directories: Vec<File>,
     process_key: PathBuf,
 }
 
@@ -148,11 +149,16 @@ impl StateStore {
         &self.root
     }
 
-    pub fn acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
+    pub(crate) fn acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
         ensure_directory(&self.root)?;
         let state_root_handle = open_ordinary_directory(&self.root)?;
+        let mut state_directories = Vec::new();
+        for name in ["locks", "images", "cells", "runtime"] {
+            let directory = self.root.join(name);
+            create_direct_child_directory(&directory)?;
+            state_directories.push(open_ordinary_directory(&directory)?);
+        }
         let lock_dir = self.root.join("locks");
-        ensure_directory(&lock_dir)?;
         let process_key = self
             .root
             .canonicalize()
@@ -193,11 +199,12 @@ impl StateStore {
         Ok(MutationGuard {
             file,
             _state_root: state_root_handle,
+            _state_directories: state_directories,
             process_key,
         })
     }
 
-    pub fn installation(&self) -> Result<InstallationRecord, StateError> {
+    pub(crate) fn installation(&self) -> Result<InstallationRecord, StateError> {
         let path = self.root.join("installation.json");
         if path.exists() {
             return self.load_installation();
@@ -243,7 +250,7 @@ impl StateStore {
         })
     }
 
-    pub fn save_image_new(&self, record: &ImageRecord) -> Result<(), StateError> {
+    pub(crate) fn save_image_new(&self, record: &ImageRecord) -> Result<(), StateError> {
         let path = self.image_path(&record.id);
         validate_image_schema(&path, record)?;
         write_json_new(&path, record)
@@ -267,7 +274,7 @@ impl StateStore {
         read_json_directory(&self.root.join("images"), validate_image_schema)
     }
 
-    pub fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
+    pub(crate) fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
         let path = self.cell_path(record.id);
         validate_cell_schema(&path, record)?;
         write_json_atomic(&path, record)
@@ -306,7 +313,8 @@ impl StateStore {
         self.cell_runtime_root(cell_id).join("hyperv")
     }
 
-    pub fn ensure_cell_runtime(&self, cell_id: CellId) -> Result<PathBuf, StateError> {
+    #[cfg(test)]
+    pub(crate) fn ensure_cell_runtime(&self, cell_id: CellId) -> Result<PathBuf, StateError> {
         let guard = self.prepare_cell_runtime(cell_id)?;
         Ok(guard.cell_root.clone())
     }
@@ -942,6 +950,23 @@ mod tests {
         ));
         drop(first);
         assert!(store.acquire_mutation_lock().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mutation_guard_pins_state_subdirectories_against_replacement() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let guard = store.acquire_mutation_lock().unwrap();
+        let cells = store.root().join("cells");
+        let moved = store.root().join("cells-moved");
+
+        assert!(fs::rename(&cells, &moved).is_err());
+        assert!(cells.is_dir());
+
+        drop(guard);
+        fs::rename(&cells, &moved).unwrap();
+        assert!(moved.is_dir());
     }
 
     #[test]

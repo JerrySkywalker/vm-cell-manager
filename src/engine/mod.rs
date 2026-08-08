@@ -550,10 +550,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
             self.validate_local_ownership_against(&record, &installation)?;
             self.state.remove_cell_runtime(cell_id, runtime)?;
-        } else if let Some(identity) = &record.provider_object {
+        } else if record.provider_object.is_some() {
             if self
                 .provider
-                .inspect_vm(&VmLookup::Name(identity.name.clone()))?
+                .inspect_vm(&VmLookup::Name(
+                    record.ownership.provider_object_name.clone(),
+                ))?
                 .is_some()
             {
                 return Err(EngineError::OwnershipNotProven(
@@ -803,6 +805,18 @@ impl<P: LocalVmProvider> CellEngine<P> {
             return Err(EngineError::OwnershipNotProven(
                 "manifest provider name is not derived from the CellId".to_owned(),
             ));
+        }
+        if let Some(identity) = &record.provider_object {
+            if Uuid::parse_str(&identity.id).is_err() {
+                return Err(EngineError::OwnershipNotProven(
+                    "recorded Hyper-V provider object id is not a GUID".to_owned(),
+                ));
+            }
+            if identity.name != record.ownership.provider_object_name {
+                return Err(EngineError::OwnershipNotProven(
+                    "recorded provider object name does not match the ownership name".to_owned(),
+                ));
+            }
         }
         if record.ownership.schema_version != OWNERSHIP_MARKER_SCHEMA {
             return Err(EngineError::OwnershipNotProven(
@@ -1613,6 +1627,39 @@ mod tests {
 
         assert!(matches!(error, EngineError::OwnershipNotProven(_)));
         assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 0);
+    }
+
+    #[test]
+    fn destroy_rejects_invalid_recorded_provider_identity_before_provider_or_runtime_mutation() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+
+        for invalid_identity in [
+            ProviderObjectIdentity {
+                id: "not-a-guid".to_owned(),
+                name: cell.ownership.provider_object_name.clone(),
+            },
+            ProviderObjectIdentity {
+                id: cell.provider_object.as_ref().unwrap().id.clone(),
+                name: "foreign-name".to_owned(),
+            },
+        ] {
+            let mut corrupted = engine.state.load_cell(cell.id).unwrap();
+            corrupted.provider_object = Some(invalid_identity);
+            engine.state.save_cell(&corrupted).unwrap();
+            let calls_before = engine.provider.state.lock().unwrap().calls.len();
+
+            assert!(matches!(
+                engine.destroy_cell(cell.id),
+                Err(EngineError::OwnershipNotProven(_))
+            ));
+            assert_eq!(
+                engine.provider.state.lock().unwrap().calls.len(),
+                calls_before
+            );
+            assert!(engine.provider.state.lock().unwrap().vm.is_some());
+            assert!(engine.state.cell_runtime_root(cell.id).exists());
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ Implementation does not authorize real Hyper-V mutation. Real acceptance require
 - ordinary non-reparse state/runtime ancestry with physical containment recorded;
 - no VM or switch name collision;
 - exclusive operator control of Hyper-V for the bounded acceptance window; no concurrent Hyper-V Manager, PowerShell, WMI, or other provider writer;
+- exclusive operator control of the configured vmcell state root for the bounded acceptance window; its ACL must exclude concurrent filesystem writers, junction creation, and path replacement by other principals;
 - inventory of foreign VMs and switches captured read-only;
 - explicit operator authorization for this exact run.
 
