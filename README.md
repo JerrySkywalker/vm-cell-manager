@@ -2,7 +2,7 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha / M1 review candidate. M0 discovery remains read-only, and M1 now implements an ownership-checked Hyper-V lifecycle. Real destructive Hyper-V acceptance is separately gated and is not run by core CI.
+> **Status:** pre-alpha / stacked M2 review candidate. M1 implements an ownership-checked Hyper-V lifecycle. M2 adds repository-local PowerShell Direct guest-control, artifact, TTL, and explicit-GC contracts. Real Hyper-V and guest acceptance remain separately gated and are not run by core CI.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -124,7 +124,7 @@ vmcell doctor [--json]
 vmcell provider list [--json]
 ```
 
-M1 adds the following Hyper-V surface:
+M1 and the stacked M2 branch expose:
 
 ```text
 vmcell doctor
@@ -132,16 +132,28 @@ vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
 vmcell image list
 vmcell image inspect IMAGE
-vmcell create --image IMAGE --cpu-count 2 --memory-mib 4096
+vmcell create --image IMAGE --cpu-count 2 --memory-mib 4096 [--ttl-seconds N]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
 vmcell stop CELL_ID
 vmcell destroy CELL_ID
 vmcell reconcile [CELL_ID]
+vmcell exec CELL_ID --username USER --password-stdin -- PROGRAM [ARG...]
+vmcell copy-in CELL_ID --source HOST_FILE --destination GUEST_PATH --username USER --password-stdin
+vmcell copy-out CELL_ID --source GUEST_PATH --username USER --password-stdin
+vmcell artifact collect CELL_ID --path GUEST_PATH --username USER --password-stdin
+vmcell artifact inspect CELL_ID OPERATION_ID
+vmcell operation list [CELL_ID]
+vmcell operation inspect OPERATION_ID
+vmcell gc
 ```
 
-All commands support global `--json` and `--state-root PATH` options. Guest execution, file transfer, TTL/GC, and QEMU mutation remain later milestones.
+All commands support global `--json` and `--state-root PATH` options. Guest
+credentials are accepted only through bounded stdin and are never written to
+state. Guest actions require a current installation identity, a pinned runtime,
+and an exact-owned running Windows VM rechecked by GUID. QEMU mutation remains a
+later milestone.
 
 ## Safety and ownership
 
@@ -159,6 +171,10 @@ Initial implementation rules:
 - keep base images immutable after registration;
 - make cleanup idempotent where practical;
 - expose stable JSON output and explicit exit codes for automation.
+- never persist guest credentials, command arguments, command output, or raw transport errors;
+- never automatically replay an unknown or partially completed guest action;
+- keep artifacts in a CellId/operation-bound, hash-verified state subtree;
+- run TTL cleanup only through explicit `vmcell gc` and the existing exact-owned destroy path.
 
 `vmcell doctor` is expected to report missing prerequisites rather than attempting to repair the host automatically.
 
@@ -245,7 +261,7 @@ The first milestones are intentionally incremental:
 
 - **M0 — Architecture bootstrap:** complete; read-only provider discovery, domain model, documentation, and local-first self-hosted Windows CI.
 - **M1 — Hyper-V cell foundation:** implementation review candidate; image registration, single-level differencing disk, create/start/inspect/stop/destroy, and ownership reconciliation are implemented, with real-provider acceptance still gated.
-- **M2 — Windows guest control:** PowerShell Direct exec and file transfer, TTL cleanup, artifact collection.
+- **M2 — Windows guest control:** stacked implementation candidate; PowerShell Direct exec and file transfer, TTL cleanup, and artifact collection are mock/static validated, while real guest acceptance remains gated.
 - **M3 — QEMU provider:** QMP lifecycle, QCOW2 overlay, QGA transport, WHPX reference validation on Windows.
 - **M4 — Linux/macOS portability:** KVM and HVF acceptance, packaging and path/state semantics.
 - **M5 — automation hardening:** stable JSON schemas, exit-code contract, recovery and crash consistency.

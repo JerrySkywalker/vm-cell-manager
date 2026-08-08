@@ -54,4 +54,3 @@ in-flight or unknown guest operation as safe cleanup authority.
 - GC remains explicit and idempotent per cell; ambiguity fails closed and is
   reported without foreign mutation.
 - M1 destroy crash recovery remains the rollback mechanism for expired cells.
-

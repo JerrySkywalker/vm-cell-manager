@@ -49,4 +49,3 @@ was stopped. Nonterminal or unknown operations are never automatically replayed.
 - PowerShell remains a fixed compatibility shell, not a second orchestration
   state machine.
 - QGA and SSH remain explicit unsupported stubs in M2.
-

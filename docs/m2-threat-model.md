@@ -60,4 +60,3 @@ M2 tests use mock providers/transports plus static PowerShell checks. They do no
 authorize real Hyper-V, VHDX, PowerShell Direct, service, switch, host-feature,
 or runner mutation. Real guest acceptance remains a separately admitted
 dedicated-host gate layered on the still-pending M1 real-provider acceptance.
-

@@ -1,6 +1,6 @@
 # CLI and JSON Contract
 
-M1 CLI output is pre-stable but explicitly versioned. `--json` is global and causes successful commands to write JSON to stdout. Errors are written to stderr and return exit code 1.
+M2 CLI output is pre-stable but explicitly versioned. `--json` is global and causes successful commands to write JSON to stdout. Errors are written to stderr and return exit code 1.
 
 ## Commands
 
@@ -10,16 +10,30 @@ vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
 vmcell image list
 vmcell image inspect IMAGE
-vmcell create --image IMAGE [--cpu-count N] [--memory-mib N]
+vmcell create --image IMAGE [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
 vmcell stop CELL_ID
 vmcell destroy CELL_ID
 vmcell reconcile [CELL_ID]
+vmcell exec CELL_ID --username USER --password-stdin -- PROGRAM [ARG...]
+vmcell copy-in CELL_ID --source HOST_FILE --destination GUEST_PATH --username USER --password-stdin
+vmcell copy-out CELL_ID --source GUEST_PATH --username USER --password-stdin
+vmcell artifact collect CELL_ID --path GUEST_PATH [--path GUEST_PATH...] --username USER --password-stdin
+vmcell artifact inspect CELL_ID OPERATION_ID
+vmcell operation list [CELL_ID]
+vmcell operation inspect OPERATION_ID
+vmcell gc
 ```
 
 `--state-root PATH` is also global. It is intended for isolated development and acceptance roots; changing it does not authorize adoption of provider objects.
+
+Guest commands require an exact-owned, running Windows cell. The password is
+read as one bounded line from stdin; there is deliberately no password argument
+or environment-variable option. Guest paths are relative to vmcell's fixed
+workspace and reject traversal, absolute paths, alternate data streams, device
+names, and ambiguous trailing dot/space forms.
 
 ## Successful output
 
@@ -45,6 +59,23 @@ Lifecycle operations return:
 
 Inspection includes the durable cell record, provider-observed VM when present, and one reconciliation classification. Reconciliation itself is read-only.
 
+Guest exec returns a generated `operation_id`, exact `cell_id`, exit code,
+UTF-8 stdout/stderr, byte counts, encoding, and truncation status. Output is
+bounded by `--max-output-bytes`. The durable operation record intentionally
+does not contain credentials, command arguments, output, or raw transport
+errors. A timeout, partial copy, invalid response, or unknown transport failure
+remains nonterminal and is never replayed automatically.
+
+Copy-out and artifact collection write only beneath the deterministic state
+artifact root. Each committed manifest binds CellId, operation ID, guest path,
+state-relative host path, SHA-256, and size. `artifact inspect` reads that
+manifest; it does not contact the guest.
+
+`vmcell gc` is an explicit foreground operation. It evaluates durable TTLs at
+one timestamp, skips cells with nonterminal guest operations, and delegates
+eligible cells to the M1 exact-ownership destroy path. It is not a daemon or
+background timer.
+
 ## Error output
 
 ```json
@@ -57,4 +88,6 @@ Inspection includes the durable cell record, provider-observed VM when present, 
 }
 ```
 
-M5 may refine categories and schema stability, but it must preserve the fail-closed ownership semantics introduced in M1.
+M5 may refine categories and schema stability, but it must preserve the
+fail-closed ownership semantics introduced in M1 and the non-secret,
+nonreplayable guest-operation semantics introduced in M2.
