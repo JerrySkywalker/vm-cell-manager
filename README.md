@@ -146,6 +146,7 @@ vmcell artifact collect CELL_ID --path GUEST_PATH --username USER --password-std
 vmcell artifact inspect CELL_ID OPERATION_ID
 vmcell operation list [CELL_ID]
 vmcell operation inspect OPERATION_ID
+vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 

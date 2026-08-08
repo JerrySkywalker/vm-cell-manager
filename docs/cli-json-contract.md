@@ -24,6 +24,7 @@ vmcell artifact collect CELL_ID --path GUEST_PATH [--path GUEST_PATH...] --usern
 vmcell artifact inspect CELL_ID OPERATION_ID
 vmcell operation list [CELL_ID]
 vmcell operation inspect OPERATION_ID
+vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
@@ -66,10 +67,18 @@ does not contain credentials, command arguments, output, or raw transport
 errors. A timeout, partial copy, invalid response, or unknown transport failure
 remains nonterminal and is never replayed automatically.
 
+`operation reconcile` is also nonreplaying. It marks an intent interrupted only
+when transport was never recorded as active, completes an `artifact_committed`
+record only after revalidating the bound manifest and every file hash/size, and
+reports `recovery_required` without mutation for transport-active operations.
+Incomplete artifact staging without a committed manifest remains quarantined;
+M2 provides no broad or automatic staging deletion.
+
 Copy-out and artifact collection write only beneath the deterministic state
 artifact root. Each committed manifest binds CellId, operation ID, guest path,
 state-relative host path, SHA-256, and size. `artifact inspect` reads that
-manifest; it does not contact the guest.
+manifest; it does not contact the guest. One collection is capped at 16 files,
+64 MiB per file, and a 1 GiB declared aggregate maximum.
 
 `vmcell gc` is an explicit foreground operation. It evaluates durable TTLs at
 one timestamp, skips cells with nonterminal guest operations, and delegates

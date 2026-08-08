@@ -209,6 +209,9 @@ pub enum GuestOperationCommand {
 
     /// Inspect one operation record.
     Inspect { operation_id: GuestOperationId },
+
+    /// Reconcile a durable operation without replaying guest side effects.
+    Reconcile { operation_id: GuestOperationId },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -446,5 +449,15 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["vmcell", "gc"]).is_ok());
+        let operation_id = GuestOperationId::new();
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "operation",
+                "reconcile",
+                &operation_id.to_string(),
+            ])
+            .is_ok()
+        );
     }
 }

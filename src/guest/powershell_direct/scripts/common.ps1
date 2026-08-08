@@ -6,19 +6,23 @@ trap { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
 function Read-ExactBytes([System.IO.BinaryReader]$Reader, [uint32]$Length) {
   $bytes = $Reader.ReadBytes([int]$Length)
   if ($bytes.Length -ne $Length) { throw 'GUEST_SESSION_FAILED: truncated stdin frame' }
-  return $bytes
+  return ,$bytes
 }
 
 $reader = [System.IO.BinaryReader]::new([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8, $false)
+$strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $actionLength = $reader.ReadUInt32()
-if ($actionLength -gt 400000000) { throw 'GUEST_SESSION_FAILED: action frame exceeds limit' }
-$request = [System.Text.Encoding]::UTF8.GetString((Read-ExactBytes $reader $actionLength)) | ConvertFrom-Json
+if ($actionLength -gt 1048576) { throw 'GUEST_SESSION_FAILED: action frame exceeds limit' }
+$request = $strictUtf8.GetString((Read-ExactBytes $reader $actionLength)) | ConvertFrom-Json
 $usernameLength = $reader.ReadUInt32()
 if ($usernameLength -gt 256) { throw 'GUEST_SESSION_FAILED: username frame exceeds limit' }
-$guestUsername = [System.Text.Encoding]::UTF8.GetString((Read-ExactBytes $reader $usernameLength))
+$guestUsername = $strictUtf8.GetString((Read-ExactBytes $reader $usernameLength))
 $passwordLength = $reader.ReadUInt32()
 if ($passwordLength -gt 4096) { throw 'GUEST_SESSION_FAILED: password frame exceeds limit' }
 $guestPasswordBytes = Read-ExactBytes $reader $passwordLength
+$payloadLength = $reader.ReadUInt32()
+if ($payloadLength -gt 67108864) { throw 'GUEST_SESSION_FAILED: payload frame exceeds limit' }
+$guestPayloadBytes = Read-ExactBytes $reader $payloadLength
 $reader.Dispose()
 
 $providerMutex = [System.Threading.Mutex]::new($false, 'Global\vmcell-hyperv-provider-v1')
@@ -61,14 +65,17 @@ function Assert-ExpectedVm($Expected) {
 
 function Enter-GuestAction($Expected) {
   try { $script:providerMutexHeld = $providerMutex.WaitOne(0) }
-  catch [System.Threading.AbandonedMutexException] { throw 'GUEST_UNKNOWN: abandoned provider mutex' }
+  catch [System.Threading.AbandonedMutexException] {
+    $script:providerMutexHeld = $true
+    throw 'GUEST_UNKNOWN: abandoned provider mutex'
+  }
   if (-not $script:providerMutexHeld) { throw 'OWNERSHIP_CHANGED: another vmcell provider action is active' }
   return Assert-ExpectedVm $Expected
 }
 
 function Open-GuestSession($Vm) {
   $secure = [System.Security.SecureString]::new()
-  $passwordChars = [System.Text.Encoding]::UTF8.GetChars($script:guestPasswordBytes)
+  $passwordChars = $strictUtf8.GetChars($script:guestPasswordBytes)
   foreach ($character in $passwordChars) { $secure.AppendChar($character) }
   $secure.MakeReadOnly()
   [Array]::Clear($script:guestPasswordBytes, 0, $script:guestPasswordBytes.Length)
@@ -81,6 +88,9 @@ function Open-GuestSession($Vm) {
         [string]$_.CategoryInfo.Category -eq 'AuthenticationError' -or
         [string]$_.FullyQualifiedErrorId -match 'Credential|Authentication') {
       throw 'GUEST_AUTHENTICATION_FAILED: PowerShell Direct rejected the credential'
+    }
+    if ([string]$_.FullyQualifiedErrorId -match 'PSSessionOpenFailed|VMNotRunning|HyperVSocket|InvalidState') {
+      throw 'GUEST_NOT_READY: PowerShell Direct endpoint is not ready'
     }
     throw 'GUEST_SESSION_FAILED: PowerShell Direct session could not be created'
   } finally {
@@ -99,6 +109,12 @@ function Close-GuestSession($Session) {
 }
 
 function Exit-GuestAction {
+  if ($script:guestPasswordBytes) {
+    [Array]::Clear($script:guestPasswordBytes, 0, $script:guestPasswordBytes.Length)
+  }
+  if ($script:guestPayloadBytes) {
+    [Array]::Clear($script:guestPayloadBytes, 0, $script:guestPayloadBytes.Length)
+  }
   if ($providerMutexHeld) { $providerMutex.ReleaseMutex(); $script:providerMutexHeld = $false }
   $providerMutex.Dispose()
 }

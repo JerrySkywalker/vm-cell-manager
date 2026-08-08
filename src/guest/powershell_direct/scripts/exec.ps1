@@ -10,6 +10,16 @@ try {
     [uint64]$request.max_output_bytes
   ) -ScriptBlock {
     param($Program, $CommandLine, $TimeoutMs, $MaxOutputBytes)
+    function Stop-GuestProcessTree($OwnedProcess) {
+      try {
+        & 'C:\Windows\System32\taskkill.exe' /PID ([string]$OwnedProcess.Id) /T /F 2>$null | Out-Null
+      } catch {}
+      if (-not $OwnedProcess.HasExited) { try { $OwnedProcess.Kill() } catch {} }
+    }
+    trap [System.Text.DecoderFallbackException] {
+      if ($process) { Stop-GuestProcessTree $process }
+      throw 'GUEST_INVALID_ENCODING: guest process output is not valid UTF-8'
+    }
     $start = [System.Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $Program
     $start.Arguments = $CommandLine
@@ -17,8 +27,8 @@ try {
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    $start.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false, $false)
-    $start.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false, $false)
+    $start.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
+    $start.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false, $true)
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'GUEST_SESSION_FAILED: guest process did not start' }
@@ -46,7 +56,7 @@ try {
           $chunkBytes = [uint64]$stdoutEncoder.GetByteCount($stdoutBuffer, 0, $count, $false)
           if (($stdoutBytes + $stderrBytes + $chunkBytes) -gt $MaxOutputBytes) {
             $outputExceeded = $true
-            try { $process.Kill() } catch {}
+            Stop-GuestProcessTree $process
           } elseif (-not $outputExceeded) {
             $null = $stdout.Append($stdoutBuffer, 0, $count)
             $stdoutBytes += $chunkBytes
@@ -62,7 +72,7 @@ try {
           $chunkBytes = [uint64]$stderrEncoder.GetByteCount($stderrBuffer, 0, $count, $false)
           if (($stdoutBytes + $stderrBytes + $chunkBytes) -gt $MaxOutputBytes) {
             $outputExceeded = $true
-            try { $process.Kill() } catch {}
+            Stop-GuestProcessTree $process
           } elseif (-not $outputExceeded) {
             $null = $stderr.Append($stderrBuffer, 0, $count)
             $stderrBytes += $chunkBytes
@@ -72,7 +82,7 @@ try {
       }
       if (-not $timedOut -and $clock.ElapsedMilliseconds -ge $TimeoutMs) {
         $timedOut = $true
-        try { $process.Kill() } catch {}
+        Stop-GuestProcessTree $process
       }
       if (-not ($stdoutDone -and $stderrDone -and $process.HasExited)) {
         Start-Sleep -Milliseconds 5

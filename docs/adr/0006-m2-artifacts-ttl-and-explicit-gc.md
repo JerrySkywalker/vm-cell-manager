@@ -33,8 +33,11 @@ transport, so PowerShell never reopens an arbitrary host source path.
 Guest paths are relative to a fixed CellId-scoped guest workspace. Rust rejects
 absolute paths, traversal, device names, alternate data streams, trailing
 dots/spaces, and ambiguous separators. The PowerShell guest shim independently
-checks the resolved root and every existing ancestor for reparse points.
-Copy-in uses a sibling temporary file and an explicit `deny` or `replace`
+checks the resolved root and every existing ancestor for reparse points before
+and after commit. An administrator-equivalent process inside the disposable
+guest can still race its own filesystem and is not treated as a host security
+boundary; observed ambiguity remains nonreplayable. Copy-in uses a sibling
+temporary file and an explicit `deny` or `replace`
 policy; interruption cannot expose a partially written destination.
 
 `CellSpec.ttl_seconds` is bounded durable intent and `expires_at` is written in

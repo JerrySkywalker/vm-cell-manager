@@ -19,6 +19,7 @@ use vm_cell_manager::guest::{GuestCommand, GuestCredentials, ReadinessPolicy};
 use vm_cell_manager::providers::builtin_provider_probes;
 use vm_cell_manager::providers::hyperv::HyperVProvider;
 use vm_cell_manager::state::StateStore;
+use zeroize::Zeroizing;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -318,6 +319,10 @@ fn run_m2(
                 let operation = engine.inspect_guest_operation(operation_id)?;
                 emit(&operation, json, || println!("{operation:#?}"))?;
             }
+            GuestOperationCommand::Reconcile { operation_id } => {
+                let report = engine.reconcile_guest_operation(operation_id)?;
+                emit(&report, json, || println!("{report:#?}"))?;
+            }
         },
         Command::Gc => {
             let report = engine.gc_expired()?;
@@ -345,7 +350,7 @@ fn read_credentials(args: CredentialArgs) -> Result<GuestCredentials, Box<dyn Er
     if !args.password_stdin {
         return Err("guest password must be provided with --password-stdin".into());
     }
-    let mut password = String::new();
+    let mut password = Zeroizing::new(String::new());
     std::io::stdin().take(4097).read_to_string(&mut password)?;
     while password.ends_with(['\r', '\n']) {
         password.pop();
@@ -353,7 +358,10 @@ fn read_credentials(args: CredentialArgs) -> Result<GuestCredentials, Box<dyn Er
     if password.len() > 4096 || password.contains(['\r', '\n']) {
         return Err("guest password stdin must contain one bounded line".into());
     }
-    Ok(GuestCredentials::new(args.username, password)?)
+    Ok(GuestCredentials::new(
+        args.username,
+        std::mem::take(&mut *password),
+    )?)
 }
 
 fn emit<T: Serialize>(

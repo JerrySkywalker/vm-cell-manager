@@ -9,7 +9,19 @@ try {
     [uint64]$request.max_bytes
   ) -ScriptBlock {
     param($CellId, $RelativePath, $MaxBytes)
+    function Assert-OrdinaryDirectory([string]$Path) {
+      $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+      if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'GUEST_PATH_VIOLATION: guest directory is not ordinary'
+      }
+    }
     $root = "C:\ProgramData\vmcell\cells\$CellId\workspace"
+    $current = 'C:\ProgramData'
+    Assert-OrdinaryDirectory $current
+    foreach ($segment in @('vmcell', 'cells', $CellId, 'workspace')) {
+      $current = Join-Path $current $segment
+      Assert-OrdinaryDirectory $current
+    }
     $source = [IO.Path]::GetFullPath([IO.Path]::Combine($root, $RelativePath))
     if (-not $source.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
       throw 'GUEST_PATH_VIOLATION: source escaped workspace'
@@ -39,6 +51,20 @@ try {
         $offset += $read
       }
     } finally { $stream.Dispose() }
+    $current = 'C:\ProgramData'
+    Assert-OrdinaryDirectory $current
+    foreach ($segment in @('vmcell', 'cells', $CellId, 'workspace')) {
+      $current = Join-Path $current $segment
+      Assert-OrdinaryDirectory $current
+    }
+    $current = $root
+    foreach ($segment in @($RelativePath.Split('\'))) {
+      $current = Join-Path $current $segment
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'GUEST_PARTIAL_COPY: source identity changed during read'
+      }
+    }
     [pscustomobject]@{ content_base64 = [Convert]::ToBase64String($bytes); size = [uint64]$bytes.Length }
   }
   $result | ConvertTo-Json -Compress

@@ -20,9 +20,20 @@ CLI/library caller
 ```
 
 The caller controls command text, relative guest paths, copy-in source files,
-timeouts, and credentials. The guest may be unready, compromised, or actively
-changing files. Hyper-V and the host filesystem may drift between observations.
-Only Rust state plus exact provider identity can authorize an action.
+timeouts, and credentials. The guest may be unready or return adversarial
+output and file contents. Hyper-V and the host filesystem may drift between
+observations. Only Rust state plus exact provider identity can authorize an
+action.
+
+An administrator-equivalent process already running inside the same disposable
+guest is not a security boundary for that guest's filesystem. vmcell serializes
+its own guest actions, validates the workspace chain before and after commit,
+and reports observed replacement as partial/unknown, but it cannot prevent a
+guest administrator from racing or reverting in-guest filesystem metadata or
+from constructing hard-link aliases to files that identity-equivalent guest
+credentials can already read.
+That limitation cannot authorize host or foreign-VM mutation and never permits
+automatic replay.
 
 ## Threats and controls
 
@@ -35,6 +46,7 @@ Only Rust state plus exact provider identity can authorize an action.
 | Unbounded readiness or child process | Rust deadline/poll policy, owned child timeout/kill, bounded output and copy sizes. |
 | Host path escape or replacement | Ordinary non-reparse source handle; pinned state/artifact ancestors; operation-scoped staging; atomic commit. |
 | Guest traversal, ADS, device, or reparse escape | Strict relative `GuestPath`; fixed CellId root; independent in-guest full-path and reparse checks. |
+| Concurrent guest filesystem replacement | Provider mutex serializes vmcell actions; pre/post workspace checks detect ordinary races. Administrator-equivalent guest races remain a documented guest-integrity limitation and any detected ambiguity is nonreplayable. |
 | Partial or overwritten copy | Explicit overwrite policy and sibling temporary file; atomic destination replacement; interrupted operations never auto-replay. |
 | Artifact substitution | Deterministic root, size/SHA-256 manifest, schema/filename identity gates, atomic file and manifest writes. |
 | Crash after unknown guest side effect | Durable intent and nonterminal recovery classification; no automatic retry of exec/copy. |
@@ -51,8 +63,14 @@ Only Rust state plus exact provider identity can authorize an action.
 | Copy-in temporary write | Partial copy staging | Destination remains old/absent; no implicit replay |
 | Copy-out before host commit | Partial host staging | Explicit owned-staging cleanup only |
 | Artifact file commit before manifest | Orphan/incomplete artifact | Read-only detection; no adoption |
+| Artifact manifest committed before operation completion | Hash/size validation, then explicit nonreplaying reconciliation | Complete the durable operation record |
 | GC before/during M1 destroy | Existing M1 destroying phase | Exact-owned idempotent destroy retry |
 | Installation/provider drift | Ownership failure | No guest or provider verb |
+
+M2 intentionally has no automatic deletion for an artifact directory that has
+files but no committed manifest. Such staging is detectable beneath the exact
+CellId/operation root but remains operator-quarantined until a later cleanup
+command gains an equally strong, handle-bound ownership proof.
 
 ## Repository-local acceptance boundary
 

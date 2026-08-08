@@ -22,7 +22,7 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1_048_576;
 pub const DEFAULT_MAX_COPY_BYTES: u64 = 67_108_864;
 pub const MAX_ACTION_TIMEOUT_SECONDS: u64 = 3_600;
 pub const MAX_OUTPUT_BYTES: u64 = 16_777_216;
-pub const MAX_COPY_BYTES: u64 = 268_435_456;
+pub const MAX_COPY_BYTES: u64 = 67_108_864;
 
 pub struct GuestCredentials {
     username: String,
@@ -31,6 +31,7 @@ pub struct GuestCredentials {
 
 impl GuestCredentials {
     pub fn new(username: String, password: String) -> Result<Self, GuestIoError> {
+        let password = Zeroizing::new(password);
         if username.trim().is_empty()
             || username.len() > 256
             || username.contains('\0')
@@ -45,10 +46,7 @@ impl GuestCredentials {
                 "guest password is outside the supported bounds",
             ));
         }
-        Ok(Self {
-            username,
-            password: Zeroizing::new(password),
-        })
+        Ok(Self { username, password })
     }
 
     pub(crate) fn username(&self) -> &str {
@@ -140,6 +138,9 @@ fn is_windows_device_name(segment: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -149,6 +150,9 @@ fn is_windows_device_name(segment: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
     )
 }
 
@@ -236,6 +240,8 @@ pub struct GuestActionAuthority<'a> {
     provider_marker: &'a str,
     configuration_path: &'a Path,
     overlay_path: &'a Path,
+    cpu_count: u16,
+    memory_mib: u64,
     _installation: &'a InstallationAuthority,
     _runtime: &'a CellRuntimeGuard,
     _mutation: &'a MutationGuard,
@@ -264,6 +270,8 @@ impl<'a> GuestActionAuthority<'a> {
             provider_marker: &record.ownership.provider_marker,
             configuration_path: &record.ownership.configuration_path,
             overlay_path: &record.ownership.overlay_path,
+            cpu_count: record.spec.cpu_count,
+            memory_mib: record.spec.memory_mib,
             _installation: installation,
             _runtime: runtime,
             _mutation: mutation,
@@ -283,6 +291,8 @@ impl<'a> GuestActionAuthority<'a> {
             || expected.attached_disks.len() != 1
             || !path_identity_equal(&expected.attached_disks[0], self.overlay_path)
             || expected.network_adapter_count != 0
+            || expected.cpu_count != self.cpu_count
+            || expected.memory_mib != self.memory_mib
             || expected.power_state != ProviderPowerState::Running
         {
             return Err(GuestIoError::OwnershipChanged);
@@ -419,6 +429,9 @@ pub enum GuestIoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::cell::{CellPhase, CellState};
+    use crate::core::ownership::ProviderObjectIdentity;
+    use crate::providers::{ProviderVm, ProviderVmIdentity};
 
     #[test]
     fn credential_debug_is_redacted() {
@@ -441,6 +454,8 @@ mod tests {
             "safe\\..\\secret",
             "safe\\file:stream",
             "safe\\NUL.txt",
+            "safe\\COM¹.txt",
+            "safe\\LPT³",
             "safe\\trailing. ",
             "safe//double",
         ] {
@@ -452,6 +467,50 @@ mod tests {
         assert_eq!(
             GuestPath::parse("results/output.txt").unwrap().as_str(),
             "results\\output.txt"
+        );
+    }
+
+    #[test]
+    fn guest_authority_rejects_cpu_and_memory_drift() {
+        let (_directory, state, installation, runtime, mut record) =
+            crate::providers::test_mutation_fixture();
+        let identity = ProviderVmIdentity {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: record.ownership.provider_object_name.clone(),
+        };
+        record.provider_object = Some(ProviderObjectIdentity {
+            id: identity.id.clone(),
+            name: identity.name.clone(),
+        });
+        record.state = CellState::Running;
+        record.phase = CellPhase::Ready;
+        let expected = ProviderVm {
+            id: identity.id,
+            name: identity.name,
+            power_state: ProviderPowerState::Running,
+            ownership_marker: record.ownership.provider_marker.clone(),
+            configuration_path: record.ownership.configuration_path.clone(),
+            attached_disks: vec![record.ownership.overlay_path.clone()],
+            network_adapter_count: 0,
+            cpu_count: record.spec.cpu_count,
+            memory_mib: record.spec.memory_mib,
+        };
+        let mutation = state.acquire_mutation_lock().unwrap();
+        let authority =
+            GuestActionAuthority::new(&record, &expected, &installation, &runtime, &mutation)
+                .unwrap();
+
+        let mut drifted = expected.clone();
+        drifted.cpu_count += 1;
+        assert_eq!(
+            authority.validate(&drifted),
+            Err(GuestIoError::OwnershipChanged)
+        );
+        drifted = expected.clone();
+        drifted.memory_mib += 1;
+        assert_eq!(
+            authority.validate(&drifted),
+            Err(GuestIoError::OwnershipChanged)
         );
     }
 }

@@ -7,10 +7,10 @@ try {
     [string]$request.cell_id,
     [string]$request.operation_id,
     [string]$request.destination,
-    [string]$request.content_base64,
+    ,([byte[]]$guestPayloadBytes),
     [string]$request.overwrite
   ) -ScriptBlock {
-    param($CellId, $OperationId, $RelativePath, $ContentBase64, $Overwrite)
+    param($CellId, $OperationId, $RelativePath, $ContentBytes, $Overwrite)
     function Assert-OrdinaryDirectory([string]$Path) {
       $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
       if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -46,11 +46,27 @@ try {
     }
     $temporary = Join-Path $parent ('.vmcell-' + ([guid]$OperationId).ToString() + '.tmp')
     try {
-      [IO.File]::WriteAllBytes($temporary, [Convert]::FromBase64String($ContentBase64))
+      [IO.File]::WriteAllBytes($temporary, [byte[]]$ContentBytes)
+      Assert-OrdinaryDirectory $root
+      $current = $root
+      foreach ($segment in @($relativeParent.Split('\') | Where-Object { $_ })) {
+        $current = Join-Path $current $segment
+        Assert-OrdinaryDirectory $current
+      }
       if (Test-Path -LiteralPath $target) {
         [IO.File]::Replace($temporary, $target, $null, $true)
       } else {
         [IO.File]::Move($temporary, $target)
+      }
+      Assert-OrdinaryDirectory $root
+      $current = $root
+      foreach ($segment in @($relativeParent.Split('\') | Where-Object { $_ })) {
+        $current = Join-Path $current $segment
+        Assert-OrdinaryDirectory $current
+      }
+      $committed = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+      if ($committed.PSIsContainer -or ($committed.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'GUEST_PARTIAL_COPY: committed destination identity changed'
       }
     } finally {
       if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
@@ -59,6 +75,7 @@ try {
   }
   $result | ConvertTo-Json -Compress
 } finally {
+  if ($guestPayloadBytes) { [Array]::Clear($guestPayloadBytes, 0, $guestPayloadBytes.Length) }
   Close-GuestSession $session
   Exit-GuestAction
 }

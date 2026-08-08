@@ -7,6 +7,7 @@ use directories::ProjectDirs;
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -73,6 +74,12 @@ pub enum StateError {
         expected: u32,
         actual: u32,
     },
+
+    #[error("artifact integrity check failed for {path}: {reason}")]
+    ArtifactIntegrity { path: PathBuf, reason: &'static str },
+
+    #[error("guest operation integrity check failed for {path}: {reason}")]
+    GuestOperationIntegrity { path: PathBuf, reason: &'static str },
 }
 
 pub struct MutationGuard {
@@ -426,8 +433,10 @@ impl StateStore {
         }) {
             return Err(StateError::UnsafeRuntimePath(path));
         }
+        validate_artifact_files(&guard.root, record)?;
         write_json_new(&path, record)?;
-        self.validate_artifact_guard(guard)
+        self.validate_artifact_guard(guard)?;
+        validate_artifact_files(&guard.root, record)
     }
 
     pub fn load_artifact(
@@ -448,6 +457,7 @@ impl StateStore {
                 expected: format!("{cell_id}/{operation_id}"),
             });
         }
+        validate_artifact_files(&root, &record)?;
         Ok(record)
     }
 
@@ -966,6 +976,57 @@ fn validate_guest_operation_schema(
             expected: expected.unwrap_or("<non-utf8>").to_owned(),
         });
     }
+    let fields_are_valid = match record.phase {
+        crate::core::guest::GuestOperationPhase::IntentRecorded => {
+            record.completed_at.is_none()
+                && record.failure.is_none()
+                && record.artifact_id.is_none()
+                && record.exit_code.is_none()
+                && record.stdout_bytes.is_none()
+                && record.stderr_bytes.is_none()
+        }
+        crate::core::guest::GuestOperationPhase::TransportActive => {
+            record.completed_at.is_none()
+                && record.artifact_id.is_none()
+                && record.exit_code.is_none()
+                && record.stdout_bytes.is_none()
+                && record.stderr_bytes.is_none()
+        }
+        crate::core::guest::GuestOperationPhase::ArtifactCommitted => {
+            record.completed_at.is_none()
+                && record.failure.is_none()
+                && record.artifact_id == Some(record.id)
+                && record.exit_code.is_none()
+                && record.stdout_bytes.is_none()
+                && record.stderr_bytes.is_none()
+        }
+        crate::core::guest::GuestOperationPhase::Completed => {
+            record.completed_at.is_some()
+                && record.failure.is_none()
+                && record
+                    .artifact_id
+                    .is_none_or(|artifact_id| artifact_id == record.id)
+        }
+        crate::core::guest::GuestOperationPhase::Failed => {
+            record.completed_at.is_some()
+                && record.failure.is_some()
+                && record.artifact_id.is_none()
+                && record.exit_code.is_none()
+                && record.stdout_bytes.is_none()
+                && record.stderr_bytes.is_none()
+        }
+    };
+    if !fields_are_valid
+        || record.updated_at < record.created_at
+        || record.completed_at.is_some_and(|completed_at| {
+            completed_at < record.created_at || completed_at != record.updated_at
+        })
+    {
+        return Err(StateError::GuestOperationIntegrity {
+            path: path.to_path_buf(),
+            reason: "phase and durable fields are inconsistent",
+        });
+    }
     Ok(())
 }
 
@@ -976,6 +1037,83 @@ fn validate_artifact_schema(path: &Path, record: &ArtifactRecord) -> Result<(), 
         record.schema_version,
         ARTIFACT_SCHEMA_VERSION,
     )
+}
+
+fn validate_artifact_files(root: &Path, record: &ArtifactRecord) -> Result<(), StateError> {
+    if record.entries.is_empty() {
+        return Err(StateError::ArtifactIntegrity {
+            path: root.to_path_buf(),
+            reason: "manifest contains no files",
+        });
+    }
+    let files_root = root.join("files");
+    let _files_handle = open_ordinary_directory(&files_root)?;
+    ensure_no_reparse_tree(root)?;
+    let expected_names = (0..record.entries.len())
+        .map(|index| format!("{index:04}.bin"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_names = fs::read_dir(&files_root)
+        .map_err(|source| io_error(&files_root, source))?
+        .map(|entry| {
+            entry
+                .map_err(|source| io_error(&files_root, source))
+                .and_then(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| StateError::ArtifactIntegrity {
+                            path: entry.path(),
+                            reason: "artifact filename is not UTF-8",
+                        })
+                })
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    if actual_names != expected_names {
+        return Err(StateError::ArtifactIntegrity {
+            path: files_root,
+            reason: "artifact file set does not exactly match manifest",
+        });
+    }
+    for (index, entry) in record.entries.iter().enumerate() {
+        let file_name = format!("{index:04}.bin");
+        let expected_relative = format!(
+            "artifacts/{}/{}/files/{file_name}",
+            record.cell_id, record.id
+        );
+        if entry.host_relative_path != expected_relative {
+            return Err(StateError::ArtifactIntegrity {
+                path: root.join("manifest.json"),
+                reason: "manifest path is not operation-bound",
+            });
+        }
+        let path = files_root.join(file_name);
+        let mut file = open_state_file_for_authority(&path)?;
+        let metadata = file.metadata().map_err(|source| io_error(&path, source))?;
+        if metadata.len() != entry.size {
+            return Err(StateError::ArtifactIntegrity {
+                path,
+                reason: "file size does not match manifest",
+            });
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|source| io_error(&path, source))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if format!("{:x}", hasher.finalize()) != entry.sha256 {
+            return Err(StateError::ArtifactIntegrity {
+                path,
+                reason: "file hash does not match manifest",
+            });
+        }
+    }
+    ensure_no_reparse_tree(root)
 }
 
 fn ensure_schema(
@@ -1229,6 +1367,7 @@ mod tests {
         let mut operation = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
         operation.phase = GuestOperationPhase::Failed;
         operation.failure = Some(GuestFailureClass::Authentication);
+        operation.completed_at = Some(now);
         store.save_guest_operation(&operation).unwrap();
         assert_eq!(store.load_guest_operation(operation.id).unwrap(), operation);
         let operation_json = fs::read_to_string(store.guest_operation_path(operation.id)).unwrap();
@@ -1248,20 +1387,32 @@ mod tests {
             entries: vec![ArtifactEntry {
                 guest_path: "results/output.bin".to_owned(),
                 host_relative_path: relative,
-                sha256: "frozen-test-hash".to_owned(),
+                sha256: format!("{:x}", Sha256::digest(b"bounded-artifact")),
                 size: 16,
             }],
         };
         store.save_artifact_new(&guard, &artifact).unwrap();
         assert_eq!(store.load_artifact(cell_id, artifact_id).unwrap(), artifact);
 
-        let mut unsupported = artifact;
+        let artifact_file = guard.files_root.join("0000.bin");
+        fs::write(&artifact_file, b"tampered-artifact").unwrap();
+        assert!(matches!(
+            store.load_artifact(cell_id, artifact_id),
+            Err(StateError::ArtifactIntegrity { .. })
+        ));
+        fs::write(&artifact_file, b"bounded-artifact").unwrap();
+        let extra_file = guard.files_root.join("9999.bin");
+        fs::write(&extra_file, b"unexpected").unwrap();
+        assert!(matches!(
+            store.load_artifact(cell_id, artifact_id),
+            Err(StateError::ArtifactIntegrity { .. })
+        ));
+        fs::remove_file(extra_file).unwrap();
+
+        let manifest_path = guard.root.join("manifest.json");
+        let mut unsupported = artifact.clone();
         unsupported.schema_version = ARTIFACT_SCHEMA_VERSION + 1;
-        fs::write(
-            guard.root.join("manifest.json"),
-            serde_json::to_vec(&unsupported).unwrap(),
-        )
-        .unwrap();
+        fs::write(&manifest_path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
         assert!(matches!(
             store.load_artifact(cell_id, artifact_id),
             Err(StateError::UnsupportedSchema {
@@ -1269,6 +1420,17 @@ mod tests {
                 ..
             })
         ));
+
+        fs::write(&manifest_path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+        fs::remove_file(&artifact_file).unwrap();
+        let external = directory.path().join("external-artifact.bin");
+        fs::write(&external, b"bounded-artifact").unwrap();
+        if create_file_link(&external, &artifact_file).is_ok() {
+            assert!(matches!(
+                store.load_artifact(cell_id, artifact_id),
+                Err(StateError::UnsafeRuntimePath(_))
+            ));
+        }
     }
 
     #[test]
@@ -1293,6 +1455,18 @@ mod tests {
                 kind: "guest operation record",
                 ..
             })
+        ));
+
+        operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION;
+        operation.phase = GuestOperationPhase::Completed;
+        fs::write(
+            operations.join(format!("{requested_id}.json")),
+            serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_guest_operation(requested_id),
+            Err(StateError::GuestOperationIntegrity { .. })
         ));
 
         operation.id = requested_id;
@@ -1405,7 +1579,10 @@ mod tests {
             let mut operation = store.load_guest_operation(operation_id).unwrap();
             operation.phase = match phase.as_str() {
                 "transport_active" => GuestOperationPhase::TransportActive,
-                "artifact_committed" => GuestOperationPhase::ArtifactCommitted,
+                "artifact_committed" => {
+                    operation.artifact_id = Some(operation.id);
+                    GuestOperationPhase::ArtifactCommitted
+                }
                 value => panic!("unknown guest phase {value}"),
             };
             operation.updated_at = Utc::now();

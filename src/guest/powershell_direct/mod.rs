@@ -36,9 +36,12 @@ fn execute_transport<E: PowerShellDirectCommandExecutor, T: serde::de::Deseriali
     transport: &PowerShellDirectTransport<E>,
     action: PowerShellDirectAction,
     credentials: &GuestCredentials,
+    payload: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<T, GuestIoError> {
-    let value = transport.executor.execute(&action, credentials, timeout)?;
+    let value = transport
+        .executor
+        .execute(&action, credentials, payload, timeout)?;
     serde_json::from_value(value).map_err(|_| GuestIoError::InvalidResponse)
 }
 
@@ -62,6 +65,7 @@ impl<E: PowerShellDirectCommandExecutor> GuestTransport for PowerShellDirectTran
                 expected: expected.clone(),
             },
             credentials,
+            None,
             timeout,
         )?;
         Ok(response.status)
@@ -95,6 +99,7 @@ impl<E: PowerShellDirectCommandExecutor> GuestTransport for PowerShellDirectTran
                 max_output_bytes: command.max_output_bytes,
             },
             credentials,
+            None,
             command.timeout + Duration::from_secs(5),
         )?;
         if response.timed_out {
@@ -126,10 +131,10 @@ impl<E: PowerShellDirectCommandExecutor> GuestTransport for PowerShellDirectTran
                 operation_id: action.operation_id,
                 expected: expected.clone(),
                 destination: action.destination.as_str().to_owned(),
-                content_base64: base64::engine::general_purpose::STANDARD.encode(action.content),
                 overwrite: action.overwrite,
             },
             credentials,
+            Some(action.content),
             action.timeout,
         )?;
         if response.ok {
@@ -157,6 +162,7 @@ impl<E: PowerShellDirectCommandExecutor> GuestTransport for PowerShellDirectTran
                 max_bytes: action.max_bytes,
             },
             credentials,
+            None,
             action.timeout,
         )?;
         let bytes = base64::engine::general_purpose::STANDARD

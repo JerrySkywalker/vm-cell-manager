@@ -32,6 +32,10 @@ $guestProviderMutationCommands = @(
   'Set-VMProcessor',
   'Set-VMMemory'
 )
+$guestDynamicExecutionCommands = @(
+  'Invoke-Expression',
+  'iex'
+)
 
 $files = @($scriptRoots | ForEach-Object {
   Get-ChildItem -LiteralPath $_ -Filter '*.ps1' -File
@@ -69,10 +73,16 @@ foreach ($file in $files) {
         throw "provider mutation command $forbidden is forbidden in guest shim $fullName"
       }
     }
+    foreach ($forbidden in $guestDynamicExecutionCommands) {
+      if ($commands -contains $forbidden) {
+        throw "dynamic execution command $forbidden is forbidden in guest shim $fullName"
+      }
+    }
     $text = [IO.File]::ReadAllText($fullName)
     if ($text -match '(?i)\$env:' -or
         $text -match '(?i)GetEnvironmentVariable' -or
-        $text -match '(?i)-VMName') {
+        $text -match '(?i)-VMName' -or
+        $text -match '(?i)\bGet-VM\b[^\r\n|;]*\s-Name\b') {
       throw "guest shim contains a forbidden environment, secret, or name-authority channel: $fullName"
     }
   }
