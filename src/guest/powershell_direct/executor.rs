@@ -417,7 +417,7 @@ mod tests {
             .arg("--nocapture")
             .env("VMCELL_TEST_GUEST_EXECUTOR_SLEEP_CHILD", "1")
             .env("VMCELL_TEST_GUEST_EXECUTOR_MARKER", &marker)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();

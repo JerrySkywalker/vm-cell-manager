@@ -1457,6 +1457,7 @@ mod tests {
             })
         ));
 
+        operation.id = requested_id;
         operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION;
         operation.phase = GuestOperationPhase::Completed;
         fs::write(
@@ -1469,7 +1470,6 @@ mod tests {
             Err(StateError::GuestOperationIntegrity { .. })
         ));
 
-        operation.id = requested_id;
         operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION + 1;
         fs::write(
             operations.join(format!("{requested_id}.json")),
