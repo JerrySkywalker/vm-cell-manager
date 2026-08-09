@@ -2166,9 +2166,9 @@ fn provider_variant<'a>(
         .filter(|variant| variant.provider == provider);
     let variant = variants
         .next()
-        .ok_or_else(|| EngineError::InvalidImage(format!("image has no {provider} variant")))?;
+        .ok_or_else(|| EngineError::ImageIntegrity(format!("image has no {provider} variant")))?;
     if variants.next().is_some() {
-        return Err(EngineError::InvalidImage(format!(
+        return Err(EngineError::ImageIntegrity(format!(
             "image has more than one {provider} variant"
         )));
     }
@@ -2886,6 +2886,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second, record);
+    }
+
+    #[test]
+    fn persisted_provider_variant_cardinality_is_image_integrity() {
+        let mut image = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: "variant-integrity".parse().unwrap(),
+            guest_os: GuestOs::Linux,
+            guest_arch: Architecture::X86_64,
+            variants: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        assert!(matches!(
+            provider_variant(&image, "qemu"),
+            Err(EngineError::ImageIntegrity(_))
+        ));
+
+        let variant = ImageVariant {
+            provider: "qemu".to_owned(),
+            disk_format: "qcow2".to_owned(),
+            path: PathBuf::from("base.qcow2"),
+            sha256: "00".repeat(32),
+            file_size: 4096,
+        };
+        image.variants = vec![variant.clone(), variant];
+        assert!(matches!(
+            provider_variant(&image, "qemu"),
+            Err(EngineError::ImageIntegrity(_))
+        ));
     }
 
     #[test]
