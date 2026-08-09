@@ -184,6 +184,15 @@ record. Human `image add`, `list`, and `inspect` output includes guest/provider
 identity and immutable content identity; `--json` retains versioned records and
 validation reports. vmcell does not build, mount, or modify guest images.
 
+## Windows portable distribution
+
+The repository can build a deterministic portable Windows archive containing
+`vmcell.exe`, license/notice, bounded install/remove guidance, and versioned
+build provenance. A sibling `SHA256SUMS.txt` binds the archive. The manual
+trusted-runner workflow does not publish a release or create a tag; see
+[Windows Portable Package](docs/windows-portable-package.md) for layout,
+verification, and release-boundary details.
+
 ## Safety and ownership
 
 The local runtime is designed to be conservative around host state.

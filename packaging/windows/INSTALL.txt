@@ -1,0 +1,33 @@
+VM Cell Manager portable Windows package
+========================================
+
+Install
+-------
+
+1. Extract this archive into a user-owned directory, for example:
+   %LOCALAPPDATA%\Programs\vmcell
+2. Run `vmcell.exe --version` from that directory.
+3. Either invoke the full path or add the directory to your user PATH.
+4. Run `vmcell.exe doctor` before attempting provider operations.
+
+The package does not enable Hyper-V, install drivers or services, change
+virtual switches, or modify system policy. Real Hyper-V and PowerShell Direct
+use remains release-gated by the project's dedicated-host acceptance process.
+
+Use
+---
+
+Run `vmcell.exe --help` for the installed command surface. VM Cell Manager
+stores per-user state outside this portable program directory unless
+`--state-root` selects another path.
+
+Remove
+------
+
+1. Inspect and safely destroy or retain any cells you still need.
+2. Remove the directory containing this portable package.
+3. Remove that directory from your user PATH if you added it.
+
+Removing the program directory does not delete vmcell state, images, cells, or
+artifacts. Delete retained state only through separately reviewed, explicit
+operator action.

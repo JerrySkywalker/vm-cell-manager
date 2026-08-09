@@ -57,6 +57,14 @@ P0/P1-clean, exact-head-green work may merge while separately documented
 Hyper-V, PowerShell Direct, QEMU, KVM, WHPX, or HVF acceptance remains pending.
 Never describe mock, WSL2, or core CI evidence as real-provider acceptance.
 
+The Windows portable-package contract is implemented by
+`tools/package-windows.ps1` and tested by `tools/test-windows-package.ps1`.
+Normal CI proves byte-identical repeat builds, fixed archive layout, checksums,
+and provenance without publishing. The separate `Package Windows` workflow is
+manual `workflow_dispatch` only on the trusted runner and uploads a bounded
+short-retention artifact; it does not tag, promote, or create a release. See
+`docs/windows-portable-package.md` for the exact contract.
+
 On a native Linux development host, `tools/check-linux.sh` runs the locked
 repository-local portability suite. It does not install Rust, QEMU, KVM
 components, packages, or change `/dev/kvm` permissions. WSL2 output is useful
