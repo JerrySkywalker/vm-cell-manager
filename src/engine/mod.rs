@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, OwnershipClassification, RequiredAction};
 use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState};
 use crate::core::guest::{
     ARTIFACT_SCHEMA_VERSION, ArtifactEntry, ArtifactRecord, GuestFailureClass, GuestOperationId,
@@ -65,6 +66,7 @@ pub struct CellInspection {
     pub schema_version: u32,
     pub cell: CellRecord,
     pub provider_vm: Option<ProviderVm>,
+    pub classification: ReconciliationClassification,
     pub reconciliation: ReconciliationStatus,
 }
 
@@ -158,6 +160,7 @@ pub struct GuestOperationRecoveryReport {
     pub schema_version: u32,
     pub operation: GuestOperationRecord,
     pub disposition: GuestOperationRecoveryDisposition,
+    pub required_action: RequiredAction,
     pub changed: bool,
 }
 
@@ -193,6 +196,74 @@ pub enum ReconciliationStatus {
         phase: CellPhase,
     },
     Destroyed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationCode {
+    ExactOwned,
+    ManifestOnly,
+    ProviderMissing,
+    UnprovenProviderObject,
+    OwnershipMismatch,
+    StateDrift,
+    Provisioning,
+    Destroyed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconciliationClassification {
+    pub code: ReconciliationCode,
+    pub ownership: OwnershipClassification,
+    pub required_action: RequiredAction,
+}
+
+impl ReconciliationStatus {
+    #[must_use]
+    pub const fn classification(&self) -> ReconciliationClassification {
+        match self {
+            Self::ExactOwned => ReconciliationClassification {
+                code: ReconciliationCode::ExactOwned,
+                ownership: OwnershipClassification::Proven,
+                required_action: RequiredAction::None,
+            },
+            Self::ManifestOnly => ReconciliationClassification {
+                code: ReconciliationCode::ManifestOnly,
+                ownership: OwnershipClassification::Unproven,
+                required_action: RequiredAction::ManualReview,
+            },
+            Self::ProviderMissing => ReconciliationClassification {
+                code: ReconciliationCode::ProviderMissing,
+                ownership: OwnershipClassification::Unproven,
+                required_action: RequiredAction::ManualReview,
+            },
+            Self::UnprovenProviderObject { .. } => ReconciliationClassification {
+                code: ReconciliationCode::UnprovenProviderObject,
+                ownership: OwnershipClassification::Unproven,
+                required_action: RequiredAction::ManualReview,
+            },
+            Self::OwnershipMismatch { .. } => ReconciliationClassification {
+                code: ReconciliationCode::OwnershipMismatch,
+                ownership: OwnershipClassification::Mismatch,
+                required_action: RequiredAction::ManualReview,
+            },
+            Self::StateDrift { .. } => ReconciliationClassification {
+                code: ReconciliationCode::StateDrift,
+                ownership: OwnershipClassification::Proven,
+                required_action: RequiredAction::RetryLifecycle,
+            },
+            Self::Provisioning { .. } => ReconciliationClassification {
+                code: ReconciliationCode::Provisioning,
+                ownership: OwnershipClassification::PhaseProven,
+                required_action: RequiredAction::RecoveryRequired,
+            },
+            Self::Destroyed => ReconciliationClassification {
+                code: ReconciliationCode::Destroyed,
+                ownership: OwnershipClassification::NotApplicable,
+                required_action: RequiredAction::None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -519,10 +590,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
     pub fn inspect_cell(&self, cell_id: CellId) -> Result<CellInspection, EngineError> {
         let record = self.state.load_cell(cell_id)?;
         let (provider_vm, reconciliation) = self.reconcile_record(&record)?;
+        let classification = reconciliation.classification();
         Ok(CellInspection {
-            schema_version: 1,
+            schema_version: AUTOMATION_SCHEMA_VERSION,
             cell: record,
             provider_vm,
+            classification,
             reconciliation,
         })
     }
@@ -679,7 +752,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 };
                 Ok((
                     GuestExecReport {
-                        schema_version: 1,
+                        schema_version: AUTOMATION_SCHEMA_VERSION,
                         operation_id,
                         cell_id,
                         result,
@@ -726,7 +799,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 )?;
                 Ok((
                     GuestCopyInReport {
-                        schema_version: 1,
+                        schema_version: AUTOMATION_SCHEMA_VERSION,
                         operation_id,
                         cell_id,
                         guest_path: destination,
@@ -848,9 +921,17 @@ impl<P: LocalVmProvider> CellEngine<P> {
             }
         };
         Ok(GuestOperationRecoveryReport {
-            schema_version: 1,
+            schema_version: AUTOMATION_SCHEMA_VERSION,
             operation,
             disposition,
+            required_action: match disposition {
+                GuestOperationRecoveryDisposition::RecoveryRequired => RequiredAction::ManualReview,
+                GuestOperationRecoveryDisposition::AlreadyTerminal
+                | GuestOperationRecoveryDisposition::InterruptedBeforeTransport
+                | GuestOperationRecoveryDisposition::ArtifactCompletionRecovered => {
+                    RequiredAction::None
+                }
+            },
             changed,
         })
     }
@@ -899,7 +980,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             });
         }
         Ok(GcReport {
-            schema_version: 1,
+            schema_version: AUTOMATION_SCHEMA_VERSION,
             evaluated_at,
             entries,
         })
@@ -1434,7 +1515,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 self.state.save_artifact_new(&artifact_guard, &artifact)?;
                 Ok((
                     ArtifactReport {
-                        schema_version: 1,
+                        schema_version: AUTOMATION_SCHEMA_VERSION,
                         operation_id,
                         cell_id,
                         artifact,
@@ -2184,7 +2265,7 @@ fn same_image_identity(left: &ImageRecord, right: &ImageRecord) -> bool {
 
 fn operation_report(record: &CellRecord, changed: bool) -> OperationReport {
     OperationReport {
-        schema_version: 1,
+        schema_version: AUTOMATION_SCHEMA_VERSION,
         cell_id: record.id,
         state: record.state,
         changed,
@@ -2241,7 +2322,97 @@ mod tests {
 
     use super::*;
     use crate::core::capability::ProviderCapabilities;
-    use crate::providers::{ProviderProbe, ProviderVmIdentity};
+    use crate::providers::{ProviderProbe, ProviderProbeStatus, ProviderVmIdentity};
+
+    #[test]
+    fn reconciliation_classification_is_stable_and_provider_neutral() {
+        let cases = [
+            (
+                ReconciliationStatus::ExactOwned,
+                ReconciliationCode::ExactOwned,
+                OwnershipClassification::Proven,
+                RequiredAction::None,
+            ),
+            (
+                ReconciliationStatus::ManifestOnly,
+                ReconciliationCode::ManifestOnly,
+                OwnershipClassification::Unproven,
+                RequiredAction::ManualReview,
+            ),
+            (
+                ReconciliationStatus::ProviderMissing,
+                ReconciliationCode::ProviderMissing,
+                OwnershipClassification::Unproven,
+                RequiredAction::ManualReview,
+            ),
+            (
+                ReconciliationStatus::UnprovenProviderObject {
+                    id: "id".to_owned(),
+                },
+                ReconciliationCode::UnprovenProviderObject,
+                OwnershipClassification::Unproven,
+                RequiredAction::ManualReview,
+            ),
+            (
+                ReconciliationStatus::OwnershipMismatch {
+                    reasons: vec!["drift".to_owned()],
+                },
+                ReconciliationCode::OwnershipMismatch,
+                OwnershipClassification::Mismatch,
+                RequiredAction::ManualReview,
+            ),
+            (
+                ReconciliationStatus::StateDrift {
+                    manifest_state: CellState::Stopped,
+                    provider_state: ProviderPowerState::Running,
+                },
+                ReconciliationCode::StateDrift,
+                OwnershipClassification::Proven,
+                RequiredAction::RetryLifecycle,
+            ),
+            (
+                ReconciliationStatus::Provisioning {
+                    phase: CellPhase::ProviderObjectClaimed,
+                },
+                ReconciliationCode::Provisioning,
+                OwnershipClassification::PhaseProven,
+                RequiredAction::RecoveryRequired,
+            ),
+            (
+                ReconciliationStatus::Destroyed,
+                ReconciliationCode::Destroyed,
+                OwnershipClassification::NotApplicable,
+                RequiredAction::None,
+            ),
+        ];
+
+        for (status, code, ownership, required_action) in cases {
+            assert_eq!(
+                status.classification(),
+                ReconciliationClassification {
+                    code,
+                    ownership,
+                    required_action
+                }
+            );
+        }
+
+        let json = serde_json::to_value(
+            ReconciliationStatus::Provisioning {
+                phase: CellPhase::ProviderObjectClaimed,
+            }
+            .classification(),
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "provisioning",
+                "ownership": "phase_proven",
+                "required_action": "recovery_required"
+            })
+        );
+    }
 
     #[cfg(windows)]
     fn alternate_windows_path(path: &Path) -> PathBuf {
@@ -2363,6 +2534,7 @@ mod tests {
         fn probe(&self) -> ProviderProbe {
             ProviderProbe {
                 name: self.provider_name,
+                status: ProviderProbeStatus::Ready,
                 available: true,
                 detail: "mock".to_owned(),
                 capabilities: ProviderCapabilities::unavailable(),
@@ -3852,6 +4024,7 @@ mod tests {
             GuestOperationRecoveryDisposition::InterruptedBeforeTransport
         );
         assert!(report.changed);
+        assert_eq!(report.required_action, RequiredAction::None);
         assert_eq!(report.operation.phase, GuestOperationPhase::Failed);
         assert_eq!(
             report.operation.failure,
@@ -3868,6 +4041,7 @@ mod tests {
             GuestOperationRecoveryDisposition::RecoveryRequired
         );
         assert!(!report.changed);
+        assert_eq!(report.required_action, RequiredAction::ManualReview);
         assert_eq!(report.operation.phase, GuestOperationPhase::TransportActive);
 
         let mut committed =
@@ -3906,6 +4080,7 @@ mod tests {
             GuestOperationRecoveryDisposition::ArtifactCompletionRecovered
         );
         assert!(report.changed);
+        assert_eq!(report.required_action, RequiredAction::None);
         assert_eq!(report.operation.phase, GuestOperationPhase::Completed);
 
         fs::write(artifact_file, b"tampered").unwrap();

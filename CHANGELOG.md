@@ -10,6 +10,8 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - Stable M5 JSON schema-version constants and a provider-neutral automation
   error envelope with deterministic codes, categories, retryability, and exit
   statuses.
+- Stable provider-neutral reconciliation ownership/action classifications and
+  a versioned machine-readable doctor/provider capability contract.
 - Initial open-source repository governance and project bootstrap.
 - M1 ownership/state manifests, immutable VHDX registration, Hyper-V differencing-disk and VM lifecycle contracts, read-only reconciliation, versioned JSON output, and mock-driven safety tests.
 - Subprocess crash-consistency, duplicate-root, cross-installation authority, tombstone stress, and cross-process state-containment coverage for the M1 real-acceptance boundary.

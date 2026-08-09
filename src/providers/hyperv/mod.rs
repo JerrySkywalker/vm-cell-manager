@@ -7,8 +7,8 @@ use serde::Deserialize;
 use crate::core::capability::ProviderCapabilities;
 use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
-    ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderProbe, ProviderVm,
-    ProviderVmIdentity, VmLookup,
+    ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderProbe,
+    ProviderProbeStatus, ProviderVm, ProviderVmIdentity, VmLookup,
 };
 
 pub use executor::PowerShellHyperVExecutor;
@@ -53,6 +53,7 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
         {
             ProviderProbe {
                 name: "hyperv",
+                status: ProviderProbeStatus::UnsupportedHost,
                 available: false,
                 detail: "Hyper-V provider is only available on Windows hosts".to_owned(),
                 capabilities: ProviderCapabilities::unavailable(),
@@ -65,9 +66,11 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
             match result {
                 Ok(response) if response.available => ProviderProbe {
                     name: "hyperv",
+                    status: ProviderProbeStatus::Ready,
                     available: true,
                     detail: response.detail,
                     capabilities: ProviderCapabilities {
+                        schema_version: crate::core::automation::AUTOMATION_SCHEMA_VERSION,
                         full_system_vm: true,
                         cow_overlay: true,
                         hardware_acceleration: true,
@@ -80,12 +83,14 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
                 },
                 Ok(response) => ProviderProbe {
                     name: "hyperv",
+                    status: ProviderProbeStatus::Unavailable,
                     available: false,
                     detail: response.detail,
                     capabilities: ProviderCapabilities::unavailable(),
                 },
                 Err(error) => ProviderProbe {
                     name: "hyperv",
+                    status: ProviderProbeStatus::ProbeFailed,
                     available: false,
                     detail: format!("failed to probe Hyper-V: {error}"),
                     capabilities: ProviderCapabilities::unavailable(),

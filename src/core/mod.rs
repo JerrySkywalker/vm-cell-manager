@@ -1,3 +1,4 @@
+pub mod automation;
 pub mod capability;
 pub mod cell;
 pub mod guest;

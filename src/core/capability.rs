@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+use super::automation::AUTOMATION_SCHEMA_VERSION;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
+    pub schema_version: u32,
     pub full_system_vm: bool,
     pub cow_overlay: bool,
     pub hardware_acceleration: bool,
@@ -16,6 +19,7 @@ impl ProviderCapabilities {
     #[must_use]
     pub fn unavailable() -> Self {
         Self {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
             full_system_vm: false,
             cow_overlay: false,
             hardware_acceleration: false,

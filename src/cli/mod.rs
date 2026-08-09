@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
+use crate::core::capability::ProviderCapabilities;
 use crate::core::cell::{CellId, CellIdError};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
@@ -12,10 +14,12 @@ use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
 };
-use crate::providers::{ProviderError, ProviderProbe, builtin_provider_probes};
+use crate::providers::{
+    ProviderError, ProviderProbe, ProviderProbeStatus, builtin_provider_probes,
+};
 use crate::state::{StateError, StateStore};
 
-pub const CLI_JSON_SCHEMA_VERSION: u32 = 1;
+pub const CLI_JSON_SCHEMA_VERSION: u32 = AUTOMATION_SCHEMA_VERSION;
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid CLI input: {0}")]
@@ -357,21 +361,55 @@ impl From<CliArchitecture> for Architecture {
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub schema_version: u32,
+    pub contract: &'static str,
+    pub status: DoctorStatus,
     pub host_os: &'static str,
     pub host_arch: &'static str,
     pub state_root: PathBuf,
     pub providers: Vec<ProviderProbe>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorStatus {
+    Ready,
+    Unavailable,
+}
+
 impl DoctorReport {
     #[must_use]
     pub fn collect(state_root: Option<PathBuf>) -> Self {
+        Self::from_probes(
+            state_root.unwrap_or_else(StateStore::default_root),
+            builtin_provider_probes(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn from_probes(state_root: PathBuf, providers: Vec<ProviderProbe>) -> Self {
+        let providers = providers
+            .into_iter()
+            .map(|mut provider| {
+                provider.available = provider.status == ProviderProbeStatus::Ready;
+                if !provider.available {
+                    provider.capabilities = ProviderCapabilities::unavailable();
+                }
+                provider
+            })
+            .collect::<Vec<_>>();
+        let status = if providers.iter().any(|provider| provider.available) {
+            DoctorStatus::Ready
+        } else {
+            DoctorStatus::Unavailable
+        };
         Self {
             schema_version: CLI_JSON_SCHEMA_VERSION,
+            contract: DOCTOR_CONTRACT,
+            status,
             host_os: std::env::consts::OS,
             host_arch: std::env::consts::ARCH,
-            state_root: state_root.unwrap_or_else(StateStore::default_root),
-            providers: builtin_provider_probes(),
+            state_root,
+            providers,
         }
     }
 }
@@ -770,6 +808,89 @@ impl<T> ListEnvelope<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
+    use crate::core::capability::ProviderCapabilities;
+    use crate::providers::ProviderProbeStatus;
+
+    #[test]
+    fn doctor_contract_is_versioned_and_machine_readable() {
+        let report = DoctorReport::from_probes(
+            PathBuf::from("state"),
+            vec![ProviderProbe {
+                name: "qemu",
+                status: ProviderProbeStatus::Ready,
+                available: true,
+                detail: "diagnostic prose".to_owned(),
+                capabilities: ProviderCapabilities {
+                    schema_version: AUTOMATION_SCHEMA_VERSION,
+                    full_system_vm: true,
+                    cow_overlay: true,
+                    hardware_acceleration: false,
+                    accelerators: vec!["tcg".to_owned()],
+                    guest_os: vec!["linux".to_owned()],
+                    guest_arch: vec!["x86_64".to_owned()],
+                    guest_transports: vec!["qga".to_owned()],
+                    networkless_guest_exec: true,
+                },
+            }],
+        );
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["schema_version"], AUTOMATION_SCHEMA_VERSION);
+        assert_eq!(value["contract"], DOCTOR_CONTRACT);
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["providers"][0]["status"], "ready");
+        assert_eq!(
+            value["providers"][0]["capabilities"]["schema_version"],
+            AUTOMATION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            value["providers"][0]["capabilities"]["accelerators"][0],
+            "tcg"
+        );
+    }
+
+    #[test]
+    fn doctor_is_unavailable_when_no_provider_is_ready() {
+        let report = DoctorReport::from_probes(
+            PathBuf::from("state"),
+            vec![ProviderProbe {
+                name: "hyperv",
+                status: ProviderProbeStatus::UnsupportedHost,
+                available: false,
+                detail: "diagnostic prose".to_owned(),
+                capabilities: ProviderCapabilities::unavailable(),
+            }],
+        );
+        assert_eq!(report.status, DoctorStatus::Unavailable);
+    }
+
+    #[test]
+    fn doctor_normalizes_inconsistent_provider_availability() {
+        let report = DoctorReport::from_probes(
+            PathBuf::from("state"),
+            vec![ProviderProbe {
+                name: "qemu",
+                status: ProviderProbeStatus::Unavailable,
+                available: true,
+                detail: "scripted inconsistent probe".to_owned(),
+                capabilities: ProviderCapabilities {
+                    schema_version: AUTOMATION_SCHEMA_VERSION,
+                    full_system_vm: true,
+                    cow_overlay: true,
+                    hardware_acceleration: true,
+                    accelerators: vec!["tcg".to_owned()],
+                    guest_os: vec!["linux".to_owned()],
+                    guest_arch: vec!["x86_64".to_owned()],
+                    guest_transports: vec!["qga".to_owned()],
+                    networkless_guest_exec: true,
+                },
+            }],
+        );
+
+        assert_eq!(report.status, DoctorStatus::Unavailable);
+        assert!(!report.providers[0].available);
+        assert!(!report.providers[0].capabilities.cow_overlay);
+    }
 
     #[test]
     fn json_v1_envelopes_remain_compatibly_shaped() {

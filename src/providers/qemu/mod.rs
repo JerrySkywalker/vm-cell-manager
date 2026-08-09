@@ -18,7 +18,7 @@ use crate::process::{ProcessError, run_bounded};
 use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
     ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderPowerState, ProviderProbe,
-    ProviderVm, ProviderVmIdentity, QemuDefinition, VmLookup,
+    ProviderProbeStatus, ProviderVm, ProviderVmIdentity, QemuDefinition, VmLookup,
 };
 
 const QEMU_CONFIG_SCHEMA: u32 = 1;
@@ -367,24 +367,84 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             Duration::from_secs(10),
             PROBE_OUTPUT_LIMIT,
         );
-        let Ok(version) = version else {
-            return ProviderProbe {
-                name: "qemu",
-                available: false,
-                detail: "QEMU system binary was not found or did not complete its bounded probe"
-                    .to_owned(),
-                capabilities: ProviderCapabilities::unavailable(),
-            };
+        let version = match version {
+            Ok(version) => version,
+            Err(ProviderError::Command(_)) => {
+                return ProviderProbe {
+                    name: "qemu",
+                    status: ProviderProbeStatus::Unavailable,
+                    available: false,
+                    detail: "QEMU system binary was not found".to_owned(),
+                    capabilities: ProviderCapabilities::unavailable(),
+                };
+            }
+            Err(_) => {
+                return ProviderProbe {
+                    name: "qemu",
+                    status: ProviderProbeStatus::ProbeFailed,
+                    available: false,
+                    detail: "QEMU system binary did not complete its bounded probe".to_owned(),
+                    capabilities: ProviderCapabilities::unavailable(),
+                };
+            }
         };
         if !version.success {
             return ProviderProbe {
                 name: "qemu",
+                status: ProviderProbeStatus::ProbeFailed,
                 available: false,
                 detail: "QEMU version probe failed".to_owned(),
                 capabilities: ProviderCapabilities::unavailable(),
             };
         }
-        let accelerators = self.accelerators().unwrap_or_default();
+        let image_version = self.executor.run(
+            &self.image_binary,
+            &[OsString::from("--version")],
+            Duration::from_secs(10),
+            PROBE_OUTPUT_LIMIT,
+        );
+        let image_version = match image_version {
+            Ok(version) => version,
+            Err(ProviderError::Command(_)) => {
+                return ProviderProbe {
+                    name: "qemu",
+                    status: ProviderProbeStatus::Unavailable,
+                    available: false,
+                    detail: "QEMU image binary was not found".to_owned(),
+                    capabilities: ProviderCapabilities::unavailable(),
+                };
+            }
+            Err(_) => {
+                return ProviderProbe {
+                    name: "qemu",
+                    status: ProviderProbeStatus::ProbeFailed,
+                    available: false,
+                    detail: "QEMU image binary did not complete its bounded probe".to_owned(),
+                    capabilities: ProviderCapabilities::unavailable(),
+                };
+            }
+        };
+        if !image_version.success {
+            return ProviderProbe {
+                name: "qemu",
+                status: ProviderProbeStatus::ProbeFailed,
+                available: false,
+                detail: "QEMU image version probe failed".to_owned(),
+                capabilities: ProviderCapabilities::unavailable(),
+            };
+        }
+        let accelerators = match self.accelerators() {
+            Ok(accelerators) => accelerators,
+            Err(_) => {
+                return ProviderProbe {
+                    name: "qemu",
+                    status: ProviderProbeStatus::ProbeFailed,
+                    available: false,
+                    detail: "QEMU accelerator discovery failed".to_owned(),
+                    capabilities: ProviderCapabilities::unavailable(),
+                };
+            }
+        };
         let hardware = host_accelerator();
         let hardware_available = accelerators.iter().any(|value| value == hardware);
         let version_line = std::str::from_utf8(&version.stdout)
@@ -394,9 +454,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             .to_owned();
         ProviderProbe {
             name: "qemu",
+            status: ProviderProbeStatus::Ready,
             available: true,
             detail: version_line,
             capabilities: ProviderCapabilities {
+                schema_version: crate::core::automation::AUTOMATION_SCHEMA_VERSION,
                 full_system_vm: true,
                 cow_overlay: true,
                 hardware_acceleration: hardware_available,
@@ -1191,10 +1253,13 @@ fn host_accelerator() -> &'static str {
 }
 
 fn filter_usable_accelerators(values: Vec<String>, kvm_usable: bool) -> Vec<String> {
-    values
+    let mut values = values
         .into_iter()
         .filter(|value| value != "kvm" || kvm_usable)
-        .collect()
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
 }
 
 #[cfg(target_os = "linux")]
@@ -1481,6 +1546,7 @@ mod tests {
     struct FakeExecutor {
         accelerators: Vec<String>,
         calls: Mutex<Vec<String>>,
+        failed_program: Option<String>,
         backing: Option<PathBuf>,
         qmp_sessions: Mutex<VecDeque<Vec<u8>>>,
     }
@@ -1497,6 +1563,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{} {:?}", program.to_string_lossy(), args));
+            if self.failed_program.as_deref() == program.to_str() {
+                return Err(ProviderError::Command(
+                    "scripted command failure".to_owned(),
+                ));
+            }
             let stdout = if args == [OsString::from("-accel"), OsString::from("help")] {
                 self.accelerators.join("\n").into_bytes()
             } else if args == [OsString::from("--version")] {
@@ -1572,6 +1643,7 @@ mod tests {
             FakeExecutor {
                 accelerators: vec![host_accelerator().to_owned(), "tcg".to_owned()],
                 calls: Mutex::new(Vec::new()),
+                failed_program: None,
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
             },
@@ -1581,10 +1653,49 @@ mod tests {
         );
         let probe = provider.probe();
         assert!(probe.available);
+        assert_eq!(probe.status, ProviderProbeStatus::Ready);
+        assert_eq!(
+            probe.capabilities.schema_version,
+            crate::core::automation::AUTOMATION_SCHEMA_VERSION
+        );
         let hardware_expected = host_accelerator() != "kvm" || kvm_device_usable();
         assert_eq!(probe.capabilities.hardware_acceleration, hardware_expected);
         assert!(probe.capabilities.accelerators.contains(&"tcg".to_owned()));
         assert_eq!(probe.capabilities.guest_transports, ["qga"]);
+        let calls = provider.executor.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("qemu-system-test [\"--version\"]"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("qemu-img [\"--version\"]"))
+        );
+    }
+
+    #[test]
+    fn probe_is_unavailable_when_qemu_img_is_missing() {
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec![host_accelerator().to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: Some("qemu-img".to_owned()),
+                backing: None,
+                qmp_sessions: Mutex::new(VecDeque::new()),
+            },
+            PathBuf::from("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+
+        let probe = provider.probe();
+
+        assert!(!probe.available);
+        assert_eq!(probe.status, ProviderProbeStatus::Unavailable);
+        assert!(!probe.capabilities.cow_overlay);
+        assert_eq!(probe.detail, "QEMU image binary was not found");
     }
 
     #[test]
@@ -1594,7 +1705,10 @@ mod tests {
             vec!["tcg"]
         );
         assert_eq!(
-            filter_usable_accelerators(vec!["kvm".to_owned(), "tcg".to_owned()], true),
+            filter_usable_accelerators(
+                vec!["tcg".to_owned(), "kvm".to_owned(), "tcg".to_owned()],
+                true
+            ),
             vec!["kvm", "tcg"]
         );
     }
@@ -1643,6 +1757,7 @@ mod tests {
             FakeExecutor {
                 accelerators: vec!["tcg".to_owned()],
                 calls: Mutex::new(Vec::new()),
+                failed_program: None,
                 backing: Some(record.image.path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
             },
@@ -1755,6 +1870,7 @@ mod tests {
             FakeExecutor {
                 accelerators: vec!["tcg".to_owned()],
                 calls: Mutex::new(Vec::new()),
+                failed_program: None,
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
             },
@@ -1909,6 +2025,7 @@ mod tests {
             FakeExecutor {
                 accelerators: vec!["tcg".to_owned()],
                 calls: Mutex::new(Vec::new()),
+                failed_program: None,
                 backing: Some(config.parent_path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
             },

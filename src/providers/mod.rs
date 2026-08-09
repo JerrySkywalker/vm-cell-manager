@@ -367,9 +367,19 @@ fn provider_paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProbe {
     pub name: &'static str,
+    pub status: ProviderProbeStatus,
     pub available: bool,
     pub detail: String,
     pub capabilities: ProviderCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProbeStatus {
+    Ready,
+    UnsupportedHost,
+    Unavailable,
+    ProbeFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
