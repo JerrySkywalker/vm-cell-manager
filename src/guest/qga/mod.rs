@@ -53,9 +53,14 @@ impl QgaCommandExecutor for SystemQgaExecutor {
     ) -> Result<(), GuestIoError> {
         let endpoint =
             ControlEndpoint::qmp(authority.configuration_path(), authority.provider_id());
-        let stream = connect_endpoint(&endpoint, timeout.min(Duration::from_secs(5)))
+        let deadline = Instant::now() + timeout;
+        let stream = connect_endpoint(
+            &endpoint,
+            remaining_guest_duration(deadline)?.min(Duration::from_secs(5)),
+        )
+        .map_err(provider_to_guest)?;
+        let mut qmp = QmpClient::negotiate(stream, remaining_guest_duration(deadline)?)
             .map_err(provider_to_guest)?;
-        let mut qmp = QmpClient::negotiate(stream, timeout).map_err(provider_to_guest)?;
         prove_qmp_snapshot(&mut qmp, expected)
     }
 
@@ -229,10 +234,14 @@ struct QgaClient {
 
 impl QgaClient {
     fn connect(endpoint: &ControlEndpoint, timeout: Duration) -> Result<Self, GuestIoError> {
+        let deadline = Instant::now() + timeout;
         let mut client = Self {
-            stream: connect_endpoint(endpoint, timeout.min(Duration::from_secs(5)))
-                .map_err(provider_to_guest)?,
-            deadline: Instant::now() + timeout,
+            stream: connect_endpoint(
+                endpoint,
+                remaining_guest_duration(deadline)?.min(Duration::from_secs(5)),
+            )
+            .map_err(provider_to_guest)?,
+            deadline,
         };
         client
             .stream
@@ -549,6 +558,13 @@ fn provider_to_guest(error: ProviderError) -> GuestIoError {
         ProviderError::InvalidResponse(_) => GuestIoError::InvalidResponse,
         _ => GuestIoError::GuestNotReady,
     }
+}
+
+fn remaining_guest_duration(deadline: Instant) -> Result<Duration, GuestIoError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(GuestIoError::Timeout)
 }
 
 #[cfg(test)]

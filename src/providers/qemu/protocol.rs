@@ -70,9 +70,12 @@ pub(crate) fn connect_endpoint(
 ) -> Result<Box<dyn ReadWrite>, ProviderError> {
     let deadline = Instant::now() + timeout;
     loop {
+        let remaining = remaining_duration(deadline).map_err(|error| {
+            ProviderError::Command(format!("QEMU control endpoint unavailable: {error}"))
+        })?;
         let result: std::io::Result<Box<dyn ReadWrite>> = match endpoint {
-            ControlEndpoint::Unix(path) => connect_unix(path, timeout),
-            ControlEndpoint::WindowsPipe(path) => connect_windows_pipe(path, timeout),
+            ControlEndpoint::Unix(path) => connect_unix(path, remaining),
+            ControlEndpoint::WindowsPipe(path) => connect_windows_pipe(path, remaining),
         };
         match result {
             Ok(stream) => return Ok(stream),

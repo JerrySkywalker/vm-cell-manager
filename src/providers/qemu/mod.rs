@@ -284,12 +284,14 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
     }
 
     fn inspect_config(&self, config: &QemuVmConfig) -> Result<ProviderVm, ProviderError> {
+        let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         let qmp = self
             .executor
             .connect_qmp(&config.qmp, Duration::from_millis(100));
         let power_state = match qmp {
             Ok(stream) => {
-                let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
+                let mut qmp =
+                    QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
                 validate_qmp_identity(&mut qmp, config)?;
                 let status = qmp.execute("query-status", None)?;
                 match status.get("status").and_then(Value::as_str) {
@@ -587,8 +589,9 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 "QEMU start expected an off or prelaunch VM".to_owned(),
             ));
         }
+        let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
-        let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
+        let mut qmp = QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
         validate_qmp_identity(&mut qmp, &config)?;
         qmp.execute("cont", None)?;
         let status = qmp.execute("query-status", None)?;
@@ -610,10 +613,6 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let mut config = read_config(&path)?;
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
-        let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
-        let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
-        validate_qmp_identity(&mut qmp, &config)?;
-        qmp.execute("quit", None)?;
         let (process_id, process_start_token) = config
             .process_id
             .zip(config.process_start_token)
@@ -622,6 +621,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 "QEMU stop requires a durable process receipt".to_owned(),
             )
         })?;
+        let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+        let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
+        let mut qmp = QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
+        validate_qmp_identity(&mut qmp, &config)?;
+        qmp.execute("quit", None)?;
         let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         while std::time::Instant::now() < deadline {
             let endpoint_absent = self
@@ -694,6 +698,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         }
         fs::remove_file(&path).map_err(|error| {
             ProviderError::Command(format!("failed to remove QEMU configuration: {error}"))
+        })?;
+        sync_parent_directory(&path).map_err(|error| {
+            ProviderError::Command(format!(
+                "failed to persist QEMU configuration removal: {error}"
+            ))
         })
     }
 }
@@ -736,6 +745,7 @@ impl QemuVmConfig {
             || !qemu_argument_path_is_safe(&self.parent_path)
             || self.command_sha256 != launch_digest(self)
             || self.process_id.is_some() != self.process_start_token.is_some()
+            || self.process_start_token == Some(0)
         {
             return Err(ProviderError::InvalidResponse(
                 "QEMU configuration invariants failed".to_owned(),
@@ -1022,6 +1032,13 @@ fn qemu_argument_path_is_safe(path: &Path) -> bool {
             .chars()
             .any(|character| matches!(character, ',' | '\n' | '\r' | '\0'))
     })
+}
+
+fn remaining_provider_duration(deadline: std::time::Instant) -> Result<Duration, ProviderError> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ProviderError::Command("QEMU operation exceeded its deadline".to_owned()))
 }
 
 #[cfg(unix)]
@@ -1721,6 +1738,11 @@ mod tests {
         assert!(config.validate(&path).is_err());
         config.overlay_path = directory.path().join("cell.qcow2");
         config.command_sha256 = launch_digest(&config);
+        config.process_id = Some(42);
+        config.process_start_token = Some(0);
+        assert!(config.validate(&path).is_err());
+        config.process_id = None;
+        config.process_start_token = None;
         config.qmp = ControlEndpoint::WindowsPipe("foreign".to_owned());
         assert!(config.validate(&path).is_err());
         config.qmp = ControlEndpoint::qmp(&configuration_path, &id);
