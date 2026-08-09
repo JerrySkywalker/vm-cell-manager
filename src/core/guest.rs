@@ -105,6 +105,8 @@ pub struct GuestOperationRecord {
     pub stdout_bytes: Option<u64>,
     pub stderr_bytes: Option<u64>,
     pub artifact_id: Option<GuestOperationId>,
+    #[serde(default)]
+    pub artifact_pruned_at: Option<DateTime<Utc>>,
 }
 
 impl GuestOperationRecord {
@@ -124,6 +126,7 @@ impl GuestOperationRecord {
             stdout_bytes: None,
             stderr_bytes: None,
             artifact_id: None,
+            artifact_pruned_at: None,
         }
     }
 }
@@ -144,3 +147,7 @@ pub struct ArtifactRecord {
     pub created_at: DateTime<Utc>,
     pub entries: Vec<ArtifactEntry>,
 }
+
+pub const MAX_ARTIFACT_FILES: usize = 16;
+pub const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ARTIFACT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;

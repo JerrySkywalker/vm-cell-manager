@@ -29,13 +29,18 @@ vmcell copy-in CELL_ID --source HOST_FILE --destination GUEST_PATH --username US
 vmcell copy-out CELL_ID --source GUEST_PATH --username USER --password-stdin
 vmcell artifact collect CELL_ID --path GUEST_PATH [--path GUEST_PATH...] --username USER --password-stdin
 vmcell artifact inspect CELL_ID OPERATION_ID
+vmcell artifact prune [--older-than-seconds N] [--max-artifacts N] [--dry-run]
 vmcell operation list [CELL_ID]
 vmcell operation inspect OPERATION_ID
 vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
-`--state-root PATH` is also global. It is intended for isolated development and acceptance roots; changing it does not authorize adoption of provider objects.
+`--state-root PATH` and `--lock-timeout-ms N` are global. The lock timeout is
+bounded to 30 seconds per state-lock acquisition, defaults to fail-fast, and
+never authorizes lock stealing. Commands that dispatch serially to multiple
+provider engines may consume one bounded interval per acquisition.
+Changing the state root does not authorize adoption of provider objects.
 
 PowerShell Direct guest commands require an exact-owned, running Windows cell.
 Its password is read as one bounded line from stdin; there is deliberately no
@@ -120,6 +125,17 @@ state-relative host path, SHA-256, and size. `artifact inspect` reads that
 manifest; it does not contact the guest. One collection is capped at 16 files,
 64 MiB per file, and a 1 GiB declared aggregate maximum.
 
+`artifact prune` is the only M5 retention mutation. It selects completed
+artifacts at one age cutoff, processes at most 256 records, and supports
+`--dry-run`. Dry run does not alter operation or artifact records, although it
+may initialize lock infrastructure when the state root is new. The engine saves
+the additive `artifact_pruned_at` tombstone on the completed operation before
+removing the exact CellId/operation artifact subtree. A crash after that save is
+resumed by a later prune, including from a partially removed exact subtree;
+guest work is never replayed. Missing or integrity-drifted committed artifacts
+fail closed before the tombstone is written. There is no background retention
+daemon.
+
 `vmcell gc` is an explicit foreground operation. It evaluates durable TTLs at
 one timestamp, skips cells with nonterminal guest operations, and delegates
 eligible cells to the M1 exact-ownership destroy path. It is not a daemon or
@@ -133,7 +149,7 @@ background timer.
   "error": {
     "code": "vmcell.ownership.not_proven",
     "category": "ownership",
-    "message": "ownership is not proven: ownership marker mismatch",
+    "message": "ownership proof failed",
     "retryable": false,
     "exit_code": 6
   }
@@ -141,7 +157,9 @@ background timer.
 ```
 
 `code`, `category`, and `exit_code` are compatibility fields. `message` is
-redacted diagnostic prose and must not be parsed. `retryable` means the same
+bounded redacted category prose and must not be parsed. Raw provider stderr,
+paths, credentials, arguments, and guest output are never placed in the error
+envelope or durable cell failure summary. `retryable` means the same
 request may be attempted after its stated precondition changes; it never
 authorizes replay of a timeout, partial copy, unknown guest operation, or
 ownership failure.
@@ -154,7 +172,7 @@ ownership failure.
 | 4 | conflict | Existing state or lifecycle state conflicts. |
 | 5 | unavailable | Provider or guest transport is unavailable. |
 | 6 | ownership | Ownership is absent, changed, or drifted. |
-| 7 | contention | Another local mutation owns the lock. |
+| 7 | contention | Another local mutation owns the lock; bounded wait expired. |
 | 8 | timeout | Deadline expired; side effects may be unknown. |
 | 9 | integrity | Schema, identity, response, or artifact proof failed. |
 | 10 | internal | Unclassified internal or state I/O failure. |

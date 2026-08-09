@@ -40,6 +40,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub state_root: Option<PathBuf>,
 
+    /// Wait up to this bounded interval for the state mutation lock.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 0,
+        value_parser = parse_lock_timeout_ms
+    )]
+    pub lock_timeout_ms: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -201,6 +210,30 @@ fn reject_password_argv(_value: &str) -> Result<String, &'static str> {
     Err("guest passwords are forbidden on argv; use --password-stdin")
 }
 
+fn parse_lock_timeout_ms(value: &str) -> Result<u64, String> {
+    parse_bounded_u64(value, 0, 30_000, "lock timeout")
+}
+
+fn parse_retention_seconds(value: &str) -> Result<u64, String> {
+    parse_bounded_u64(value, 0, 31_536_000, "artifact retention")
+}
+
+fn parse_prune_batch(value: &str) -> Result<usize, String> {
+    let value = parse_bounded_u64(value, 1, 256, "artifact prune batch")?;
+    usize::try_from(value).map_err(|_| "artifact prune batch is not representable".to_owned())
+}
+
+fn parse_bounded_u64(value: &str, min: u64, max: u64, label: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{label} must be an integer"))?;
+    if (min..=max).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!("{label} must be between {min} and {max}"))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
     /// Collect one or more guest-workspace files into one atomic artifact record.
@@ -227,6 +260,18 @@ pub enum ArtifactCommand {
     Inspect {
         cell_id: CellId,
         operation_id: GuestOperationId,
+    },
+
+    /// Explicitly prune committed artifacts older than the retention interval.
+    Prune {
+        #[arg(long, default_value_t = 604_800, value_parser = parse_retention_seconds)]
+        older_than_seconds: u64,
+
+        #[arg(long, default_value_t = 64, value_parser = parse_prune_batch)]
+        max_artifacts: usize,
+
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -495,6 +540,25 @@ pub struct CliErrorClassification {
     pub category: CliErrorCategory,
     pub exit_code: CliExitCode,
     pub retryable: bool,
+}
+
+#[must_use]
+pub const fn public_error_message(classification: CliErrorClassification) -> &'static str {
+    match classification.category {
+        CliErrorCategory::InvalidInput => "request input is invalid",
+        CliErrorCategory::NotFound => "requested state object was not found",
+        CliErrorCategory::Conflict => "requested operation conflicts with current state",
+        CliErrorCategory::Unavailable => "required provider capability is unavailable",
+        CliErrorCategory::Ownership => "ownership proof failed",
+        CliErrorCategory::Contention => "state mutation lock is busy",
+        CliErrorCategory::Timeout => "bounded operation timed out",
+        CliErrorCategory::Integrity => "integrity proof failed",
+        CliErrorCategory::Internal => "internal operation failed",
+        CliErrorCategory::RecoveryRequired => "manual recovery is required",
+        CliErrorCategory::ResourceLimit => "configured resource bound was exceeded",
+        CliErrorCategory::Authentication => "guest authentication failed",
+        CliErrorCategory::Unsupported => "requested capability is unsupported",
+    }
 }
 
 const fn classification(
@@ -1119,6 +1183,27 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(exec.command, Command::Exec { .. }));
+        let prune = Cli::try_parse_from([
+            "vmcell",
+            "--lock-timeout-ms",
+            "250",
+            "artifact",
+            "prune",
+            "--older-than-seconds",
+            "3600",
+            "--max-artifacts",
+            "8",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert_eq!(prune.lock_timeout_ms, 250);
+        assert!(matches!(
+            prune.command,
+            Command::Artifact {
+                command: ArtifactCommand::Prune { dry_run: true, .. }
+            }
+        ));
+        assert!(Cli::try_parse_from(["vmcell", "--lock-timeout-ms", "30001", "list"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "vmcell",

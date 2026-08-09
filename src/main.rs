@@ -8,12 +8,12 @@ use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliInputError, CliProvider, Command, CredentialArgs, DoctorReport,
     ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
-    classify_cli_error,
+    classify_cli_error, public_error_message,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
-    ArtifactCollectRequest, CellEngine, EngineError, GuestCopyInRequest, GuestCopyOutRequest,
-    GuestExecRequest, RegisterImageRequest,
+    ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, EngineError, GuestCopyInRequest,
+    GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -31,8 +31,8 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let classification = classify_cli_error(error.as_ref());
+            let message = public_error_message(classification);
             if json {
-                let message = error.to_string();
                 let envelope = ErrorEnvelope::new(classification, message);
                 eprintln!(
                     "{}",
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
                         .unwrap_or_else(|_| "{\"schema_version\":1,\"error\":{\"code\":\"vmcell.internal\",\"category\":\"internal\",\"message\":\"error serialization failed\",\"retryable\":false,\"exit_code\":10}}".to_owned())
                 );
             } else {
-                eprintln!("vmcell: {error}");
+                eprintln!("vmcell: {}: {message}", classification.code);
             }
             ExitCode::from(classification.exit_code.as_u8())
         }
@@ -49,6 +49,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let state_root = cli.state_root.clone();
+    let lock_timeout = Duration::from_millis(cli.lock_timeout_ms);
     match cli.command {
         Command::Doctor => {
             let report = DoctorReport::collect(state_root);
@@ -86,12 +87,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Command::Reconcile { cell_id: None } => {
             let root = state_root.unwrap_or_else(StateStore::default_root);
-            let mut items =
-                CellEngine::new(StateStore::new(root.clone()), HyperVProvider::system())
-                    .reconcile_all()?;
+            let mut items = CellEngine::new(
+                StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout),
+                HyperVProvider::system(),
+            )
+            .reconcile_all()?;
             items.extend(
-                CellEngine::new(StateStore::new(root.clone()), QemuProvider::system(root))
-                    .reconcile_all()?,
+                CellEngine::new(
+                    StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout),
+                    QemuProvider::system(root),
+                )
+                .reconcile_all()?,
             );
             let response = ListEnvelope::new(items);
             emit(&response, cli.json, || {
@@ -103,13 +109,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Gc => {
             let root = state_root.unwrap_or_else(StateStore::default_root);
             let evaluated_at = chrono::Utc::now();
-            let mut report =
-                CellEngine::new(StateStore::new(root.clone()), HyperVProvider::system())
-                    .gc_expired_at(evaluated_at)?;
+            let mut report = CellEngine::new(
+                StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout),
+                HyperVProvider::system(),
+            )
+            .gc_expired_at(evaluated_at)?;
             report.entries.extend(
-                CellEngine::new(StateStore::new(root.clone()), QemuProvider::system(root))
-                    .gc_expired_at(evaluated_at)?
-                    .entries,
+                CellEngine::new(
+                    StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout),
+                    QemuProvider::system(root),
+                )
+                .gc_expired_at(evaluated_at)?
+                .entries,
             );
             emit(&report, cli.json, || {
                 for entry in &report.entries {
@@ -119,7 +130,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         command => {
             let root = state_root.unwrap_or_else(StateStore::default_root);
-            let state = StateStore::new(root.clone());
+            let state = StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout);
             let provider = provider_for_command(&command, &state)?;
             match provider.as_str() {
                 "hyperv" => run_m2(
@@ -352,6 +363,25 @@ fn run_m2<P: LocalVmProvider>(
                 let artifact = engine.inspect_artifact(cell_id, operation_id)?;
                 emit(&artifact, json, || println!("{artifact:#?}"))?;
             }
+            ArtifactCommand::Prune {
+                older_than_seconds,
+                max_artifacts,
+                dry_run,
+            } => {
+                let report = engine.prune_artifacts(ArtifactPruneRequest {
+                    older_than: Duration::from_secs(older_than_seconds),
+                    max_artifacts,
+                    dry_run,
+                })?;
+                emit(&report, json, || {
+                    for entry in &report.entries {
+                        println!(
+                            "{}\t{}\t{:?}",
+                            entry.cell_id, entry.operation_id, entry.disposition
+                        );
+                    }
+                })?;
+            }
         },
         Command::Operation { command } => match command {
             GuestOperationCommand::List { cell_id } => {
@@ -406,6 +436,9 @@ fn provider_for_command(command: &Command, state: &StateStore) -> Result<String,
             command:
                 ArtifactCommand::Collect { cell_id, .. } | ArtifactCommand::Inspect { cell_id, .. },
         } => state.load_cell(*cell_id)?.provider,
+        Command::Artifact {
+            command: ArtifactCommand::Prune { .. },
+        } => CliProvider::Hyperv.as_str().to_owned(),
         Command::List
         | Command::Image { .. }
         | Command::Operation { .. }

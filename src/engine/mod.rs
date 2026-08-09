@@ -14,7 +14,8 @@ use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, OwnershipClassification
 use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState};
 use crate::core::guest::{
     ARTIFACT_SCHEMA_VERSION, ArtifactEntry, ArtifactRecord, GuestFailureClass, GuestOperationId,
-    GuestOperationKind, GuestOperationPhase, GuestOperationRecord,
+    GuestOperationKind, GuestOperationPhase, GuestOperationRecord, MAX_ARTIFACT_FILES,
+    MAX_ARTIFACT_TOTAL_BYTES,
 };
 use crate::core::image::{
     Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
@@ -37,8 +38,8 @@ const MAX_MEMORY_MIB: u64 = 1_048_576;
 const MAX_CPU_COUNT: u16 = 64;
 const MIN_TTL_SECONDS: u64 = 1;
 const MAX_TTL_SECONDS: u64 = 31_536_000;
-const MAX_ARTIFACT_FILES: usize = 16;
-const MAX_ARTIFACT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARTIFACT_RETENTION_SECONDS: u64 = 31_536_000;
+const MAX_ARTIFACT_PRUNE_BATCH: usize = 256;
 
 pub struct CellEngine<P> {
     state: StateStore,
@@ -130,6 +131,38 @@ pub struct ArtifactReport {
     pub operation_id: GuestOperationId,
     pub cell_id: CellId,
     pub artifact: ArtifactRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPruneRequest {
+    pub older_than: StdDuration,
+    pub max_artifacts: usize,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactPruneReport {
+    pub schema_version: u32,
+    pub evaluated_at: chrono::DateTime<Utc>,
+    pub cutoff: chrono::DateTime<Utc>,
+    pub dry_run: bool,
+    pub entries: Vec<ArtifactPruneEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactPruneEntry {
+    pub cell_id: CellId,
+    pub operation_id: GuestOperationId,
+    pub bytes: u64,
+    pub disposition: ArtifactPruneDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPruneDisposition {
+    Eligible,
+    Pruned,
+    RecoveryCompleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -869,7 +902,113 @@ impl<P: LocalVmProvider> CellEngine<P> {
         cell_id: CellId,
         operation_id: GuestOperationId,
     ) -> Result<ArtifactRecord, EngineError> {
+        let operation = self.state.load_guest_operation(operation_id)?;
+        if operation.cell_id != cell_id {
+            return Err(EngineError::Integrity(
+                "artifact operation is bound to a different cell".to_owned(),
+            ));
+        }
+        if operation.artifact_pruned_at.is_some() {
+            return Err(StateError::NotFound(
+                self.state
+                    .root()
+                    .join("artifacts")
+                    .join(cell_id.to_string())
+                    .join(operation_id.to_string()),
+            )
+            .into());
+        }
         Ok(self.state.load_artifact(cell_id, operation_id)?)
+    }
+
+    pub fn prune_artifacts(
+        &self,
+        request: ArtifactPruneRequest,
+    ) -> Result<ArtifactPruneReport, EngineError> {
+        if request.max_artifacts == 0 || request.max_artifacts > MAX_ARTIFACT_PRUNE_BATCH {
+            return Err(EngineError::InvalidCellRequest(format!(
+                "artifact prune batch must be between 1 and {MAX_ARTIFACT_PRUNE_BATCH}"
+            )));
+        }
+        if request.older_than.as_secs() > MAX_ARTIFACT_RETENTION_SECONDS {
+            return Err(EngineError::InvalidCellRequest(format!(
+                "artifact retention must not exceed {MAX_ARTIFACT_RETENTION_SECONDS} seconds"
+            )));
+        }
+        let retention = Duration::from_std(request.older_than).map_err(|_| {
+            EngineError::InvalidCellRequest("artifact retention duration is invalid".to_owned())
+        })?;
+        let evaluated_at = Utc::now();
+        let cutoff = evaluated_at - retention;
+        let mutation = self.state.acquire_mutation_lock()?;
+        let mut operations = self.state.list_guest_operations()?;
+        operations.sort_by_key(|operation| (operation.updated_at, operation.id.to_string()));
+        let mut entries = Vec::new();
+
+        for mut operation in operations {
+            let is_recovery = operation.artifact_pruned_at.is_some();
+            let is_expired_artifact = operation.phase == GuestOperationPhase::Completed
+                && operation.artifact_id == Some(operation.id)
+                && operation.artifact_pruned_at.is_none()
+                && operation
+                    .completed_at
+                    .is_some_and(|completed_at| completed_at <= cutoff);
+            if !is_recovery && !is_expired_artifact {
+                continue;
+            }
+            if entries.len() == request.max_artifacts {
+                break;
+            }
+
+            let artifact_exists = self
+                .state
+                .artifact_root_exists(operation.cell_id, operation.id)?;
+            let bytes = if is_recovery {
+                0
+            } else if artifact_exists {
+                self.state
+                    .load_artifact(operation.cell_id, operation.id)?
+                    .entries
+                    .iter()
+                    .try_fold(0_u64, |total, entry| total.checked_add(entry.size))
+                    .ok_or_else(|| EngineError::Integrity("artifact size overflow".to_owned()))?
+            } else {
+                return Err(EngineError::Integrity(
+                    "completed artifact operation is missing its artifact root".to_owned(),
+                ));
+            };
+
+            let disposition = if request.dry_run {
+                ArtifactPruneDisposition::Eligible
+            } else {
+                if !is_recovery {
+                    operation.updated_at = evaluated_at;
+                    operation.artifact_pruned_at = Some(evaluated_at);
+                    self.state.save_guest_operation(&operation)?;
+                }
+                self.state
+                    .remove_artifact_root(&mutation, operation.cell_id, operation.id)?;
+                if is_recovery {
+                    ArtifactPruneDisposition::RecoveryCompleted
+                } else {
+                    ArtifactPruneDisposition::Pruned
+                }
+            };
+            entries.push(ArtifactPruneEntry {
+                cell_id: operation.cell_id,
+                operation_id: operation.id,
+                bytes,
+                disposition,
+            });
+        }
+
+        Ok(ArtifactPruneReport {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            evaluated_at,
+            cutoff,
+            dry_run: request.dry_run,
+            entries,
+        })
     }
 
     pub fn reconcile_guest_operation(
@@ -1627,9 +1766,32 @@ impl<P: LocalVmProvider> CellEngine<P> {
     fn fail_record<T>(&self, mut record: CellRecord, error: EngineError) -> Result<T, EngineError> {
         record.state = CellState::Failed;
         record.updated_at = Utc::now();
-        record.last_error = Some(error.to_string());
+        record.last_error = Some(durable_error_code(&error).to_owned());
         self.state.save_cell(&record)?;
         Err(error)
+    }
+}
+
+fn durable_error_code(error: &EngineError) -> &'static str {
+    match error {
+        EngineError::State(_) => "vmcell.state.failed",
+        EngineError::Provider(ProviderError::Timeout(_)) => "vmcell.provider.timeout",
+        EngineError::Provider(ProviderError::OutputLimit(_)) => "vmcell.provider.output_limit",
+        EngineError::Provider(_) => "vmcell.provider.failed",
+        EngineError::UnsupportedProvider(_) => "vmcell.provider.unsupported",
+        EngineError::ProviderUnavailable(_) => "vmcell.provider.unavailable",
+        EngineError::InvalidImage(_) => "vmcell.image.invalid",
+        EngineError::ImageIntegrity(_) => "vmcell.image.integrity",
+        EngineError::ImageConflict(_) => "vmcell.image.conflict",
+        EngineError::InvalidCellRequest(_) => "vmcell.request.invalid",
+        EngineError::LifecycleConflict(_) => "vmcell.lifecycle.conflict",
+        EngineError::Integrity(_) => "vmcell.state.integrity",
+        EngineError::OwnershipNotProven(_) => "vmcell.ownership.not_proven",
+        EngineError::ProviderDrift(_) => "vmcell.ownership.drift",
+        EngineError::UnexpectedPowerState(_) => "vmcell.lifecycle.power_state",
+        EngineError::Guest(GuestIoError::Timeout) => "vmcell.guest.timeout",
+        EngineError::Guest(GuestIoError::OutputLimit) => "vmcell.guest.output_limit",
+        EngineError::Guest(_) => "vmcell.guest.failed",
     }
 }
 
@@ -4418,6 +4580,92 @@ mod tests {
                 .unwrap()
                 .phase,
             GuestOperationPhase::Completed
+        );
+    }
+
+    #[test]
+    fn artifact_prune_is_bounded_dry_runnable_and_crash_retryable() {
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        guest.state.lock().unwrap().copy_out = VecDeque::from([b"retained".to_vec()]);
+        let artifact = engine
+            .collect_artifacts(
+                &guest,
+                &credentials,
+                ArtifactCollectRequest {
+                    cell_id: cell.id,
+                    sources: vec![GuestPath::parse("results/retained.txt").unwrap()],
+                    timeout: StdDuration::from_secs(1),
+                    max_bytes_per_file: 1024,
+                    readiness: readiness_for_test(),
+                },
+            )
+            .unwrap();
+        let request = |dry_run| ArtifactPruneRequest {
+            older_than: StdDuration::ZERO,
+            max_artifacts: 1,
+            dry_run,
+        };
+
+        let dry_run = engine.prune_artifacts(request(true)).unwrap();
+        assert_eq!(dry_run.entries.len(), 1);
+        assert_eq!(
+            dry_run.entries[0].disposition,
+            ArtifactPruneDisposition::Eligible
+        );
+        assert!(
+            engine
+                .inspect_artifact(cell.id, artifact.operation_id)
+                .is_ok()
+        );
+
+        let pruned = engine.prune_artifacts(request(false)).unwrap();
+        assert_eq!(pruned.entries[0].bytes, 8);
+        assert_eq!(
+            pruned.entries[0].disposition,
+            ArtifactPruneDisposition::Pruned
+        );
+        assert!(matches!(
+            engine.inspect_artifact(cell.id, artifact.operation_id),
+            Err(EngineError::State(StateError::NotFound(_)))
+        ));
+        assert_eq!(
+            engine
+                .inspect_guest_operation(artifact.operation_id)
+                .unwrap()
+                .phase,
+            GuestOperationPhase::Completed
+        );
+        assert!(
+            engine
+                .inspect_guest_operation(artifact.operation_id)
+                .unwrap()
+                .artifact_pruned_at
+                .is_some()
+        );
+
+        let recovered = engine.prune_artifacts(request(false)).unwrap();
+        assert_eq!(
+            recovered.entries[0].disposition,
+            ArtifactPruneDisposition::RecoveryCompleted
+        );
+        assert_eq!(recovered.entries[0].bytes, 0);
+        assert!(matches!(
+            engine.prune_artifacts(ArtifactPruneRequest {
+                older_than: StdDuration::ZERO,
+                max_artifacts: 0,
+                dry_run: false,
+            }),
+            Err(EngineError::InvalidCellRequest(_))
+        ));
+    }
+
+    #[test]
+    fn durable_cell_errors_are_bounded_codes_without_provider_detail() {
+        assert_eq!(
+            durable_error_code(&EngineError::Provider(ProviderError::Command(
+                "credential-sentinel provider stderr".to_owned()
+            ))),
+            "vmcell.provider.failed"
         );
     }
 
