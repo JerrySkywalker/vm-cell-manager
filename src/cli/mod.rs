@@ -49,7 +49,7 @@ pub enum Command {
         command: ImageCommand,
     },
 
-    /// Create one stopped, networkless Hyper-V cell.
+    /// Create one stopped, networkless Hyper-V or QEMU cell.
     Create {
         #[arg(long)]
         image: ImageId,
@@ -91,7 +91,7 @@ pub enum Command {
     /// Reconcile local manifests with provider-observed state without mutation.
     Reconcile { cell_id: Option<CellId> },
 
-    /// Execute a process in an exact-owned running Windows guest.
+    /// Execute a process through the exact-owned cell's supported guest transport.
     Exec {
         cell_id: CellId,
 
@@ -247,7 +247,7 @@ impl From<CliOverwritePolicy> for OverwritePolicy {
 
 #[derive(Debug, Subcommand)]
 pub enum ImageCommand {
-    /// Register an immutable Hyper-V VHDX base.
+    /// Register an immutable provider-compatible VHDX or QCOW2 base.
     Add {
         #[arg(long)]
         id: ImageId,

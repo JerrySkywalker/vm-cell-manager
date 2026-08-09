@@ -44,6 +44,12 @@ CellId, QMP UUID, configuration, overlay/backing chain, and process instance
 remain proven. An ambiguous process or endpoint is preserved for manual
 recovery; it is never killed by pid, name, or socket alone.
 
+The no-external-writer window is also the check-to-connect boundary for QGA:
+vmcell takes a fresh complete QMP snapshot before every guest action, but QEMU
+does not provide an atomic transaction spanning QMP proof and the separate QGA
+connection. A timed-out QGA `guest-exec` is nonreplayable and its guest process
+may require operator cleanup inside the disposable cell.
+
 ## Repository-local gates
 
 - Rust 1.85 locked metadata, check, clippy, tests, and doc-tests;

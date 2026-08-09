@@ -2623,6 +2623,24 @@ mod tests {
         assert!(calls.contains(&"remove_vm"));
     }
 
+    #[test]
+    fn qemu_overlay_without_exact_parent_is_rejected() {
+        let (_directory, engine, image_id) = qemu_fixture();
+        let cell = engine.create_cell(qemu_spec(image_id)).unwrap();
+        let missing_parent = ProviderImageInfo {
+            path: cell.ownership.overlay_path.clone(),
+            disk_format: "qcow2".to_owned(),
+            disk_type: "overlay".to_owned(),
+            parent_path: None,
+            file_size: cell.image.file_size,
+            virtual_size: cell.image.file_size,
+        };
+        assert!(matches!(
+            validate_overlay(&cell, &missing_parent),
+            Err(EngineError::ProviderDrift(_))
+        ));
+    }
+
     fn spec(image: ImageId) -> CellSpec {
         CellSpec {
             image,

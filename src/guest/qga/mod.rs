@@ -9,13 +9,19 @@ use crate::guest::{
     GuestActionAuthority, GuestCommand, GuestCommandResult, GuestCopyInAction, GuestCopyOutAction,
     GuestCredentials, GuestIoError, GuestReadiness, GuestTransport, OverwritePolicy,
 };
-use crate::providers::qemu::protocol::{ControlEndpoint, ReadWrite, connect_endpoint};
+use crate::providers::qemu::protocol::{ControlEndpoint, QmpClient, ReadWrite, connect_endpoint};
 use crate::providers::{ProviderError, ProviderVm};
 
 const QGA_FRAME_LIMIT: usize = 24 * 1024 * 1024;
 const QGA_FILE_CHUNK: usize = 48 * 1024;
 
 pub(crate) trait QgaCommandExecutor: Send + Sync {
+    fn prove_vm(
+        &self,
+        authority: &GuestActionAuthority<'_>,
+        expected: &ProviderVm,
+        timeout: Duration,
+    ) -> Result<(), GuestIoError>;
     fn probe(&self, endpoint: &ControlEndpoint, timeout: Duration) -> Result<(), GuestIoError>;
     fn exec(
         &self,
@@ -39,6 +45,20 @@ pub(crate) trait QgaCommandExecutor: Send + Sync {
 pub struct SystemQgaExecutor;
 
 impl QgaCommandExecutor for SystemQgaExecutor {
+    fn prove_vm(
+        &self,
+        authority: &GuestActionAuthority<'_>,
+        expected: &ProviderVm,
+        timeout: Duration,
+    ) -> Result<(), GuestIoError> {
+        let endpoint =
+            ControlEndpoint::qmp(authority.configuration_path(), authority.provider_id());
+        let stream = connect_endpoint(&endpoint, timeout.min(Duration::from_secs(5)))
+            .map_err(provider_to_guest)?;
+        let mut qmp = QmpClient::negotiate(stream, timeout).map_err(provider_to_guest)?;
+        prove_qmp_snapshot(&mut qmp, expected)
+    }
+
     fn probe(&self, endpoint: &ControlEndpoint, timeout: Duration) -> Result<(), GuestIoError> {
         let mut client = QgaClient::connect(endpoint, timeout)?;
         client.execute("guest-info", None)?;
@@ -142,6 +162,7 @@ impl<E: QgaCommandExecutor> GuestTransport for QemuGuestAgentTransport<E> {
         if authority.provider() != "qemu" {
             return Err(GuestIoError::OwnershipChanged);
         }
+        self.executor.prove_vm(authority, expected, timeout)?;
         let endpoint =
             ControlEndpoint::qga(authority.configuration_path(), authority.provider_id());
         match self.executor.probe(&endpoint, timeout) {
@@ -161,6 +182,8 @@ impl<E: QgaCommandExecutor> GuestTransport for QemuGuestAgentTransport<E> {
         command: &GuestCommand,
     ) -> Result<GuestCommandResult, GuestIoError> {
         authority.validate(expected)?;
+        self.executor
+            .prove_vm(authority, expected, command.timeout)?;
         let endpoint =
             ControlEndpoint::qga(authority.configuration_path(), authority.provider_id());
         self.executor.exec(&endpoint, command)
@@ -174,6 +197,8 @@ impl<E: QgaCommandExecutor> GuestTransport for QemuGuestAgentTransport<E> {
         action: GuestCopyInAction<'_>,
     ) -> Result<(), GuestIoError> {
         authority.validate(expected)?;
+        self.executor
+            .prove_vm(authority, expected, action.timeout)?;
         let endpoint =
             ControlEndpoint::qga(authority.configuration_path(), authority.provider_id());
         self.executor
@@ -188,6 +213,8 @@ impl<E: QgaCommandExecutor> GuestTransport for QemuGuestAgentTransport<E> {
         action: GuestCopyOutAction<'_>,
     ) -> Result<Vec<u8>, GuestIoError> {
         authority.validate(expected)?;
+        self.executor
+            .prove_vm(authority, expected, action.timeout)?;
         let endpoint =
             ControlEndpoint::qga(authority.configuration_path(), authority.provider_id());
         self.executor
@@ -197,6 +224,7 @@ impl<E: QgaCommandExecutor> GuestTransport for QemuGuestAgentTransport<E> {
 
 struct QgaClient {
     stream: Box<dyn ReadWrite>,
+    deadline: Instant,
 }
 
 impl QgaClient {
@@ -204,6 +232,7 @@ impl QgaClient {
         let mut client = Self {
             stream: connect_endpoint(endpoint, timeout.min(Duration::from_secs(5)))
                 .map_err(provider_to_guest)?,
+            deadline: Instant::now() + timeout,
         };
         client
             .stream
@@ -218,6 +247,9 @@ impl QgaClient {
     }
 
     fn execute(&mut self, command: &str, arguments: Option<Value>) -> Result<Value, GuestIoError> {
+        if Instant::now() >= self.deadline {
+            return Err(GuestIoError::Timeout);
+        }
         let mut request = json!({"execute": command});
         if let Some(arguments) = arguments {
             request["arguments"] = arguments;
@@ -232,6 +264,9 @@ impl QgaClient {
             .and_then(|_| self.stream.flush())
             .map_err(|_| GuestIoError::Transport)?;
         let response = self.receive()?;
+        if Instant::now() >= self.deadline {
+            return Err(GuestIoError::Timeout);
+        }
         if response.get("error").is_some() {
             return Err(GuestIoError::Transport);
         }
@@ -245,6 +280,7 @@ impl QgaClient {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         let mut started = false;
+        let mut skipped = 0_usize;
         loop {
             if self
                 .stream
@@ -256,6 +292,10 @@ impl QgaClient {
             }
             if !started {
                 if byte[0] != b'{' {
+                    skipped += 1;
+                    if skipped >= QGA_FRAME_LIMIT {
+                        return Err(GuestIoError::OutputLimit);
+                    }
                     continue;
                 }
                 started = true;
@@ -405,6 +445,72 @@ impl QgaClient {
     }
 }
 
+fn prove_qmp_snapshot<S: Read + Write>(
+    qmp: &mut QmpClient<S>,
+    expected: &ProviderVm,
+) -> Result<(), GuestIoError> {
+    let uuid = qmp.execute("query-uuid", None).map_err(provider_to_guest)?;
+    let name = qmp.execute("query-name", None).map_err(provider_to_guest)?;
+    let cpus = qmp
+        .execute("query-cpus-fast", None)
+        .map_err(provider_to_guest)?;
+    let memory = qmp
+        .execute("query-memory-size-summary", None)
+        .map_err(provider_to_guest)?;
+    let network = qmp
+        .execute("query-rx-filter", None)
+        .map_err(provider_to_guest)?;
+    let blocks = qmp
+        .execute("query-block", None)
+        .map_err(provider_to_guest)?;
+    let status = qmp
+        .execute("query-status", None)
+        .map_err(provider_to_guest)?;
+    let block = blocks
+        .as_array()
+        .and_then(|items| (items.len() == 1).then(|| &items[0]));
+    let attached = block
+        .and_then(|item| item.get("inserted"))
+        .and_then(|item| item.get("file"))
+        .and_then(Value::as_str);
+    if uuid.get("UUID").and_then(Value::as_str) != Some(expected.id.as_str())
+        || name.get("name").and_then(Value::as_str) != Some(expected.name.as_str())
+        || cpus.as_array().map(Vec::len) != Some(expected.cpu_count as usize)
+        || memory.get("base-memory").and_then(Value::as_u64)
+            != Some(expected.memory_mib * 1024 * 1024)
+        || network.as_array().is_none_or(|items| !items.is_empty())
+        || block
+            .and_then(|item| item.get("inserted"))
+            .and_then(|item| item.get("drv"))
+            .and_then(Value::as_str)
+            != Some("qcow2")
+        || block
+            .and_then(|item| item.get("inserted"))
+            .and_then(|item| item.get("backing_file_depth"))
+            .and_then(Value::as_u64)
+            != Some(1)
+        || attached.is_none_or(|path| {
+            expected.attached_disks.len() != 1
+                || !qga_provider_path_equal(std::path::Path::new(path), &expected.attached_disks[0])
+        })
+        || status.get("status").and_then(Value::as_str) != Some("running")
+    {
+        return Err(GuestIoError::OwnershipChanged);
+    }
+    Ok(())
+}
+
+fn qga_provider_path_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let canonical = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.into());
+    if cfg!(target_os = "windows") {
+        canonical(left)
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&canonical(right).to_string_lossy())
+    } else {
+        canonical(left) == canonical(right)
+    }
+}
+
 fn decode_output(status: &Value, field: &str, limit: u64) -> Result<Vec<u8>, GuestIoError> {
     let Some(value) = status.get(field).and_then(Value::as_str) else {
         return Ok(Vec::new());
@@ -487,6 +593,15 @@ mod tests {
         calls: Mutex<Vec<&'static str>>,
     }
     impl QgaCommandExecutor for FakeQga {
+        fn prove_vm(
+            &self,
+            _: &GuestActionAuthority<'_>,
+            _: &ProviderVm,
+            _: Duration,
+        ) -> Result<(), GuestIoError> {
+            self.calls.lock().unwrap().push("prove_vm");
+            Ok(())
+        }
         fn probe(&self, _: &ControlEndpoint, _: Duration) -> Result<(), GuestIoError> {
             self.calls.lock().unwrap().push("probe");
             Ok(())
@@ -537,6 +652,7 @@ mod tests {
         ]);
         let mut client = QgaClient {
             stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
         };
         let result = client
             .exec(&GuestCommand {
@@ -556,6 +672,7 @@ mod tests {
         ]);
         let mut client = QgaClient {
             stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
         };
         assert_eq!(
             client.exec(&GuestCommand {
@@ -573,6 +690,7 @@ mod tests {
         let stream = FakeQgaStream::scripted(&[json!({"return": {"count": 1}})]);
         let mut client = QgaClient {
             stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
         };
         assert_eq!(
             client.file_write_all(7, b"more than one byte"),
@@ -585,7 +703,60 @@ mod tests {
         })]);
         let mut client = QgaClient {
             stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
         };
         assert_eq!(client.file_read_all(8, 2), Err(GuestIoError::OutputLimit));
+
+        let stream = FakeQgaStream::scripted(&[json!({"return": {"count": 1}})]);
+        let mut expired = QgaClient {
+            stream: Box::new(stream),
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        assert_eq!(
+            expired.file_write_all(9, b"deadline"),
+            Err(GuestIoError::Timeout)
+        );
+    }
+
+    #[test]
+    fn qga_action_qmp_snapshot_binds_running_networkless_vm() {
+        let expected = ProviderVm {
+            id: Uuid::nil().to_string(),
+            name: format!("vmcell-{}", Uuid::nil()),
+            power_state: crate::providers::ProviderPowerState::Running,
+            ownership_marker: "marker".to_owned(),
+            configuration_path: std::path::PathBuf::from("runtime/qemu"),
+            attached_disks: vec![std::path::PathBuf::from("runtime/cell.qcow2")],
+            network_adapter_count: 0,
+            cpu_count: 1,
+            memory_mib: 1024,
+        };
+        let lines = [
+            json!({"QMP": {}}),
+            json!({"return": {}, "id": 1}),
+            json!({"return": {"UUID": expected.id}, "id": 2}),
+            json!({"return": {"name": expected.name}, "id": 3}),
+            json!({"return": [{"cpu-index": 0}], "id": 4}),
+            json!({"return": {"base-memory": 1073741824_u64}, "id": 5}),
+            json!({"return": [], "id": 6}),
+            json!({"return": [{"inserted": {
+                "drv": "qcow2",
+                "file": expected.attached_disks[0],
+                "backing_file_depth": 1
+            }}], "id": 7}),
+            json!({"return": {"status": "running"}, "id": 8}),
+        ];
+        let stream = FakeQgaStream::scripted(&lines);
+        let mut qmp = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
+        assert!(prove_qmp_snapshot(&mut qmp, &expected).is_ok());
+
+        let mut drifted = lines;
+        drifted[6] = json!({"return": [{"name": "foreign-nic"}], "id": 6});
+        let stream = FakeQgaStream::scripted(&drifted);
+        let mut qmp = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            prove_qmp_snapshot(&mut qmp, &expected),
+            Err(GuestIoError::OwnershipChanged)
+        );
     }
 }

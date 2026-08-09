@@ -32,11 +32,11 @@ vmcell gc
 
 `--state-root PATH` is also global. It is intended for isolated development and acceptance roots; changing it does not authorize adoption of provider objects.
 
-Guest commands require an exact-owned, running Windows cell. The password is
-read as one bounded line from stdin; there is deliberately no password argument
-or environment-variable option. Guest paths are relative to vmcell's fixed
-workspace and reject traversal, absolute paths, alternate data streams, device
-names, and ambiguous trailing dot/space forms.
+PowerShell Direct guest commands require an exact-owned, running Windows cell.
+Its password is read as one bounded line from stdin; there is deliberately no
+password argument or environment-variable option. Guest paths are relative to
+vmcell's fixed workspace and reject traversal, absolute paths, alternate data
+streams, device names, and ambiguous trailing dot/space forms.
 
 For QEMU, the image and create provider must be explicit and compatible. TCG
 requires both `--accelerator tcg` and `--allow-tcg`; `auto` never silently

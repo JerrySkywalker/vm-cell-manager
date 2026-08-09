@@ -62,6 +62,8 @@ pub trait QemuCommandExecutor: Send + Sync {
         command_sha256: &str,
     ) -> bool;
 
+    fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool;
+
     fn connect_qmp(
         &self,
         endpoint: &ControlEndpoint,
@@ -122,6 +124,10 @@ impl QemuCommandExecutor for SystemQemuExecutor {
         command_sha256: &str,
     ) -> bool {
         process_matches(process_id, start_token, program, command_sha256)
+    }
+
+    fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool {
+        process_absence_proven(process_id, start_token)
     }
 
     fn connect_qmp(
@@ -276,7 +282,7 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             .connect_qmp(&config.qmp, Duration::from_millis(100));
         let power_state = match qmp {
             Ok(stream) => {
-                let mut qmp = QmpClient::negotiate(stream)?;
+                let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
                 validate_qmp_identity(&mut qmp, config)?;
                 let status = qmp.execute("query-status", None)?;
                 match status.get("status").and_then(Value::as_str) {
@@ -291,6 +297,12 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
                 }
             }
             Err(_) => {
+                if config.spawn_pending {
+                    return Err(ProviderError::OwnershipChanged(
+                        "QEMU launch may have started before its process receipt was persisted"
+                            .to_owned(),
+                    ));
+                }
                 if let (Some(pid), Some(token)) = (config.process_id, config.process_start_token) {
                     if self.executor.process_matches(
                         pid,
@@ -301,6 +313,11 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
                         return Err(ProviderError::OwnershipChanged(
                             "recorded QEMU process is alive but its QMP identity is unavailable"
                                 .to_owned(),
+                        ));
+                    }
+                    if !self.executor.process_absence_proven(pid, token) {
+                        return Err(ProviderError::OwnershipChanged(
+                            "recorded QEMU process absence cannot be proven".to_owned(),
                         ));
                     }
                 }
@@ -477,6 +494,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             qmp: ControlEndpoint::qmp(&request.configuration_path, &id),
             qga: ControlEndpoint::qga(&request.configuration_path, &id),
             command_sha256: String::new(),
+            spawn_pending: false,
             process_id: None,
             process_start_token: None,
         };
@@ -549,10 +567,13 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ));
         }
         if expected.power_state == ProviderPowerState::Off {
+            config.spawn_pending = true;
+            replace_config(&path, &config)?;
             let args = launch_args(&config);
             let receipt = self.executor.spawn_vm(&self.system_binary, &args)?;
             config.process_id = Some(receipt.process_id);
             config.process_start_token = Some(receipt.process_start_token);
+            config.spawn_pending = false;
             replace_config(&path, &config)?;
         } else if expected.power_state != ProviderPowerState::Paused {
             return Err(ProviderError::OwnershipChanged(
@@ -560,7 +581,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ));
         }
         let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
-        let mut qmp = QmpClient::negotiate(stream)?;
+        let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
         validate_qmp_identity(&mut qmp, &config)?;
         qmp.execute("cont", None)?;
         let status = qmp.execute("query-status", None)?;
@@ -583,7 +604,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
         let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
-        let mut qmp = QmpClient::negotiate(stream)?;
+        let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
         validate_qmp_identity(&mut qmp, &config)?;
         qmp.execute("quit", None)?;
         let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
@@ -595,6 +616,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             {
                 config.process_id = None;
                 config.process_start_token = None;
+                config.spawn_pending = false;
                 replace_config(&path, &config)?;
                 return Ok(());
             }
@@ -620,6 +642,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let config = read_config(&path)?;
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
+        if config.spawn_pending {
+            return Err(ProviderError::OwnershipChanged(
+                "QEMU launch intent has no durable process receipt".to_owned(),
+            ));
+        }
         if self
             .executor
             .connect_qmp(&config.qmp, Duration::from_millis(50))
@@ -638,6 +665,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ) {
                 return Err(ProviderError::OwnershipChanged(
                     "QEMU process is still live".to_owned(),
+                ));
+            }
+            if !self.executor.process_absence_proven(pid, token) {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU process absence cannot be proven".to_owned(),
                 ));
             }
         }
@@ -662,6 +694,8 @@ struct QemuVmConfig {
     qmp: ControlEndpoint,
     qga: ControlEndpoint,
     command_sha256: String,
+    #[serde(default)]
+    spawn_pending: bool,
     process_id: Option<u32>,
     process_start_token: Option<u64>,
 }
@@ -673,9 +707,13 @@ impl QemuVmConfig {
             || self.name != format!("vmcell-{}", self.id)
             || !Self::config_path_matches(path, &self.configuration_path)
             || self.overlay_path.parent() != self.configuration_path.parent()
+            || self.qmp != ControlEndpoint::qmp(&self.configuration_path, &self.id)
+            || self.qga != ControlEndpoint::qga(&self.configuration_path, &self.id)
             || self.cpu_count == 0
             || self.memory_mib == 0
             || !matches!(self.accelerator.as_str(), "whpx" | "kvm" | "hvf" | "tcg")
+            || self.command_sha256 != launch_digest(self)
+            || self.process_id.is_some() != self.process_start_token.is_some()
         {
             return Err(ProviderError::InvalidResponse(
                 "QEMU configuration invariants failed".to_owned(),
@@ -767,9 +805,46 @@ fn write_config_new(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderEr
 fn replace_config(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderError> {
     let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     write_config_new(&temp, config)?;
-    fs::rename(&temp, path).map_err(|error| {
+    replace_file_atomic(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
         ProviderError::Command(format!("failed to replace QEMU configuration: {error}"))
     })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_config_snapshot(
@@ -985,7 +1060,29 @@ fn process_start_token(process_id: u32) -> Option<u64> {
         .ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn process_start_token(process_id: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        ok.then(|| (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn process_start_token(_process_id: u32) -> Option<u64> {
     Some(0)
 }
@@ -1028,19 +1125,71 @@ fn process_matches(
     argument_digest(&arguments) == command_sha256
 }
 
+#[cfg(target_os = "linux")]
+fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
+    process_start_token(process_id) != Some(start_token)
+}
+
 #[cfg(target_os = "windows")]
 fn process_matches(
     process_id: u32,
-    _start_token: u64,
-    _program: &OsStr,
-    _command_sha256: &str,
+    start_token: u64,
+    program: &OsStr,
+    command_sha256: &str,
 ) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        WaitForSingleObject,
+    };
+
+    let _ = command_sha256;
     unsafe {
-        let handle = OpenProcess(0x0010_0000, 0, process_id);
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000,
+            0,
+            process_id,
+        );
         if handle.is_null() {
             return false;
         }
-        let result = WaitForSingleObject(handle, 0) == 258;
+        let mut length = 32_768_u32;
+        let mut buffer = vec![0_u16; length as usize];
+        let image_ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) != 0;
+        let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+        CloseHandle(handle);
+        if !image_ok || !alive || process_start_token(process_id) != Some(start_token) {
+            return false;
+        }
+        buffer.truncate(length as usize);
+        let actual = PathBuf::from(OsString::from_wide(&buffer));
+        let expected = Path::new(program);
+        if expected.is_absolute() {
+            actual.canonicalize().ok() == expected.canonicalize().ok()
+        } else {
+            actual
+                .file_name()
+                .zip(expected.file_name())
+                .is_some_and(|(left, right)| {
+                    left.to_string_lossy()
+                        .eq_ignore_ascii_case(&right.to_string_lossy())
+                })
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_absence_proven(process_id: u32, _start_token: u64) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    unsafe {
+        let handle = OpenProcess(0x0010_0000, 0, process_id);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let result = WaitForSingleObject(handle, 0) == 0;
         CloseHandle(handle);
         result
     }
@@ -1056,12 +1205,9 @@ fn process_matches(
     false
 }
 
-#[cfg(target_os = "windows")]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut core::ffi::c_void;
-    fn WaitForSingleObject(handle: *mut core::ffi::c_void, milliseconds: u32) -> u32;
-    fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn process_absence_proven(_process_id: u32, _start_token: u64) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -1159,6 +1305,9 @@ mod tests {
         ) -> bool {
             false
         }
+        fn process_absence_proven(&self, _process_id: u32, _start_token: u64) -> bool {
+            true
+        }
         fn connect_qmp(
             &self,
             _: &ControlEndpoint,
@@ -1214,6 +1363,7 @@ mod tests {
             qmp: ControlEndpoint::Unix(PathBuf::from("qmp.sock")),
             qga: ControlEndpoint::Unix(PathBuf::from("qga.sock")),
             command_sha256: String::new(),
+            spawn_pending: false,
             process_id: None,
             process_start_token: None,
         };
@@ -1427,6 +1577,7 @@ mod tests {
             qmp: ControlEndpoint::Unix(PathBuf::from("qmp.sock")),
             qga: ControlEndpoint::Unix(PathBuf::from("qga.sock")),
             command_sha256: String::new(),
+            spawn_pending: false,
             process_id: Some(42),
             process_start_token: Some(7),
         };
@@ -1442,9 +1593,60 @@ mod tests {
             reads: drifted.into(),
             writes: Vec::new(),
         };
-        let mut qmp = QmpClient::negotiate(stream).unwrap();
+        let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT).unwrap();
         assert!(matches!(
             validate_qmp_identity(&mut qmp, &config),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+    }
+
+    #[test]
+    fn config_endpoint_digest_and_spawn_receipt_gates_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration_path = directory.path().join("qemu");
+        let id = Uuid::new_v4().to_string();
+        let mut config = QemuVmConfig {
+            schema_version: QEMU_CONFIG_SCHEMA,
+            id: id.clone(),
+            name: format!("vmcell-{id}"),
+            ownership_marker: "marker".to_owned(),
+            configuration_path: configuration_path.clone(),
+            overlay_path: directory.path().join("cell.qcow2"),
+            parent_path: directory.path().join("base.qcow2"),
+            cpu_count: 1,
+            memory_mib: 1024,
+            accelerator: "tcg".to_owned(),
+            qmp: ControlEndpoint::qmp(&configuration_path, &id),
+            qga: ControlEndpoint::qga(&configuration_path, &id),
+            command_sha256: String::new(),
+            spawn_pending: false,
+            process_id: None,
+            process_start_token: None,
+        };
+        config.command_sha256 = launch_digest(&config);
+        let path = configuration_path.join("vm.json");
+        assert!(config.validate(&path).is_ok());
+        config.qmp = ControlEndpoint::WindowsPipe("foreign".to_owned());
+        assert!(config.validate(&path).is_err());
+        config.qmp = ControlEndpoint::qmp(&configuration_path, &id);
+        config.command_sha256 = "tampered".to_owned();
+        assert!(config.validate(&path).is_err());
+
+        config.command_sha256 = launch_digest(&config);
+        config.spawn_pending = true;
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                backing: Some(config.parent_path.clone()),
+                qmp_sessions: Mutex::new(VecDeque::new()),
+            },
+            directory.path().to_path_buf(),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+        assert!(matches!(
+            provider.inspect_config(&config),
             Err(ProviderError::OwnershipChanged(_))
         ));
     }

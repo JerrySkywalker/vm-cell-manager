@@ -64,8 +64,8 @@ pub(crate) fn connect_endpoint(
     let deadline = Instant::now() + timeout;
     loop {
         let result: std::io::Result<Box<dyn ReadWrite>> = match endpoint {
-            ControlEndpoint::Unix(path) => connect_unix(path),
-            ControlEndpoint::WindowsPipe(path) => connect_windows_pipe(path),
+            ControlEndpoint::Unix(path) => connect_unix(path, timeout),
+            ControlEndpoint::WindowsPipe(path) => connect_windows_pipe(path, timeout),
         };
         match result {
             Ok(stream) => return Ok(stream),
@@ -83,15 +83,15 @@ pub(crate) fn connect_endpoint(
 }
 
 #[cfg(unix)]
-fn connect_unix(path: &Path) -> std::io::Result<Box<dyn ReadWrite>> {
+fn connect_unix(path: &Path, timeout: Duration) -> std::io::Result<Box<dyn ReadWrite>> {
     let stream = std::os::unix::net::UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     Ok(Box::new(stream))
 }
 
 #[cfg(not(unix))]
-fn connect_unix(_path: &Path) -> std::io::Result<Box<dyn ReadWrite>> {
+fn connect_unix(_path: &Path, _timeout: Duration) -> std::io::Result<Box<dyn ReadWrite>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "Unix sockets are unavailable",
@@ -99,20 +99,158 @@ fn connect_unix(_path: &Path) -> std::io::Result<Box<dyn ReadWrite>> {
 }
 
 #[cfg(target_os = "windows")]
-fn connect_windows_pipe(path: &str) -> std::io::Result<Box<dyn ReadWrite>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    Ok(Box::new(file))
+fn connect_windows_pipe(path: &str, timeout: Duration) -> std::io::Result<Box<dyn ReadWrite>> {
+    WindowsPipeStream::connect(path, timeout).map(|stream| Box::new(stream) as Box<dyn ReadWrite>)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn connect_windows_pipe(_path: &str) -> std::io::Result<Box<dyn ReadWrite>> {
+fn connect_windows_pipe(_path: &str, _timeout: Duration) -> std::io::Result<Box<dyn ReadWrite>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "Windows named pipes are unavailable",
     ))
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsPipeStream {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    timeout_ms: u32,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WindowsPipeStream {}
+
+#[cfg(target_os = "windows")]
+impl WindowsPipeStream {
+    fn connect(path: &str, timeout: Duration) -> std::io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+        let wide = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let timeout_ms = duration_millis(timeout);
+        if unsafe { WaitNamedPipeW(wide.as_ptr(), timeout_ms) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { handle, timeout_ms })
+    }
+
+    fn transfer(&self, bytes: &mut [u8], write: bool) -> std::io::Result<usize> {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GetLastError};
+        use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+        use windows_sys::Win32::System::IO::{
+            CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
+        };
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..OVERLAPPED::default()
+        };
+        let mut transferred = 0_u32;
+        let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let started = unsafe {
+            if write {
+                WriteFile(
+                    self.handle,
+                    bytes.as_ptr(),
+                    length,
+                    &mut transferred,
+                    &mut overlapped,
+                )
+            } else {
+                ReadFile(
+                    self.handle,
+                    bytes.as_mut_ptr(),
+                    length,
+                    &mut transferred,
+                    &mut overlapped,
+                )
+            }
+        };
+        let result = if started != 0 {
+            Ok(transferred as usize)
+        } else if unsafe { GetLastError() } != ERROR_IO_PENDING {
+            Err(std::io::Error::last_os_error())
+        } else if unsafe {
+            GetOverlappedResultEx(
+                self.handle,
+                &overlapped,
+                &mut transferred,
+                self.timeout_ms,
+                0,
+            )
+        } != 0
+        {
+            Ok(transferred as usize)
+        } else {
+            unsafe {
+                CancelIoEx(self.handle, &overlapped);
+                GetOverlappedResult(self.handle, &overlapped, &mut transferred, 1);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "QEMU named-pipe operation timed out",
+            ))
+        };
+        unsafe { CloseHandle(event) };
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Read for WindowsPipeStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.transfer(bytes, false)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Write for WindowsPipeStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut owned = bytes.to_vec();
+        self.transfer(&mut owned, true)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsPipeStream {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn duration_millis(timeout: Duration) -> u32 {
+    timeout.as_millis().clamp(1, u128::from(u32::MAX)) as u32
 }
 
 pub(crate) struct JsonLineProtocol<S> {
@@ -171,13 +309,15 @@ impl<S: Read + Write> JsonLineProtocol<S> {
 pub(crate) struct QmpClient<S> {
     protocol: JsonLineProtocol<S>,
     next_id: u64,
+    deadline: Instant,
 }
 
 impl<S: Read + Write> QmpClient<S> {
-    pub(crate) fn negotiate(stream: S) -> Result<Self, ProviderError> {
+    pub(crate) fn negotiate(stream: S, timeout: Duration) -> Result<Self, ProviderError> {
         let mut client = Self {
             protocol: JsonLineProtocol::new(stream),
             next_id: 1,
+            deadline: Instant::now() + timeout,
         };
         let greeting = client.protocol.receive()?;
         if greeting.get("QMP").is_none() {
@@ -194,6 +334,11 @@ impl<S: Read + Write> QmpClient<S> {
         command: &str,
         arguments: Option<Value>,
     ) -> Result<Value, ProviderError> {
+        if Instant::now() >= self.deadline {
+            return Err(ProviderError::Command(
+                "QMP operation exceeded its deadline".to_owned(),
+            ));
+        }
         let id = self.next_id;
         self.next_id += 1;
         let mut request = json!({"execute": command, "id": id});
@@ -201,9 +346,21 @@ impl<S: Read + Write> QmpClient<S> {
             request["arguments"] = arguments;
         }
         self.protocol.send(&request)?;
+        let mut event_count = 0_u16;
         loop {
+            if Instant::now() >= self.deadline {
+                return Err(ProviderError::Command(
+                    "QMP operation exceeded its deadline".to_owned(),
+                ));
+            }
             let response = self.protocol.receive()?;
             if response.get("event").is_some() {
+                event_count += 1;
+                if event_count > 64 {
+                    return Err(ProviderError::InvalidResponse(
+                        "QMP emitted too many events before the response".to_owned(),
+                    ));
+                }
                 continue;
             }
             if response.get("id").and_then(Value::as_u64) != Some(id) {
@@ -212,12 +369,9 @@ impl<S: Read + Write> QmpClient<S> {
                 ));
             }
             if let Some(error) = response.get("error") {
+                let _ = error;
                 return Err(ProviderError::Command(format!(
-                    "QMP command {command} failed: {}",
-                    error
-                        .get("desc")
-                        .and_then(Value::as_str)
-                        .unwrap_or("redacted QMP error")
+                    "QMP command {command} failed"
                 )));
             }
             return response.get("return").cloned().ok_or_else(|| {
@@ -270,7 +424,7 @@ mod tests {
             reads: input.bytes().collect(),
             writes: Vec::new(),
         };
-        let mut client = QmpClient::negotiate(stream).unwrap();
+        let mut client = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
         assert_eq!(
             client.execute("query-status", None).unwrap()["status"],
             "running"
@@ -298,7 +452,7 @@ mod tests {
             writes: Vec::new(),
         };
         assert!(matches!(
-            QmpClient::negotiate(wrong_id),
+            QmpClient::negotiate(wrong_id, Duration::from_secs(1)),
             Err(ProviderError::InvalidResponse(_))
         ));
         let truncated = ScriptedStream {
@@ -306,8 +460,37 @@ mod tests {
             writes: Vec::new(),
         };
         assert!(matches!(
-            QmpClient::negotiate(truncated),
+            QmpClient::negotiate(truncated, Duration::from_secs(1)),
             Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn qmp_event_flood_and_expired_deadline_fail_closed() {
+        let mut input = concat!("{\"QMP\":{}}\n", "{\"return\":{},\"id\":1}\n").to_owned();
+        for _ in 0..65 {
+            input.push_str("{\"event\":\"STOP\"}\n");
+        }
+        input.push_str("{\"return\":{},\"id\":2}\n");
+        let stream = ScriptedStream {
+            reads: input.bytes().collect(),
+            writes: Vec::new(),
+        };
+        let mut client = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            client.execute("query-status", None),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+
+        let expired = ScriptedStream {
+            reads: concat!("{\"QMP\":{}}\n", "{\"return\":{},\"id\":1}\n")
+                .bytes()
+                .collect(),
+            writes: Vec::new(),
+        };
+        assert!(matches!(
+            QmpClient::negotiate(expired, Duration::ZERO),
+            Err(ProviderError::Command(_))
         ));
     }
 }

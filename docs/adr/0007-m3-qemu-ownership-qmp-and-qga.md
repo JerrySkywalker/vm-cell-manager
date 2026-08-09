@@ -22,9 +22,10 @@ process id plus platform process-start token.
 
 No destructive operation is authorized by process id, process name, socket
 path, or QEMU name alone. Start and stop negotiate QMP capabilities, correlate
-request ids, ignore asynchronous events while waiting for their response, and
-prove the configured UUID and name. QMP/QGA messages, child output, and process
-lifetimes are bounded. Unknown protocol or process identity fails closed.
+request ids, bound asynchronous events while waiting for their response, and
+prove the configured UUID/name, CPU, memory, networkless state, and attached
+overlay. QMP/QGA messages, host child output, and host protocol waits are
+bounded. Unknown protocol or process identity fails closed.
 
 Registered QEMU images are ordinary immutable QCOW2 files with no backing
 image. Creation produces exactly one QCOW2 overlay whose full backing path is
@@ -40,7 +41,10 @@ daemonization.
 QGA is a guest transport, not a lifecycle provider. M3 implements
 credentialless Linux QGA exec and CellId-scoped copy using typed protocol
 requests; it does not invoke a guest shell. Unknown guest actions retain the M2
-nonreplayable recovery classification. QGA filesystem protection does not
+nonreplayable recovery classification. QGA exposes no portable process-kill
+primitive, so a timed-out `guest-exec` process may remain live inside the
+disposable guest and requires operator recovery; vmcell never replays it. QGA
+filesystem protection does not
 treat an administrator-equivalent process inside the disposable guest as a
 security boundary.
 
@@ -50,6 +54,8 @@ security boundary.
   opaque authority carry portable lifecycle intent.
 - A process that exists without a durable, exact QMP/runtime receipt is
   quarantined; it is never killed or adopted by name or pid.
+- A durable pre-spawn intent prevents an unavailable QMP endpoint from being
+  misclassified as an off VM during the spawn/receipt crash window.
 - A QMP failure after spawn can require manual recovery, but cannot authorize a
   broad host process kill or base-image deletion.
 - QEMU/KVM, WHPX, and HVF real acceptance remain separate host gates. Missing

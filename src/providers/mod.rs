@@ -331,25 +331,34 @@ pub trait LocalVmProvider: Send + Sync {
 }
 
 fn provider_paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
-    let normalize = |path: &std::path::Path| {
-        let mut value = path.to_string_lossy().replace('/', "\\");
-        if value
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
-        {
-            value = format!(r"\\{}", &value[8..]);
-        } else if value
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
-        {
-            value = value[4..].to_owned();
-        }
-        while value.len() > 3 && value.ends_with('\\') {
-            value.pop();
-        }
-        value
-    };
-    normalize(left).eq_ignore_ascii_case(&normalize(right))
+    #[cfg(target_os = "windows")]
+    {
+        let normalize = |path: &std::path::Path| {
+            let mut value = path.to_string_lossy().replace('/', "\\");
+            if value
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+            {
+                value = format!(r"\\{}", &value[8..]);
+            } else if value
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
+            {
+                value = value[4..].to_owned();
+            }
+            while value.len() > 3 && value.ends_with('\\') {
+                value.pop();
+            }
+            value
+        };
+        normalize(left).eq_ignore_ascii_case(&normalize(right))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let canonical =
+            |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        canonical(left) == canonical(right)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
