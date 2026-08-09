@@ -11,6 +11,14 @@
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
+## Windows Human MVP quick start
+
+The canonical portable-install → doctor → VHDX validate/register → `vmcell
+run` → cleanup-verification workflow is documented in the
+[Windows Human MVP Quick Start](docs/quickstart-windows.md). Real Hyper-V and
+PowerShell Direct execution remains release-gated; repository-local CI and a
+ready doctor probe do not authorize or establish platform acceptance.
+
 ## Why this project
 
 There are already strong open-source VM tools. VM Cell Manager exists only for the gap that remains between them:
@@ -129,7 +137,7 @@ vmcell doctor [--json]
 vmcell provider list [--json]
 ```
 
-Current `main` exposes:
+The current `dev` candidate exposes:
 
 ```text
 vmcell doctor

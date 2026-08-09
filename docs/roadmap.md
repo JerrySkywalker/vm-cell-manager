@@ -161,6 +161,9 @@ The package currently uses pre-1.0 versioning, but no official release tag is as
 
 # v0.1.0 — Windows Human MVP
 
+**Repository-local status:** implemented on `dev`; frozen release promotion and
+real Hyper-V/PowerShell Direct acceptance remain pending.
+
 ## Product promise
 
 > Given a prepared Windows VHDX on an accepted Hyper-V host, a human user can run a command inside a disposable Windows VM, retrieve its result, and safely dispose of the VM without manually operating Hyper-V.
@@ -265,6 +268,11 @@ install vmcell
 -> observe command output
 -> prove cleanup
 ```
+
+The repository-local command and package surface for this flow is documented
+in `docs/quickstart-windows.md`. Its mutating steps remain release-gated until
+the dedicated-host acceptance claims below pass; `doctor` readiness alone is
+not admission.
 
 ## Real-platform release gates
 

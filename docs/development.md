@@ -65,6 +65,12 @@ manual `workflow_dispatch` only on the trusted runner and uploads a bounded
 short-retention artifact; it does not tag, promote, or create a release. See
 `docs/windows-portable-package.md` for the exact contract.
 
+Public-facing Windows usage follows `docs/quickstart-windows.md`. Keep its
+command spelling synchronized with CLI help and the portable archive layout.
+The quick start must continue to distinguish repository-local evidence and a
+ready capability probe from dedicated-host Hyper-V/PowerShell Direct release
+acceptance.
+
 On a native Linux development host, `tools/check-linux.sh` runs the locked
 repository-local portability suite. It does not install Rust, QEMU, KVM
 components, packages, or change `/dev/kvm` permissions. WSL2 output is useful
