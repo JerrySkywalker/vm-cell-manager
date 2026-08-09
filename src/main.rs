@@ -3,7 +3,7 @@ use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliInputError, CliProvider, Command, CredentialArgs, DoctorReport,
@@ -25,26 +25,62 @@ use vm_cell_manager::state::StateStore;
 use zeroize::Zeroizing;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let json_requested = json_requested_by_argv();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return emit_parse_error(error, json_requested),
+    };
     let json = cli.json;
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let classification = classify_cli_error(error.as_ref());
-            let message = public_error_message(classification);
-            if json {
-                let envelope = ErrorEnvelope::new(classification, message);
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&envelope)
-                        .unwrap_or_else(|_| "{\"schema_version\":1,\"error\":{\"code\":\"vmcell.internal\",\"category\":\"internal\",\"message\":\"error serialization failed\",\"retryable\":false,\"exit_code\":10}}".to_owned())
-                );
-            } else {
-                eprintln!("vmcell: {}: {message}", classification.code);
-            }
-            ExitCode::from(classification.exit_code.as_u8())
+            emit_classified_error(classification, json)
         }
     }
+}
+
+fn json_requested_by_argv() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--json")
+}
+
+fn emit_parse_error(error: clap::Error, json_requested: bool) -> ExitCode {
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        let _ = error.print();
+        return ExitCode::SUCCESS;
+    }
+    if json_requested {
+        let classification =
+            classify_cli_error(&CliInputError("argument parsing failed".to_owned()));
+        emit_classified_error(classification, true)
+    } else {
+        let _ = error.print();
+        ExitCode::from(2)
+    }
+}
+
+fn emit_classified_error(
+    classification: vm_cell_manager::cli::CliErrorClassification,
+    json: bool,
+) -> ExitCode {
+    let message = public_error_message(classification);
+    if json {
+        let envelope = ErrorEnvelope::new(classification, message);
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&envelope)
+                .unwrap_or_else(|_| "{\"schema_version\":1,\"error\":{\"code\":\"vmcell.internal\",\"category\":\"internal\",\"message\":\"error serialization failed\",\"retryable\":false,\"exit_code\":10}}".to_owned())
+        );
+    } else {
+        eprintln!("vmcell: {}: {message}", classification.code);
+    }
+    ExitCode::from(classification.exit_code.as_u8())
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {

@@ -5,7 +5,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
-use crate::core::capability::ProviderCapabilities;
 use crate::core::cell::{CellId, CellIdError};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
@@ -14,9 +13,7 @@ use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
 };
-use crate::providers::{
-    ProviderError, ProviderProbe, ProviderProbeStatus, builtin_provider_probes,
-};
+use crate::providers::{ProviderError, ProviderProbe, builtin_provider_probes};
 use crate::state::{StateError, StateStore};
 
 pub const CLI_JSON_SCHEMA_VERSION: u32 = AUTOMATION_SCHEMA_VERSION;
@@ -434,13 +431,7 @@ impl DoctorReport {
     pub(crate) fn from_probes(state_root: PathBuf, providers: Vec<ProviderProbe>) -> Self {
         let providers = providers
             .into_iter()
-            .map(|mut provider| {
-                provider.available = provider.status == ProviderProbeStatus::Ready;
-                if !provider.available {
-                    provider.capabilities = ProviderCapabilities::unavailable();
-                }
-                provider
-            })
+            .map(ProviderProbe::normalized)
             .collect::<Vec<_>>();
         let status = if providers.iter().any(|provider| provider.available) {
             DoctorStatus::Ready
@@ -1079,6 +1070,67 @@ mod tests {
             assert_eq!(actual.code, code);
             assert_eq!(actual.exit_code, exit_code);
             assert_eq!(actual.retryable, retryable);
+        }
+    }
+
+    #[test]
+    fn provider_fault_taxonomy_is_exhaustive_and_backend_independent() {
+        let common = [
+            (
+                ProviderError::Command("redacted".to_owned()),
+                "vmcell.provider.command_failed",
+                CliExitCode::Unavailable,
+            ),
+            (
+                ProviderError::Timeout("redacted".to_owned()),
+                "vmcell.provider.timeout",
+                CliExitCode::Timeout,
+            ),
+            (
+                ProviderError::OutputLimit("redacted".to_owned()),
+                "vmcell.provider.output_limit",
+                CliExitCode::ResourceLimit,
+            ),
+            (
+                ProviderError::InvalidResponse("redacted".to_owned()),
+                "vmcell.provider.invalid_response",
+                CliExitCode::Integrity,
+            ),
+            (
+                ProviderError::NotFound("redacted".to_owned()),
+                "vmcell.provider.not_found",
+                CliExitCode::NotFound,
+            ),
+            (
+                ProviderError::Collision("redacted".to_owned()),
+                "vmcell.provider.conflict",
+                CliExitCode::Conflict,
+            ),
+            (
+                ProviderError::OwnershipChanged("redacted".to_owned()),
+                "vmcell.ownership.changed",
+                CliExitCode::Ownership,
+            ),
+            (
+                ProviderError::Authority("redacted".to_owned()),
+                "vmcell.ownership.changed",
+                CliExitCode::Ownership,
+            ),
+        ];
+        for (error, code, exit_code) in common {
+            let classification = classify_provider_error(&error);
+            assert_eq!(classification.code, code);
+            assert_eq!(classification.exit_code, exit_code);
+            assert!(!classification.retryable);
+        }
+
+        for provider in ["hyperv", "qemu"] {
+            let classification = classify_provider_error(&ProviderError::Unsupported {
+                provider,
+                operation: "fixture",
+            });
+            assert_eq!(classification.code, "vmcell.provider.unsupported");
+            assert_eq!(classification.exit_code, CliExitCode::Unsupported);
         }
     }
 

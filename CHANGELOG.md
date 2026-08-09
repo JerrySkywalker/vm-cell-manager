@@ -14,6 +14,8 @@ The project is currently pre-release and follows an architecture-first bootstrap
   a versioned machine-readable doctor/provider capability contract.
 - Bounded state-lock waiting, explicit dry-run-capable artifact retention,
   manifest size/count revalidation, and redacted durable/CLI diagnostics.
+- Provider-normalized readiness, versioned redacted JSON for argument failures,
+  explicit legacy CLI migration behavior, and cross-provider contract tests.
 - Initial open-source repository governance and project bootstrap.
 - M1 ownership/state manifests, immutable VHDX registration, Hyper-V differencing-disk and VM lifecycle contracts, read-only reconciliation, versioned JSON output, and mock-driven safety tests.
 - Subprocess crash-consistency, duplicate-root, cross-installation authority, tombstone stress, and cross-process state-containment coverage for the M1 real-acceptance boundary.

@@ -57,6 +57,12 @@ M0 probes remain read-only. M1 Hyper-V mutation is reachable only through owners
 3. Core CI runs format, Clippy, and all non-destructive tests.
 4. Real Hyper-V acceptance is a separately authorized activity on a dedicated host with a disposable VHDX, an isolated state root, and pre/post foreign-VM and switch checks.
 
+M5 automation contract tests are repository-local and provider-neutral. They
+exhaust typed probe-status/capability contradictions for both built-in provider
+names, exercise every provider fault category, and run the compiled CLI to
+verify JSON/human exit behavior and legacy-command migration. These tests do
+not substitute for real provider or guest acceptance.
+
 ## Platform boundaries
 
 - Windows-native lifecycle work belongs under `src/providers/hyperv`.

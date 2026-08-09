@@ -373,6 +373,28 @@ pub struct ProviderProbe {
     pub capabilities: ProviderCapabilities,
 }
 
+impl ProviderProbe {
+    /// Derive the compatibility-facing readiness bit from typed probe state and
+    /// the minimum lifecycle capabilities instead of trusting duplicated fields.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        let capabilities_are_usable = self.capabilities.schema_version
+            == crate::core::automation::AUTOMATION_SCHEMA_VERSION
+            && self.capabilities.full_system_vm
+            && self.capabilities.cow_overlay;
+        if self.status == ProviderProbeStatus::Ready && !capabilities_are_usable {
+            self.status = ProviderProbeStatus::ProbeFailed;
+            self.detail =
+                "provider readiness response omitted required lifecycle capabilities".to_owned();
+        }
+        self.available = self.status == ProviderProbeStatus::Ready;
+        if !self.available {
+            self.capabilities = ProviderCapabilities::unavailable();
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderProbeStatus {
@@ -531,7 +553,7 @@ pub fn builtin_provider_probes() -> Vec<ProviderProbe> {
 
     providers
         .into_iter()
-        .map(|provider| provider.probe())
+        .map(|provider| provider.probe().normalized())
         .collect()
 }
 
@@ -615,4 +637,74 @@ pub(crate) fn test_mutation_fixture_for(
         last_error: None,
     };
     (directory, state, installation_authority, runtime, record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifecycle_capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            full_system_vm: true,
+            cow_overlay: true,
+            ..ProviderCapabilities::unavailable()
+        }
+    }
+
+    #[test]
+    fn probe_readiness_invariant_is_provider_neutral_and_exhaustive() {
+        let statuses = [
+            ProviderProbeStatus::Ready,
+            ProviderProbeStatus::UnsupportedHost,
+            ProviderProbeStatus::Unavailable,
+            ProviderProbeStatus::ProbeFailed,
+        ];
+        for name in ["hyperv", "qemu"] {
+            for status in statuses {
+                for duplicated_available in [false, true] {
+                    let normalized = ProviderProbe {
+                        name,
+                        status,
+                        available: duplicated_available,
+                        detail: "fixture".to_owned(),
+                        capabilities: lifecycle_capabilities(),
+                    }
+                    .normalized();
+                    assert_eq!(
+                        normalized.available,
+                        status == ProviderProbeStatus::Ready,
+                        "provider={name} status={status:?} duplicate={duplicated_available}"
+                    );
+                    if status != ProviderProbeStatus::Ready {
+                        assert_eq!(normalized.capabilities, ProviderCapabilities::unavailable());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ready_probe_without_versioned_lifecycle_capability_fails_closed() {
+        let mut fixtures = vec![
+            ProviderCapabilities::unavailable(),
+            lifecycle_capabilities(),
+            lifecycle_capabilities(),
+        ];
+        fixtures[1].schema_version += 1;
+        fixtures[2].cow_overlay = false;
+
+        for capabilities in fixtures {
+            let normalized = ProviderProbe {
+                name: "qemu",
+                status: ProviderProbeStatus::Ready,
+                available: true,
+                detail: "fixture".to_owned(),
+                capabilities,
+            }
+            .normalized();
+            assert_eq!(normalized.status, ProviderProbeStatus::ProbeFailed);
+            assert!(!normalized.available);
+            assert_eq!(normalized.capabilities, ProviderCapabilities::unavailable());
+        }
+    }
 }

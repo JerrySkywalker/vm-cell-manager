@@ -16,6 +16,13 @@ fn inspect_missing_cell(state_root: &std::path::Path, json: bool) -> std::proces
         .expect("vmcell CLI should start")
 }
 
+fn run_vmcell(arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(arguments)
+        .output()
+        .expect("vmcell CLI should start")
+}
+
 #[test]
 fn json_and_human_modes_share_the_same_stable_exit_classification() {
     let state = tempfile::tempdir().unwrap();
@@ -44,4 +51,41 @@ fn json_and_human_modes_share_the_same_stable_exit_classification() {
         human_stderr.trim(),
         "vmcell: vmcell.state.not_found: requested state object was not found"
     );
+}
+
+#[test]
+fn json_parse_failures_are_versioned_redacted_and_migrate_legacy_provider_list() {
+    for arguments in [
+        vec!["--json", "provider-list"],
+        vec!["--json", "--credential-sentinel"],
+    ] {
+        let output = run_vmcell(&arguments);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["error"]["code"], "vmcell.invalid_input");
+        assert_eq!(envelope["error"]["category"], "invalid_input");
+        assert_eq!(envelope["error"]["retryable"], false);
+        assert_eq!(envelope["error"]["exit_code"], 2);
+        let serialized = String::from_utf8(output.stderr).unwrap();
+        assert!(!serialized.contains("provider-list"));
+        assert!(!serialized.contains("credential-sentinel"));
+    }
+
+    let human = run_vmcell(&["provider-list"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&human.stderr).contains("provider"));
+
+    let guest_argument = run_vmcell(&[
+        "exec",
+        "not-a-cell-id",
+        "--username",
+        "fixture",
+        "--password-stdin",
+        "--",
+        "--json",
+    ]);
+    assert_eq!(guest_argument.status.code(), Some(2));
+    assert!(serde_json::from_slice::<serde_json::Value>(&guest_argument.stderr).is_err());
 }
