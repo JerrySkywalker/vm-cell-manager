@@ -125,8 +125,8 @@ manifest; it does not contact the guest. One collection is capped at 16 files,
 
 `artifact prune` is the only M5 retention mutation. It selects completed
 artifacts at one age cutoff, processes at most 256 records, and supports
-`--dry-run`. The engine saves the terminal `artifact_pruned` operation phase
-before removing the exact CellId/operation artifact subtree. A crash after that
+`--dry-run`. The engine saves the additive `artifact_pruned_at` tombstone on the
+completed operation before removing the exact CellId/operation artifact subtree. A crash after that
 save is resumed by a later prune; guest work is never replayed. Missing or
 integrity-drifted committed artifacts fail closed. There is no background
 retention daemon.

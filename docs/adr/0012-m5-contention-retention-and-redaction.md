@@ -19,13 +19,14 @@ age-based cleanup is introduced. A collection remains bounded to 16 files,
 64 MiB per file, and 1 GiB total; the same limits are revalidated when a
 persisted manifest is loaded.
 
-Before deleting artifact bytes, the engine durably transitions the bound guest
-operation to `artifact_pruned`. Deletion is restricted to the exact
+Before deleting artifact bytes, the engine durably sets the additive
+`artifact_pruned_at` tombstone on the bound completed operation. Deletion is
+restricted to the exact
 CellId/operation subtree under the pinned state artifact root. A crash after the
 transition is retryable: a later prune completes the exact same removal without
 replaying guest work. Corrupt, missing, reparse, or identity-mismatched committed
 artifacts fail closed before a new prune transition.
-The small non-secret `artifact_pruned` operation record remains as the durable
+The small non-secret completed operation record remains as the durable
 audit tombstone; M5 does not introduce automatic operation-record deletion.
 
 CLI error prose and persisted cell failure summaries never contain raw provider

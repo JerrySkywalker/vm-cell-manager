@@ -1278,6 +1278,7 @@ fn validate_guest_operation_schema(
             record.completed_at.is_none()
                 && record.failure.is_none()
                 && record.artifact_id.is_none()
+                && record.artifact_pruned_at.is_none()
                 && record.exit_code.is_none()
                 && record.stdout_bytes.is_none()
                 && record.stderr_bytes.is_none()
@@ -1285,6 +1286,7 @@ fn validate_guest_operation_schema(
         crate::core::guest::GuestOperationPhase::TransportActive => {
             record.completed_at.is_none()
                 && record.artifact_id.is_none()
+                && record.artifact_pruned_at.is_none()
                 && record.exit_code.is_none()
                 && record.stdout_bytes.is_none()
                 && record.stderr_bytes.is_none()
@@ -1293,6 +1295,7 @@ fn validate_guest_operation_schema(
             record.completed_at.is_none()
                 && record.failure.is_none()
                 && record.artifact_id == Some(record.id)
+                && record.artifact_pruned_at.is_none()
                 && record.exit_code.is_none()
                 && record.stdout_bytes.is_none()
                 && record.stderr_bytes.is_none()
@@ -1303,14 +1306,17 @@ fn validate_guest_operation_schema(
                 && record
                     .artifact_id
                     .is_none_or(|artifact_id| artifact_id == record.id)
-        }
-        crate::core::guest::GuestOperationPhase::ArtifactPruned => {
-            record.completed_at.is_some()
-                && record.failure.is_none()
-                && record.artifact_id == Some(record.id)
-                && record.exit_code.is_none()
-                && record.stdout_bytes.is_none()
-                && record.stderr_bytes.is_none()
+                && record.artifact_pruned_at.is_none_or(|_| {
+                    record.artifact_id == Some(record.id)
+                        && matches!(
+                            record.kind,
+                            crate::core::guest::GuestOperationKind::CopyOut
+                                | crate::core::guest::GuestOperationKind::ArtifactCollect
+                        )
+                        && record.exit_code.is_none()
+                        && record.stdout_bytes.is_none()
+                        && record.stderr_bytes.is_none()
+                })
         }
         crate::core::guest::GuestOperationPhase::Failed => {
             record.completed_at.is_some()
@@ -1318,6 +1324,7 @@ fn validate_guest_operation_schema(
                     failure != crate::core::guest::GuestFailureClass::Unknown
                 })
                 && record.artifact_id.is_none()
+                && record.artifact_pruned_at.is_none()
                 && record.exit_code.is_none()
                 && record.stdout_bytes.is_none()
                 && record.stderr_bytes.is_none()
@@ -1328,6 +1335,9 @@ fn validate_guest_operation_schema(
         || record.completed_at.is_some_and(|completed_at| {
             completed_at < record.created_at || completed_at != record.updated_at
         })
+        || record
+            .artifact_pruned_at
+            .is_some_and(|pruned_at| Some(pruned_at) != record.completed_at)
     {
         return Err(StateError::GuestOperationIntegrity {
             path: path.to_path_buf(),

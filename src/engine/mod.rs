@@ -908,7 +908,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 "artifact operation is bound to a different cell".to_owned(),
             ));
         }
-        if operation.phase == GuestOperationPhase::ArtifactPruned {
+        if operation.artifact_pruned_at.is_some() {
             return Err(StateError::NotFound(
                 self.state
                     .root()
@@ -946,9 +946,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let mut entries = Vec::new();
 
         for mut operation in operations {
-            let is_recovery = operation.phase == GuestOperationPhase::ArtifactPruned;
+            let is_recovery = operation.artifact_pruned_at.is_some();
             let is_expired_artifact = operation.phase == GuestOperationPhase::Completed
                 && operation.artifact_id == Some(operation.id)
+                && operation.artifact_pruned_at.is_none()
                 && operation
                     .completed_at
                     .is_some_and(|completed_at| completed_at <= cutoff);
@@ -981,9 +982,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 ArtifactPruneDisposition::Eligible
             } else {
                 if !is_recovery {
-                    operation.phase = GuestOperationPhase::ArtifactPruned;
                     operation.updated_at = evaluated_at;
                     operation.completed_at = Some(evaluated_at);
+                    operation.artifact_pruned_at = Some(evaluated_at);
                     self.state.save_guest_operation(&operation)?;
                 }
                 self.state
@@ -1018,9 +1019,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let _mutation = self.state.acquire_mutation_lock()?;
         let mut operation = self.state.load_guest_operation(operation_id)?;
         let (disposition, changed) = match operation.phase {
-            GuestOperationPhase::Completed
-            | GuestOperationPhase::ArtifactPruned
-            | GuestOperationPhase::Failed => {
+            GuestOperationPhase::Completed | GuestOperationPhase::Failed => {
                 (GuestOperationRecoveryDisposition::AlreadyTerminal, false)
             }
             GuestOperationPhase::IntentRecorded => {
@@ -4635,7 +4634,14 @@ mod tests {
                 .inspect_guest_operation(artifact.operation_id)
                 .unwrap()
                 .phase,
-            GuestOperationPhase::ArtifactPruned
+            GuestOperationPhase::Completed
+        );
+        assert!(
+            engine
+                .inspect_guest_operation(artifact.operation_id)
+                .unwrap()
+                .artifact_pruned_at
+                .is_some()
         );
 
         let recovered = engine.prune_artifacts(request(false)).unwrap();

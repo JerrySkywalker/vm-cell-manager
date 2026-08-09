@@ -64,14 +64,13 @@ pub enum GuestOperationPhase {
     TransportActive,
     ArtifactCommitted,
     Completed,
-    ArtifactPruned,
     Failed,
 }
 
 impl GuestOperationPhase {
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::ArtifactPruned | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed)
     }
 }
 
@@ -106,6 +105,8 @@ pub struct GuestOperationRecord {
     pub stdout_bytes: Option<u64>,
     pub stderr_bytes: Option<u64>,
     pub artifact_id: Option<GuestOperationId>,
+    #[serde(default)]
+    pub artifact_pruned_at: Option<DateTime<Utc>>,
 }
 
 impl GuestOperationRecord {
@@ -125,6 +126,7 @@ impl GuestOperationRecord {
             stdout_bytes: None,
             stderr_bytes: None,
             artifact_id: None,
+            artifact_pruned_at: None,
         }
     }
 }

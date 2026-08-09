@@ -185,7 +185,7 @@ Initial implementation rules:
 - never automatically replay an unknown or partially completed guest action;
 - keep artifacts in a CellId/operation-bound, hash-verified state subtree;
 - prune artifacts only through an explicit bounded dry-runnable command that
-  persists `artifact_pruned` before exact-subtree deletion;
+  persists `artifact_pruned_at` before exact-subtree deletion;
 - emit and persist stable redacted error codes instead of raw provider stderr;
 - run TTL cleanup only through explicit `vmcell gc` and the existing exact-owned destroy path.
 
