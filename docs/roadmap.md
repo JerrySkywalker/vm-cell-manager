@@ -110,10 +110,11 @@ Planned acceptance:
 - concurrency-lock hardening beyond the narrow M1 exclusive mutation lock;
 - artifact/log retention policy.
 
-Status: active. Stable JSON/errors and provider-neutral reconciliation/doctor
-contracts are merged. Bounded contention plus explicit artifact retention and
-redaction are the current short slice. M5 is delivered as sequential short PRs
-against green `main`; no unfinished slice becomes the base for another.
+Status: repository-local implementation complete. Stable JSON/errors,
+provider-neutral reconciliation/doctor, bounded contention, explicit artifact
+retention/redaction, and automation CLI migration contracts were delivered as
+sequential short PRs against green `main`; no unfinished slice became the base
+for another. Real-platform acceptance remains tracked separately.
 
 ## Later candidates
 

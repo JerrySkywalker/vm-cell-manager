@@ -1306,7 +1306,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     fn require_provider_available(&self) -> Result<(), EngineError> {
         self.require_provider()?;
-        let probe = self.provider.probe();
+        let probe = self.provider.probe().normalized();
         if probe.available {
             Ok(())
         } else {
@@ -2699,7 +2699,11 @@ mod tests {
                 status: ProviderProbeStatus::Ready,
                 available: true,
                 detail: "mock".to_owned(),
-                capabilities: ProviderCapabilities::unavailable(),
+                capabilities: ProviderCapabilities {
+                    full_system_vm: true,
+                    cow_overlay: true,
+                    ..ProviderCapabilities::unavailable()
+                },
             }
         }
 

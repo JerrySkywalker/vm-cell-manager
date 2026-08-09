@@ -2,12 +2,12 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha. The repository-local M1-M4 foundations are merged to
+> **Status:** pre-alpha. The repository-local M1-M5 foundations are merged to
 > `main`: ownership-checked Hyper-V and QEMU lifecycles, PowerShell Direct and
-> QGA guest contracts, artifacts/TTL/GC, and Unix portability. Real Hyper-V,
+> QGA guest contracts, artifacts/TTL/GC, Unix portability, and versioned
+> automation contracts. Real Hyper-V,
 > guest, QEMU, KVM, WHPX, and HVF acceptance remains separately gated and is
-> not run by core CI. M5 automation hardening is active as sequential short
-> PRs against green `main`.
+> not run by core CI.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -279,7 +279,7 @@ The first milestones are intentionally incremental:
 - **M2 — Windows guest control:** repository-local implementation is merged; real PowerShell Direct guest acceptance remains gated.
 - **M3 — QEMU provider:** repository-local QMP lifecycle, QCOW2 overlay, and QGA contracts are merged; real QEMU/WHPX/KVM/HVF acceptance remains gated.
 - **M4 — Linux portability foundation:** Unix state/path/process and KVM capability foundations are merged; native Linux/KVM and macOS/HVF acceptance remains gated.
-- **M5 — automation hardening:** active as sequential short PRs covering stable JSON, deterministic failures, reconciliation, concurrency, retention, and automation CLI contracts.
+- **M5 — automation hardening:** repository-local implementation is merged; stable JSON, deterministic failures, reconciliation, contention, retention, and automation CLI contracts are covered by cross-provider tests.
 
 Provider-specific capabilities such as TPM, Secure Boot, nested virtualization, GPU/device support, or additional native providers come only after the core lifecycle is stable.
 

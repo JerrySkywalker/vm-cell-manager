@@ -7,6 +7,10 @@ Compatible releases may add fields. Removing fields, changing their types, or
 reusing their meaning requires a new schema version. Clients must ignore
 unknown additive fields.
 
+When `--json` is present, argument-validation failures also use the versioned
+error envelope and exit `2`; raw arguments and parser diagnostics are not
+echoed. Help and version output remain human-readable discovery surfaces.
+
 ## Commands
 
 ```text
@@ -65,6 +69,10 @@ carries its own `schema_version`. Provider `detail` is diagnostic prose and
 must not be parsed. `provider list --json` uses the same typed provider objects.
 `ready` means the bounded provider/capability probe completed; callers must
 still inspect the requested accelerator, guest, and transport capabilities.
+The shared provider boundary derives `available` from typed `status` and the
+versioned full-system/COW lifecycle capability minimum. Contradictory ready
+responses fail closed as `probe_failed`, and non-ready responses expose no
+positive capabilities.
 
 ```json
 {
@@ -180,3 +188,12 @@ ownership failure.
 | 12 | resource_limit | A configured size/output bound was reached. |
 | 13 | authentication | Guest authentication failed. |
 | 14 | unsupported | Provider, transport, or operation is unsupported. |
+
+## Pre-alpha command migration
+
+The former top-level `provider-list` spelling is removed. Automation must use
+`vmcell provider list`. The legacy spelling fails deterministically as
+`vmcell.invalid_input` / exit `2`; under `--json` it receives the same redacted
+schema-v1 error envelope as every other argument-validation failure. This is a
+pre-alpha migration, not a compatibility alias, so scripts cannot silently
+continue on an obsolete surface.
