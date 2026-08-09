@@ -23,18 +23,34 @@ cargo test --locked --workspace --all-features --doc
 
 Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
 
-## Rapid integration policy
+## Branch and integration policy
 
-Development is trunk-oriented. Start each independently reviewable slice from
-green `main`, keep active product PR depth at zero or one, and never exceed a
-transient depth of two during retarget or recovery. A slice completes branch
-validation, exact-head CI, focused review, merge, exact-main CI, and branch
-cleanup before the next product slice starts.
+`main` is the stable release baseline and `dev` is the persistent
+repository-local integration branch. Start each independently reviewable slice
+from green `dev` on an ephemeral `agent/*` branch. Normal development PRs target
+`dev`, never `main`. Keep active agent PR depth at zero or one and never exceed
+a transient depth of two during retarget, synchronization, or recovery. A slice
+completes focused validation, exact-head CI, focused review, merge to `dev`,
+exact-dev CI, and agent branch/worktree cleanup before the next slice starts.
 
 Do not repeat a canonical gate for an unchanged head and claim. Classify CI
 failures before changing product code, and fix-forward or revert promptly if
-`main` regresses. The self-hosted core workflow is push/workflow-dispatch only;
+`dev` regresses. The self-hosted core workflow is push/workflow-dispatch only;
 do not add an automatic untrusted-fork `pull_request` path to that runner.
+
+Release candidates use temporary frozen `release/vX.Y.Z` branches created from
+green exact `dev`. Their release record declares which repository-local and
+real-platform gates are required or explicitly deferred. Promote an accepted
+release to `main` by reviewed PR, verify exact-main CI, create the immutable
+`vX.Y.Z` tag on that accepted commit, synchronize main back to `dev`, verify
+exact-dev CI, and remove the temporary release branch. Never move, delete, or
+reuse a version tag.
+
+Release fixes use `hotfix/*` branches created from `main`. Merge the reviewed
+fix to `main`, verify exact-main CI, create a new patch-version tag when
+releasing it, and synchronize the accepted main history back through a short
+`agent/*` PR to `dev`. Delete both temporary branches after exact-dev CI. Never
+force-push or allow a hotfix to remain unsynchronized.
 
 Repository-local merge eligibility and real-platform acceptance are distinct.
 P0/P1-clean, exact-head-green work may merge while separately documented
