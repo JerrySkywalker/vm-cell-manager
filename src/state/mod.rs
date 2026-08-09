@@ -1187,7 +1187,9 @@ fn validate_guest_operation_schema(
         }
         crate::core::guest::GuestOperationPhase::Failed => {
             record.completed_at.is_some()
-                && record.failure.is_some()
+                && record.failure.is_some_and(|failure| {
+                    failure != crate::core::guest::GuestFailureClass::Unknown
+                })
                 && record.artifact_id.is_none()
                 && record.exit_code.is_none()
                 && record.stdout_bytes.is_none()
@@ -1594,6 +1596,15 @@ mod tests {
         let operation_json = fs::read_to_string(store.guest_operation_path(operation.id)).unwrap();
         assert!(!operation_json.contains("credential-sentinel"));
         assert!(!operation_json.contains("argument-sentinel"));
+
+        let mut ambiguous = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
+        ambiguous.phase = GuestOperationPhase::Failed;
+        ambiguous.failure = Some(GuestFailureClass::Unknown);
+        ambiguous.completed_at = Some(now);
+        assert!(matches!(
+            store.save_guest_operation(&ambiguous),
+            Err(StateError::GuestOperationIntegrity { .. })
+        ));
 
         let artifact_id = GuestOperationId::new();
         let guard = store.prepare_artifact_root(cell_id, artifact_id).unwrap();
