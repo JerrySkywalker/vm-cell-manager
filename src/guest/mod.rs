@@ -295,6 +295,9 @@ impl<'a> GuestActionAuthority<'a> {
     }
 
     pub(crate) fn validate(&self, expected: &ProviderVm) -> Result<(), GuestIoError> {
+        self._mutation
+            .validate_filesystem_identity()
+            .map_err(|_| GuestIoError::OwnershipChanged)?;
         if self.install_id != self._installation.record().install_id
             || self.cell_id != self._runtime.cell_id()
             || !matches!(self.provider, "hyperv" | "qemu")

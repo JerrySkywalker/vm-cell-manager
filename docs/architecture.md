@@ -168,6 +168,13 @@ Persisted installation, image, cell, and ownership schemas are rejected when the
 
 On Windows, path identity treats ordinary drive and UNC paths as equivalent to their verbatim `\\?\` forms for provider reconciliation. This alias normalization is not used for containment: state and runtime creation/deletion separately reject reparse points throughout the existing ancestor chain, pin ordinary directory identities across provider use, and require the physical CellId directory to be a direct child of the physical runtime root. Persisted manifest filenames are also bound to their embedded IDs.
 
+On Unix, vmcell state directories are current-user-owned `0700` directories
+and state/configuration files are `0600`. Authority-bearing file and directory
+opens use no-follow/close-on-exec flags and revalidate device/inode identity.
+Linux exposes KVM only when both QEMU advertises it and the current identity can
+open `/dev/kvm`; a compiled but inaccessible accelerator is not silently
+selected.
+
 The provider mutex coordinates `vmcell` processes; it cannot serialize unrelated Hyper-V tools. The Rust mutation guard also pins the state root and its `locks`, `images`, `cells`, and `runtime` children against replacement while an operation is active. Real-provider acceptance therefore requires an isolated host window with no concurrent external Hyper-V writer and exclusive, ACL-enforced control of the configured vmcell state root.
 
 The state store is not intended to become a distributed database. If multi-host scheduling is required, it belongs above this project.

@@ -318,8 +318,11 @@ mod tests {
             .arg("--nocapture")
             .env("VMCELL_PIPE_CHILD", "1");
         let started = Instant::now();
-        let output = run_bounded(&mut command, &[], Duration::from_secs(2), 64 * 1024).unwrap();
+        // A saturated Windows runner can spend several seconds starting the
+        // nested test executables. The owned grandchild sleeps for 30 seconds,
+        // so this still proves the process tree closes inherited pipes.
+        let output = run_bounded(&mut command, &[], Duration::from_secs(15), 64 * 1024).unwrap();
         assert!(output.status.success());
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

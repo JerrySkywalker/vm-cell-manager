@@ -2846,7 +2846,9 @@ mod tests {
 
     fn readiness_for_test() -> ReadinessPolicy {
         ReadinessPolicy {
-            timeout: StdDuration::from_millis(100),
+            // Keep the fake transport retries load-insensitive when the full
+            // fault suite runs concurrently on a busy self-hosted runner.
+            timeout: StdDuration::from_secs(2),
             poll_interval: StdDuration::ZERO,
         }
     }

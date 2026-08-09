@@ -80,6 +80,9 @@ impl<'a> ProviderMutationAuthority<'a> {
     }
 
     fn validate_common(&self) -> Result<(), ProviderError> {
+        self._mutation.validate_filesystem_identity().map_err(|_| {
+            ProviderError::Authority("provider mutation state-root identity changed".to_owned())
+        })?;
         if self.provider_name.is_empty()
             || self.install_id != self._installation.record().install_id
             || self.cell_id != self._runtime.cell_id()

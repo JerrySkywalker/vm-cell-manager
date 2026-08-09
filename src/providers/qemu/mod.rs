@@ -1,8 +1,8 @@
 pub mod protocol;
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -159,8 +159,8 @@ impl QemuProvider<SystemQemuExecutor> {
         Self::new(
             SystemQemuExecutor,
             state_root.into().join("runtime"),
-            system_binary_name(),
-            OsString::from("qemu-img"),
+            resolve_executable(system_binary_name()),
+            resolve_executable(OsString::from("qemu-img")),
         )
     }
 
@@ -210,12 +210,13 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
         let text = std::str::from_utf8(&output.stdout).map_err(|_| {
             ProviderError::InvalidResponse("QEMU accelerator output was not UTF-8".to_owned())
         })?;
-        Ok(text
+        let compiled = text
             .lines()
             .map(str::trim)
             .filter(|line| matches!(*line, "whpx" | "kvm" | "hvf" | "tcg"))
             .map(str::to_owned)
-            .collect())
+            .collect::<Vec<_>>();
+        Ok(filter_usable_accelerators(compiled, kvm_device_usable()))
     }
 
     fn select_accelerator(&self, request: &CreateVmRequest) -> Result<String, ProviderError> {
@@ -262,12 +263,9 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             .join(id.to_string())
             .join("qemu")
             .join("vm.json");
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let config: QemuVmConfig = serde_json::from_slice(&bytes).map_err(|_| {
-                    ProviderError::InvalidResponse("QEMU configuration JSON is invalid".to_owned())
-                })?;
-                config.validate(&path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let config = read_config(&path)?;
                 let matches = match lookup {
                     VmLookup::Id(value) => {
                         Uuid::parse_str(value).ok() == Uuid::parse_str(&config.id).ok()
@@ -787,17 +785,26 @@ struct QemuImgInfo {
 fn create_ordinary_directory(path: &Path) -> Result<(), ProviderError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            Ok(())
+            ensure_private_qemu_directory(path)
         }
         Ok(_) => Err(ProviderError::Authority(
             "QEMU configuration path is not an ordinary directory".to_owned(),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| {
+            #[cfg(unix)]
+            let result = {
+                use std::os::unix::fs::DirBuilderExt;
+
+                fs::DirBuilder::new().mode(0o700).create(path)
+            };
+            #[cfg(not(unix))]
+            let result = fs::create_dir(path);
+            result.map_err(|error| {
                 ProviderError::Command(format!(
                     "failed to create QEMU configuration directory: {error}"
                 ))
-            })
+            })?;
+            ensure_private_qemu_directory(path)
         }
         Err(error) => Err(ProviderError::Command(format!(
             "failed to inspect QEMU configuration directory: {error}"
@@ -806,7 +813,15 @@ fn create_ordinary_directory(path: &Path) -> Result<(), ProviderError> {
 }
 
 fn read_config(path: &Path) -> Result<QemuVmConfig, ProviderError> {
-    let bytes = fs::read(path).map_err(|error| {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_qemu_file_options(&mut options, false);
+    let mut file = options.open(path).map_err(|error| {
+        ProviderError::Command(format!("failed to read QEMU configuration: {error}"))
+    })?;
+    ensure_private_qemu_file(path, &file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
         ProviderError::Command(format!("failed to read QEMU configuration: {error}"))
     })?;
     let config: QemuVmConfig = serde_json::from_slice(&bytes).map_err(|_| {
@@ -820,13 +835,13 @@ fn write_config_new(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderEr
     let bytes = serde_json::to_vec_pretty(config).map_err(|_| {
         ProviderError::InvalidResponse("QEMU configuration could not be encoded".to_owned())
     })?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            ProviderError::Command(format!("failed to create QEMU configuration: {error}"))
-        })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_qemu_file_options(&mut options, true);
+    let mut file = options.open(path).map_err(|error| {
+        ProviderError::Command(format!("failed to create QEMU configuration: {error}"))
+    })?;
+    ensure_private_qemu_file(path, &file)?;
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|error| {
@@ -1057,6 +1072,75 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn configure_qemu_file_options(options: &mut OpenOptions, create: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if create {
+            options.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (options, create);
+    }
+}
+
+#[cfg(unix)]
+fn ensure_private_qemu_directory(path: &Path) -> Result<(), ProviderError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        ProviderError::Authority("QEMU configuration directory identity is unavailable".to_owned())
+    })?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+    {
+        return Err(ProviderError::Authority(
+            "QEMU configuration directory is not private and ordinary".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_qemu_directory(_path: &Path) -> Result<(), ProviderError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_qemu_file(path: &Path, file: &File) -> Result<(), ProviderError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let open = file.metadata().map_err(|_| {
+        ProviderError::Authority("QEMU configuration file identity is unavailable".to_owned())
+    })?;
+    let current = fs::symlink_metadata(path).map_err(|_| {
+        ProviderError::Authority("QEMU configuration file path is unavailable".to_owned())
+    })?;
+    if open.uid() != unsafe { libc::geteuid() }
+        || open.mode() & 0o077 != 0
+        || !open.is_file()
+        || current.file_type().is_symlink()
+        || open.dev() != current.dev()
+        || open.ino() != current.ino()
+    {
+        return Err(ProviderError::Authority(
+            "QEMU configuration file is not private, ordinary, and identity-pinned".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_qemu_file(_path: &Path, _file: &File) -> Result<(), ProviderError> {
+    Ok(())
+}
+
 fn launch_digest(config: &QemuVmConfig) -> String {
     let args = launch_args(config);
     argument_digest(&args)
@@ -1101,6 +1185,60 @@ fn host_accelerator() -> &'static str {
         "macos" => "hvf",
         _ => "",
     }
+}
+
+fn filter_usable_accelerators(values: Vec<String>, kvm_usable: bool) -> Vec<String> {
+    values
+        .into_iter()
+        .filter(|value| value != "kvm" || kvm_usable)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn kvm_device_usable() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kvm_device_usable() -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn resolve_executable(name: OsString) -> OsString {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = PathBuf::from(&name);
+    let candidates = if path.components().count() > 1 {
+        vec![path]
+    } else {
+        std::env::var_os("PATH")
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .map(|directory| directory.join(&path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    candidates
+        .into_iter()
+        .filter_map(|candidate| candidate.canonicalize().ok())
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .map(PathBuf::into_os_string)
+        .unwrap_or(name)
+}
+
+#[cfg(not(unix))]
+fn resolve_executable(name: OsString) -> OsString {
+    name
 }
 
 #[cfg(unix)]
@@ -1440,9 +1578,22 @@ mod tests {
         );
         let probe = provider.probe();
         assert!(probe.available);
-        assert!(probe.capabilities.hardware_acceleration);
+        let hardware_expected = host_accelerator() != "kvm" || kvm_device_usable();
+        assert_eq!(probe.capabilities.hardware_acceleration, hardware_expected);
         assert!(probe.capabilities.accelerators.contains(&"tcg".to_owned()));
         assert_eq!(probe.capabilities.guest_transports, ["qga"]);
+    }
+
+    #[test]
+    fn compiled_kvm_is_not_selectable_without_a_usable_device() {
+        assert_eq!(
+            filter_usable_accelerators(vec!["kvm".to_owned(), "tcg".to_owned()], false),
+            vec!["tcg"]
+        );
+        assert_eq!(
+            filter_usable_accelerators(vec!["kvm".to_owned(), "tcg".to_owned()], true),
+            vec!["kvm", "tcg"]
+        );
     }
 
     #[test]
