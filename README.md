@@ -124,15 +124,16 @@ vmcell doctor [--json]
 vmcell provider list [--json]
 ```
 
-M1 and the stacked M2 branch expose:
+The stacked M1-M3 branches expose:
 
 ```text
 vmcell doctor
 vmcell provider list
-vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
+vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows --provider hyperv
+vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
 vmcell image list
 vmcell image inspect IMAGE
-vmcell create --image IMAGE --cpu-count 2 --memory-mib 4096 [--ttl-seconds N]
+vmcell create --image IMAGE --provider PROVIDER --cpu-count 2 --memory-mib 4096 [--accelerator POLICY] [--allow-tcg] [--ttl-seconds N]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -153,8 +154,9 @@ vmcell gc
 All commands support global `--json` and `--state-root PATH` options. Guest
 credentials are accepted only through bounded stdin and are never written to
 state. Guest actions require a current installation identity, a pinned runtime,
-and an exact-owned running Windows VM rechecked by GUID. QEMU mutation remains a
-later milestone.
+and an exact-owned running VM rechecked by its provider identity. Windows uses
+PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM, WHPX, and
+HVF acceptance remain separate host gates.
 
 ## Safety and ownership
 

@@ -236,6 +236,10 @@ impl QgaClient {
         };
         client
             .stream
+            .set_operation_deadline(client.deadline)
+            .map_err(|_| GuestIoError::Timeout)?;
+        client
+            .stream
             .write_all(&[0xff])
             .map_err(|_| GuestIoError::Transport)?;
         let sync_id = Uuid::new_v4().as_u128() as u64;
@@ -260,6 +264,9 @@ impl QgaClient {
         }
         bytes.push(b'\n');
         self.stream
+            .set_operation_deadline(self.deadline)
+            .map_err(|_| GuestIoError::Timeout)?;
+        self.stream
             .write_all(&bytes)
             .and_then(|_| self.stream.flush())
             .map_err(|_| GuestIoError::Transport)?;
@@ -282,6 +289,9 @@ impl QgaClient {
         let mut started = false;
         let mut skipped = 0_usize;
         loop {
+            self.stream
+                .set_operation_deadline(self.deadline)
+                .map_err(|_| GuestIoError::Timeout)?;
             if self
                 .stream
                 .read(&mut byte)
@@ -445,7 +455,7 @@ impl QgaClient {
     }
 }
 
-fn prove_qmp_snapshot<S: Read + Write>(
+fn prove_qmp_snapshot<S: ReadWrite>(
     qmp: &mut QmpClient<S>,
     expected: &ProviderVm,
 ) -> Result<(), GuestIoError> {
@@ -586,6 +596,19 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl ReadWrite for FakeQgaStream {
+        fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+            if Instant::now() >= deadline {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted QGA deadline expired",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 

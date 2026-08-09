@@ -56,6 +56,10 @@ security boundary.
   quarantined; it is never killed or adopted by name or pid.
 - A durable pre-spawn intent prevents an unavailable QMP endpoint from being
   misclassified as an off VM during the spawn/receipt crash window.
+- Configuration replacements sync both file content and Unix directory
+  metadata before the associated provider action begins.
+- QEMU option-bearing host paths reject comma and control-character ambiguity
+  before launch rather than relying on post-launch drift detection.
 - A QMP failure after spawn can require manual recovery, but cannot authorize a
   broad host process kill or base-image deletion.
 - QEMU/KVM, WHPX, and HVF real acceptance remain separate host gates. Missing

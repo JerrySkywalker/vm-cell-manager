@@ -44,6 +44,10 @@ CellId, QMP UUID, configuration, overlay/backing chain, and process instance
 remain proven. An ambiguous process or endpoint is preserved for manual
 recovery; it is never killed by pid, name, or socket alone.
 
+The admitted state/configuration and image paths must be ordinary and free of
+QEMU option-separator ambiguity. A stop is complete only after both the QMP
+endpoint and the exact persisted process instance are proven absent.
+
 The no-external-writer window is also the check-to-connect boundary for QGA:
 vmcell takes a fresh complete QMP snapshot before every guest action, but QEMU
 does not provide an atomic transaction spanning QMP proof and the separate QGA

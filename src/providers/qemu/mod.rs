@@ -104,11 +104,18 @@ impl QemuCommandExecutor for SystemQemuExecutor {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_detached_process(&mut command);
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| ProviderError::Command(format!("failed to start QEMU: {error}")))?;
         let process_id = child.id();
-        let process_start_token = process_start_token(process_id).unwrap_or(0);
+        let Some(process_start_token) = process_start_token(process_id).filter(|token| *token != 0)
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProviderError::Command(
+                "QEMU process start identity was unavailable".to_owned(),
+            ));
+        };
         drop(child);
         Ok(QemuSpawnReceipt {
             process_id,
@@ -607,12 +614,24 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let mut qmp = QmpClient::negotiate(stream, CONTROL_TIMEOUT)?;
         validate_qmp_identity(&mut qmp, &config)?;
         qmp.execute("quit", None)?;
+        let (process_id, process_start_token) = config
+            .process_id
+            .zip(config.process_start_token)
+            .ok_or_else(|| {
+            ProviderError::OwnershipChanged(
+                "QEMU stop requires a durable process receipt".to_owned(),
+            )
+        })?;
         let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         while std::time::Instant::now() < deadline {
-            if self
+            let endpoint_absent = self
                 .executor
                 .connect_qmp(&config.qmp, Duration::from_millis(25))
-                .is_err()
+                .is_err();
+            if endpoint_absent
+                && self
+                    .executor
+                    .process_absence_proven(process_id, process_start_token)
             {
                 config.process_id = None;
                 config.process_start_token = None;
@@ -712,6 +731,9 @@ impl QemuVmConfig {
             || self.cpu_count == 0
             || self.memory_mib == 0
             || !matches!(self.accelerator.as_str(), "whpx" | "kvm" | "hvf" | "tcg")
+            || !qemu_argument_path_is_safe(&self.configuration_path)
+            || !qemu_argument_path_is_safe(&self.overlay_path)
+            || !qemu_argument_path_is_safe(&self.parent_path)
             || self.command_sha256 != launch_digest(self)
             || self.process_id.is_some() != self.process_start_token.is_some()
         {
@@ -799,7 +821,12 @@ fn write_config_new(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderEr
         .and_then(|_| file.sync_all())
         .map_err(|error| {
             ProviderError::Command(format!("failed to persist QEMU configuration: {error}"))
-        })
+        })?;
+    sync_parent_directory(path).map_err(|error| {
+        ProviderError::Command(format!(
+            "failed to persist QEMU configuration directory: {error}"
+        ))
+    })
 }
 
 fn replace_config(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderError> {
@@ -813,7 +840,8 @@ fn replace_config(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderErro
 
 #[cfg(not(target_os = "windows"))]
 fn replace_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
+    fs::rename(source, destination)?;
+    sync_parent_directory(destination)
 }
 
 #[cfg(target_os = "windows")]
@@ -901,7 +929,7 @@ fn provider_path_equal(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn validate_qmp_identity<S: std::io::Read + std::io::Write>(
+fn validate_qmp_identity<S: protocol::ReadWrite>(
     qmp: &mut QmpClient<S>,
     config: &QemuVmConfig,
 ) -> Result<(), ProviderError> {
@@ -986,6 +1014,30 @@ fn launch_args(config: &QemuVmConfig) -> Vec<OsString> {
         "-device".into(),
         "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0".into(),
     ]
+}
+
+fn qemu_argument_path_is_safe(path: &Path) -> bool {
+    path.to_str().is_some_and(|value| {
+        !value
+            .chars()
+            .any(|character| matches!(character, ',' | '\n' | '\r' | '\0'))
+    })
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "QEMU configuration has no parent directory",
+        )
+    })?)?
+    .sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn launch_digest(config: &QemuVmConfig) -> String {
@@ -1127,7 +1179,15 @@ fn process_matches(
 
 #[cfg(target_os = "linux")]
 fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
-    process_start_token(process_id) != Some(start_token)
+    if start_token == 0 {
+        return false;
+    }
+    let process_root = PathBuf::from(format!("/proc/{process_id}"));
+    match fs::symlink_metadata(&process_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(_) => process_start_token(process_id).is_some_and(|actual| actual != start_token),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1180,10 +1240,13 @@ fn process_matches(
 }
 
 #[cfg(target_os = "windows")]
-fn process_absence_proven(process_id: u32, _start_token: u64) -> bool {
+fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 
+    if start_token == 0 {
+        return false;
+    }
     unsafe {
         let handle = OpenProcess(0x0010_0000, 0, process_id);
         if handle.is_null() {
@@ -1214,6 +1277,7 @@ fn process_absence_proven(_process_id: u32, _start_token: u64) -> bool {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     use super::*;
 
@@ -1240,6 +1304,19 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl protocol::ReadWrite for FakeQmpStream {
+        fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+            if Instant::now() >= deadline {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted QMP deadline expired",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1306,6 +1383,10 @@ mod tests {
             false
         }
         fn process_absence_proven(&self, _process_id: u32, _start_token: u64) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("process_absence_proven".to_owned());
             true
         }
         fn connect_qmp(
@@ -1474,6 +1555,15 @@ mod tests {
             .unwrap()
             .push_back(qmp_stop_session(&running));
         provider.stop_vm(&authority, &running).unwrap();
+        assert!(
+            provider
+                .executor
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "process_absence_proven")
+        );
         let stopped = provider
             .inspect_vm(&VmLookup::Id(running.id.clone()))
             .unwrap()
@@ -1626,6 +1716,11 @@ mod tests {
         config.command_sha256 = launch_digest(&config);
         let path = configuration_path.join("vm.json");
         assert!(config.validate(&path).is_ok());
+        config.overlay_path = directory.path().join("foreign,format=raw.qcow2");
+        config.command_sha256 = launch_digest(&config);
+        assert!(config.validate(&path).is_err());
+        config.overlay_path = directory.path().join("cell.qcow2");
+        config.command_sha256 = launch_digest(&config);
         config.qmp = ControlEndpoint::WindowsPipe("foreign".to_owned());
         assert!(config.validate(&path).is_err());
         config.qmp = ControlEndpoint::qmp(&configuration_path, &id);
@@ -1649,5 +1744,15 @@ mod tests {
             provider.inspect_config(&config),
             Err(ProviderError::OwnershipChanged(_))
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn process_absence_rejects_unknown_and_live_instance_receipts() {
+        let process_id = std::process::id();
+        let start_token = process_start_token(process_id).unwrap();
+        assert_ne!(start_token, 0);
+        assert!(!process_absence_proven(process_id, 0));
+        assert!(!process_absence_proven(process_id, start_token));
     }
 }

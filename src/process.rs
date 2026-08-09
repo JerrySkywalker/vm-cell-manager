@@ -72,31 +72,53 @@ pub(crate) fn run_bounded(
     });
 
     let deadline = Instant::now() + timeout;
-    let mut stdout_done = false;
-    let mut stderr_done = false;
-    let status = loop {
+    let mut stdin_result = None;
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let mut status = None;
+    let mut descendants_terminated = false;
+    loop {
         while let Ok((kind, result)) = rx.try_recv() {
-            match (kind, result) {
-                (1, Ok(_)) => stdout_done = true,
-                (2, Ok(_)) => stderr_done = true,
-                (_, Err(error)) => {
-                    tree.terminate();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
-                _ => {}
+            match kind {
+                0 => stdin_result = Some(result),
+                1 => stdout_result = Some(result),
+                2 => stderr_result = Some(result),
+                _ => return Err(ProcessError::Io),
             }
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(_) => {
+        for result in [&stdin_result, &stdout_result, &stderr_result]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = result {
                 tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(ProcessError::Io);
+                return Err(clone_error(error));
             }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(None) => {}
+                Err(_) => {
+                    tree.terminate();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProcessError::Io);
+                }
+            }
+        }
+        let all_io_complete =
+            stdin_result.is_some() && stdout_result.is_some() && stderr_result.is_some();
+        if status.is_some() && all_io_complete {
+            break;
+        }
+        if status.is_some() && !all_io_complete && !descendants_terminated {
+            // A descendant can inherit a pipe after the direct child exits.
+            // Terminate the owned process tree before waiting for pipe EOF.
+            tree.terminate();
+            descendants_terminated = true;
         }
         if Instant::now() >= deadline {
             tree.terminate();
@@ -105,13 +127,14 @@ pub(crate) fn run_bounded(
             return Err(ProcessError::Timeout);
         }
         thread::sleep(Duration::from_millis(10));
-    };
-    if !stdout_done || !stderr_done {
-        // The process has exited; pipe readers now have a finite EOF.
     }
-    stdin_writer.join().map_err(|_| ProcessError::Io)??;
-    let stdout = stdout_reader.join().map_err(|_| ProcessError::Io)??;
-    let stderr = stderr_reader.join().map_err(|_| ProcessError::Io)??;
+    drop(stdin_writer);
+    drop(stdout_reader);
+    drop(stderr_reader);
+    let status = status.ok_or(ProcessError::Io)?;
+    stdin_result.ok_or(ProcessError::Io)??;
+    let stdout = stdout_result.ok_or(ProcessError::Io)??;
+    let stderr = stderr_result.ok_or(ProcessError::Io)??;
     tree.disarm();
     Ok(BoundedOutput {
         status,
@@ -266,6 +289,37 @@ mod tests {
             run_bounded(&mut command, &[], Duration::from_millis(250), 1024),
             Err(ProcessError::Timeout)
         ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // The parent intentionally exits while its owned grandchild holds the test pipes.
+    fn inherited_descendant_pipes_are_closed_with_the_owned_tree() {
+        if std::env::var_os("VMCELL_PIPE_GRANDCHILD").is_some() {
+            thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        if std::env::var_os("VMCELL_PIPE_CHILD").is_some() {
+            thread::sleep(Duration::from_millis(100));
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("process::tests::inherited_descendant_pipes_are_closed_with_the_owned_tree")
+                .arg("--nocapture")
+                .env_remove("VMCELL_PIPE_CHILD")
+                .env("VMCELL_PIPE_GRANDCHILD", "1")
+                .spawn()
+                .unwrap();
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("process::tests::inherited_descendant_pipes_are_closed_with_the_owned_tree")
+            .arg("--nocapture")
+            .env("VMCELL_PIPE_CHILD", "1");
+        let started = Instant::now();
+        let output = run_bounded(&mut command, &[], Duration::from_secs(2), 64 * 1024).unwrap();
+        assert!(output.status.success());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

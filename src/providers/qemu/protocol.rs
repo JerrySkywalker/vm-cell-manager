@@ -54,8 +54,15 @@ impl ControlEndpoint {
     }
 }
 
-pub trait ReadWrite: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWrite for T {}
+pub trait ReadWrite: Read + Write + Send {
+    fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()>;
+}
+
+impl ReadWrite for Box<dyn ReadWrite> {
+    fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+        (**self).set_operation_deadline(deadline)
+    }
+}
 
 pub(crate) fn connect_endpoint(
     endpoint: &ControlEndpoint,
@@ -84,10 +91,7 @@ pub(crate) fn connect_endpoint(
 
 #[cfg(unix)]
 fn connect_unix(path: &Path, timeout: Duration) -> std::io::Result<Box<dyn ReadWrite>> {
-    let stream = std::os::unix::net::UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    Ok(Box::new(stream))
+    UnixControlStream::connect(path, timeout).map(|stream| Box::new(stream) as Box<dyn ReadWrite>)
 }
 
 #[cfg(not(unix))]
@@ -115,6 +119,46 @@ fn connect_windows_pipe(_path: &str, _timeout: Duration) -> std::io::Result<Box<
 struct WindowsPipeStream {
     handle: windows_sys::Win32::Foundation::HANDLE,
     timeout_ms: u32,
+}
+
+#[cfg(unix)]
+struct UnixControlStream(std::os::unix::net::UnixStream);
+
+#[cfg(unix)]
+impl UnixControlStream {
+    fn connect(path: &Path, timeout: Duration) -> std::io::Result<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        Ok(Self(stream))
+    }
+}
+
+#[cfg(unix)]
+impl Read for UnixControlStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(bytes)
+    }
+}
+
+#[cfg(unix)]
+impl Write for UnixControlStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[cfg(unix)]
+impl ReadWrite for UnixControlStream {
+    fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+        let remaining = remaining_duration(deadline)?;
+        self.0.set_read_timeout(Some(remaining))?;
+        self.0.set_write_timeout(Some(remaining))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -156,21 +200,21 @@ impl WindowsPipeStream {
     }
 
     fn transfer(&self, bytes: &mut [u8], write: bool) -> std::io::Result<usize> {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GetLastError};
-        use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-        use windows_sys::Win32::System::IO::{
-            CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GetLastError,
         };
+        use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+        use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResultEx, OVERLAPPED};
         use windows_sys::Win32::System::Threading::CreateEventW;
 
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if event.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        let mut overlapped = OVERLAPPED {
+        let mut overlapped = Box::new(OVERLAPPED {
             hEvent: event,
             ..OVERLAPPED::default()
-        };
+        });
         let mut transferred = 0_u32;
         let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
         let started = unsafe {
@@ -180,7 +224,7 @@ impl WindowsPipeStream {
                     bytes.as_ptr(),
                     length,
                     &mut transferred,
-                    &mut overlapped,
+                    overlapped.as_mut(),
                 )
             } else {
                 ReadFile(
@@ -188,7 +232,7 @@ impl WindowsPipeStream {
                     bytes.as_mut_ptr(),
                     length,
                     &mut transferred,
-                    &mut overlapped,
+                    overlapped.as_mut(),
                 )
             }
         };
@@ -199,7 +243,7 @@ impl WindowsPipeStream {
         } else if unsafe {
             GetOverlappedResultEx(
                 self.handle,
-                &overlapped,
+                overlapped.as_ref(),
                 &mut transferred,
                 self.timeout_ms,
                 0,
@@ -208,14 +252,27 @@ impl WindowsPipeStream {
         {
             Ok(transferred as usize)
         } else {
+            let operation_error = std::io::Error::last_os_error();
             unsafe {
-                CancelIoEx(self.handle, &overlapped);
-                GetOverlappedResult(self.handle, &overlapped, &mut transferred, 1);
+                CancelIoEx(self.handle, overlapped.as_ref());
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "QEMU named-pipe operation timed out",
-            ))
+            let cancellation_result = unsafe {
+                GetOverlappedResultEx(self.handle, overlapped.as_ref(), &mut transferred, 100, 0)
+            };
+            let cancellation_settled =
+                cancellation_result != 0 || unsafe { GetLastError() } == ERROR_OPERATION_ABORTED;
+            if !cancellation_settled {
+                // The kernel may still reference OVERLAPPED after a failed
+                // cancellation. Leak this tiny timeout-only allocation/event
+                // instead of blocking or returning a dangling stack pointer;
+                // dropping the stream closes the pipe handle.
+                let _ = Box::into_raw(overlapped);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "QEMU named-pipe cancellation did not settle",
+                ));
+            }
+            Err(operation_error)
         };
         unsafe { CloseHandle(event) };
         result
@@ -242,6 +299,14 @@ impl Write for WindowsPipeStream {
 }
 
 #[cfg(target_os = "windows")]
+impl ReadWrite for WindowsPipeStream {
+    fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+        self.timeout_ms = duration_millis(remaining_duration(deadline)?);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl Drop for WindowsPipeStream {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
@@ -253,16 +318,28 @@ fn duration_millis(timeout: Duration) -> u32 {
     timeout.as_millis().clamp(1, u128::from(u32::MAX)) as u32
 }
 
+fn remaining_duration(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "QEMU protocol operation exceeded its deadline",
+            )
+        })
+}
+
 pub(crate) struct JsonLineProtocol<S> {
     stream: S,
 }
 
-impl<S: Read + Write> JsonLineProtocol<S> {
+impl<S: ReadWrite> JsonLineProtocol<S> {
     pub(crate) fn new(stream: S) -> Self {
         Self { stream }
     }
 
-    pub(crate) fn send(&mut self, value: &Value) -> Result<(), ProviderError> {
+    pub(crate) fn send(&mut self, value: &Value, deadline: Instant) -> Result<(), ProviderError> {
         let mut bytes = serde_json::to_vec(value)
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
         if bytes.len() > PROTOCOL_MESSAGE_LIMIT {
@@ -272,15 +349,21 @@ impl<S: Read + Write> JsonLineProtocol<S> {
         }
         bytes.push(b'\n');
         self.stream
-            .write_all(&bytes)
+            .set_operation_deadline(deadline)
+            .and_then(|_| self.stream.write_all(&bytes))
             .and_then(|_| self.stream.flush())
             .map_err(|error| ProviderError::Command(format!("QEMU protocol write failed: {error}")))
     }
 
-    pub(crate) fn receive(&mut self) -> Result<Value, ProviderError> {
+    pub(crate) fn receive(&mut self, deadline: Instant) -> Result<Value, ProviderError> {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         loop {
+            self.stream
+                .set_operation_deadline(deadline)
+                .map_err(|error| {
+                    ProviderError::Command(format!("QEMU protocol read failed: {error}"))
+                })?;
             let read = self.stream.read(&mut byte).map_err(|error| {
                 ProviderError::Command(format!("QEMU protocol read failed: {error}"))
             })?;
@@ -312,14 +395,14 @@ pub(crate) struct QmpClient<S> {
     deadline: Instant,
 }
 
-impl<S: Read + Write> QmpClient<S> {
+impl<S: ReadWrite> QmpClient<S> {
     pub(crate) fn negotiate(stream: S, timeout: Duration) -> Result<Self, ProviderError> {
         let mut client = Self {
             protocol: JsonLineProtocol::new(stream),
             next_id: 1,
             deadline: Instant::now() + timeout,
         };
-        let greeting = client.protocol.receive()?;
+        let greeting = client.protocol.receive(client.deadline)?;
         if greeting.get("QMP").is_none() {
             return Err(ProviderError::InvalidResponse(
                 "QMP greeting was missing".to_owned(),
@@ -345,7 +428,7 @@ impl<S: Read + Write> QmpClient<S> {
         if let Some(arguments) = arguments {
             request["arguments"] = arguments;
         }
-        self.protocol.send(&request)?;
+        self.protocol.send(&request, self.deadline)?;
         let mut event_count = 0_u16;
         loop {
             if Instant::now() >= self.deadline {
@@ -353,7 +436,7 @@ impl<S: Read + Write> QmpClient<S> {
                     "QMP operation exceeded its deadline".to_owned(),
                 ));
             }
-            let response = self.protocol.receive()?;
+            let response = self.protocol.receive(self.deadline)?;
             if response.get("event").is_some() {
                 event_count += 1;
                 if event_count > 64 {
@@ -412,6 +495,44 @@ mod tests {
         }
     }
 
+    impl ReadWrite for ScriptedStream {
+        fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+            remaining_duration(deadline).map(|_| ())
+        }
+    }
+
+    struct DripStream {
+        reads: VecDeque<u8>,
+        delay: Duration,
+    }
+
+    impl Read for DripStream {
+        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let Some(byte) = self.reads.pop_front() else {
+                return Ok(0);
+            };
+            target[0] = byte;
+            Ok(1)
+        }
+    }
+
+    impl Write for DripStream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ReadWrite for DripStream {
+        fn set_operation_deadline(&mut self, deadline: Instant) -> std::io::Result<()> {
+            remaining_duration(deadline).map(|_| ())
+        }
+    }
+
     #[test]
     fn qmp_negotiation_correlates_ids_and_ignores_events() {
         let input = concat!(
@@ -438,7 +559,7 @@ mod tests {
             writes: Vec::new(),
         };
         assert!(matches!(
-            JsonLineProtocol::new(stream).receive(),
+            JsonLineProtocol::new(stream).receive(Instant::now() + Duration::from_secs(1)),
             Err(ProviderError::InvalidResponse(_))
         ));
     }
@@ -490,6 +611,17 @@ mod tests {
         };
         assert!(matches!(
             QmpClient::negotiate(expired, Duration::ZERO),
+            Err(ProviderError::Command(_))
+        ));
+
+        let drip = DripStream {
+            reads: concat!("{\"QMP\":{}}\n", "{\"return\":{},\"id\":1}\n")
+                .bytes()
+                .collect(),
+            delay: Duration::from_millis(2),
+        };
+        assert!(matches!(
+            QmpClient::negotiate(drip, Duration::from_millis(5)),
             Err(ProviderError::Command(_))
         ));
     }
