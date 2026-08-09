@@ -2,7 +2,12 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha / stacked M2 review candidate. M1 implements an ownership-checked Hyper-V lifecycle. M2 adds repository-local PowerShell Direct guest-control, artifact, TTL, and explicit-GC contracts. Real Hyper-V and guest acceptance remain separately gated and are not run by core CI.
+> **Status:** pre-alpha. The repository-local M1-M4 foundations are merged to
+> `main`: ownership-checked Hyper-V and QEMU lifecycles, PowerShell Direct and
+> QGA guest contracts, artifacts/TTL/GC, and Unix portability. Real Hyper-V,
+> guest, QEMU, KVM, WHPX, and HVF acceptance remains separately gated and is
+> not run by core CI. M5 automation hardening is active as sequential short
+> PRs against green `main`.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -124,7 +129,7 @@ vmcell doctor [--json]
 vmcell provider list [--json]
 ```
 
-The stacked M1-M3 branches expose:
+Current `main` exposes:
 
 ```text
 vmcell doctor
@@ -263,11 +268,11 @@ See [`docs/architecture.md`](docs/architecture.md) for the design contract and [
 The first milestones are intentionally incremental:
 
 - **M0 — Architecture bootstrap:** complete; read-only provider discovery, domain model, documentation, and local-first self-hosted Windows CI.
-- **M1 — Hyper-V cell foundation:** implementation review candidate; image registration, single-level differencing disk, create/start/inspect/stop/destroy, and ownership reconciliation are implemented, with real-provider acceptance still gated.
-- **M2 — Windows guest control:** stacked implementation candidate; PowerShell Direct exec and file transfer, TTL cleanup, and artifact collection are mock/static validated, while real guest acceptance remains gated.
-- **M3 — QEMU provider:** QMP lifecycle, QCOW2 overlay, QGA transport, WHPX reference validation on Windows.
-- **M4 — Linux/macOS portability:** KVM and HVF acceptance, packaging and path/state semantics.
-- **M5 — automation hardening:** stable JSON schemas, exit-code contract, recovery and crash consistency.
+- **M1 — Hyper-V cell foundation:** repository-local implementation is merged; real Hyper-V acceptance remains gated.
+- **M2 — Windows guest control:** repository-local implementation is merged; real PowerShell Direct guest acceptance remains gated.
+- **M3 — QEMU provider:** repository-local QMP lifecycle, QCOW2 overlay, and QGA contracts are merged; real QEMU/WHPX/KVM/HVF acceptance remains gated.
+- **M4 — Linux portability foundation:** Unix state/path/process and KVM capability foundations are merged; native Linux/KVM and macOS/HVF acceptance remains gated.
+- **M5 — automation hardening:** active as sequential short PRs covering stable JSON, deterministic failures, reconciliation, concurrency, retention, and automation CLI contracts.
 
 Provider-specific capabilities such as TPM, Secure Boot, nested virtualization, GPU/device support, or additional native providers come only after the core lifecycle is stable.
 
