@@ -37,7 +37,9 @@ vmcell gc
 ```
 
 `--state-root PATH` and `--lock-timeout-ms N` are global. The lock timeout is
-bounded to 30 seconds, defaults to fail-fast, and never authorizes lock stealing.
+bounded to 30 seconds per state-lock acquisition, defaults to fail-fast, and
+never authorizes lock stealing. Commands that dispatch serially to multiple
+provider engines may consume one bounded interval per acquisition.
 Changing the state root does not authorize adoption of provider objects.
 
 PowerShell Direct guest commands require an exact-owned, running Windows cell.
@@ -125,11 +127,14 @@ manifest; it does not contact the guest. One collection is capped at 16 files,
 
 `artifact prune` is the only M5 retention mutation. It selects completed
 artifacts at one age cutoff, processes at most 256 records, and supports
-`--dry-run`. The engine saves the additive `artifact_pruned_at` tombstone on the
-completed operation before removing the exact CellId/operation artifact subtree. A crash after that
-save is resumed by a later prune; guest work is never replayed. Missing or
-integrity-drifted committed artifacts fail closed. There is no background
-retention daemon.
+`--dry-run`. Dry run does not alter operation or artifact records, although it
+may initialize lock infrastructure when the state root is new. The engine saves
+the additive `artifact_pruned_at` tombstone on the completed operation before
+removing the exact CellId/operation artifact subtree. A crash after that save is
+resumed by a later prune, including from a partially removed exact subtree;
+guest work is never replayed. Missing or integrity-drifted committed artifacts
+fail closed before the tombstone is written. There is no background retention
+daemon.
 
 `vmcell gc` is an explicit foreground operation. It evaluates durable TTLs at
 one timestamp, skips cells with nonterminal guest operations, and delegates

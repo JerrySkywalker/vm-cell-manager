@@ -158,7 +158,9 @@ vmcell gc
 ```
 
 All commands support global `--json`, `--state-root PATH`, and bounded
-`--lock-timeout-ms N` options. Guest
+`--lock-timeout-ms N` options. The timeout applies to each state-lock
+acquisition; artifact dry runs leave records untouched but may initialize lock
+infrastructure on a new state root. Guest
 credentials are accepted only through bounded stdin and are never written to
 state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses

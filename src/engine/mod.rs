@@ -963,15 +963,15 @@ impl<P: LocalVmProvider> CellEngine<P> {
             let artifact_exists = self
                 .state
                 .artifact_root_exists(operation.cell_id, operation.id)?;
-            let bytes = if artifact_exists {
+            let bytes = if is_recovery {
+                0
+            } else if artifact_exists {
                 self.state
                     .load_artifact(operation.cell_id, operation.id)?
                     .entries
                     .iter()
                     .try_fold(0_u64, |total, entry| total.checked_add(entry.size))
                     .ok_or_else(|| EngineError::Integrity("artifact size overflow".to_owned()))?
-            } else if is_recovery {
-                0
             } else {
                 return Err(EngineError::Integrity(
                     "completed artifact operation is missing its artifact root".to_owned(),
@@ -983,7 +983,6 @@ impl<P: LocalVmProvider> CellEngine<P> {
             } else {
                 if !is_recovery {
                     operation.updated_at = evaluated_at;
-                    operation.completed_at = Some(evaluated_at);
                     operation.artifact_pruned_at = Some(evaluated_at);
                     self.state.save_guest_operation(&operation)?;
                 }

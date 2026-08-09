@@ -245,29 +245,17 @@ impl StateStore {
         }
 
         let lock_path = lock_dir.join("mutation.lock");
-        let mut lock_options = OpenOptions::new();
-        lock_options
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false);
-        configure_private_created_file(&mut lock_options);
-        let file = match lock_options.open(&lock_path) {
+        let file = match open_mutation_lock_file(&lock_path) {
             Ok(file) => file,
-            Err(source) => {
+            Err(error) => {
                 release_process_mutation_root(&process_key);
-                return Err(io_error(&lock_path, source));
+                return Err(error);
             }
         };
 
-        if let Err(error) = ensure_private_open_file(&lock_path, &file) {
-            release_process_mutation_root(&process_key);
-            return Err(error);
-        }
-
         if let Err(source) = file.try_lock_exclusive() {
             release_process_mutation_root(&process_key);
-            if source.kind() == std::io::ErrorKind::WouldBlock {
+            if is_lock_contention(&source) {
                 return Err(StateError::MutationBusy);
             } else {
                 return Err(io_error(&lock_path, source));
@@ -569,6 +557,8 @@ impl StateStore {
             return Err(StateError::UnsafeRuntimePath(operation_root));
         }
 
+        #[cfg(test)]
+        abort_at_test_checkpoint("before_artifact_remove");
         drop(operation_handle);
         fs::remove_dir_all(&physical_operation_root)
             .map_err(|source| io_error(&physical_operation_root, source))?;
@@ -808,6 +798,21 @@ fn process_mutation_roots() -> &'static Mutex<std::collections::HashSet<PathBuf>
 fn release_process_mutation_root(root: &Path) {
     if let Ok(mut roots) = process_mutation_roots().lock() {
         roots.remove(root);
+    }
+}
+
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        error.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -1146,6 +1151,34 @@ fn configure_private_created_file(options: &mut OpenOptions) {
     let _ = options;
 }
 
+fn open_mutation_lock_file(path: &Path) -> Result<File, StateError> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    configure_private_created_file(&mut options);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.is_file()
+        || file_metadata_is_reparse(&file).map_err(|source| io_error(path, source))?
+    {
+        return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
+    }
+    ensure_private_open_file(path, &file)?;
+    validate_open_path_identity(path, &file)?;
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn ensure_private_directory(path: &Path) -> Result<(), StateError> {
     use std::os::unix::fs::MetadataExt;
@@ -1306,6 +1339,13 @@ fn validate_guest_operation_schema(
                 && record
                     .artifact_id
                     .is_none_or(|artifact_id| artifact_id == record.id)
+                && record.artifact_id.is_none_or(|_| {
+                    matches!(
+                        record.kind,
+                        crate::core::guest::GuestOperationKind::CopyOut
+                            | crate::core::guest::GuestOperationKind::ArtifactCollect
+                    )
+                })
                 && record.artifact_pruned_at.is_none_or(|_| {
                     record.artifact_id == Some(record.id)
                         && matches!(
@@ -1332,12 +1372,20 @@ fn validate_guest_operation_schema(
     };
     if !fields_are_valid
         || record.updated_at < record.created_at
-        || record.completed_at.is_some_and(|completed_at| {
-            completed_at < record.created_at || completed_at != record.updated_at
-        })
         || record
-            .artifact_pruned_at
-            .is_some_and(|pruned_at| Some(pruned_at) != record.completed_at)
+            .completed_at
+            .is_some_and(|completed_at| completed_at < record.created_at)
+        || match record.artifact_pruned_at {
+            Some(pruned_at) => {
+                record
+                    .completed_at
+                    .is_none_or(|completed_at| completed_at > pruned_at)
+                    || pruned_at != record.updated_at
+            }
+            None => record
+                .completed_at
+                .is_some_and(|completed_at| completed_at != record.updated_at),
+        }
     {
         return Err(StateError::GuestOperationIntegrity {
             path: path.to_path_buf(),
@@ -1985,6 +2033,108 @@ mod tests {
     }
 
     #[test]
+    fn artifact_prune_tombstone_survives_abort_before_exact_removal() {
+        if std::env::var_os("VMCELL_TEST_ARTIFACT_PRUNE_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let cell_id =
+                CellId::from_str(std::env::var("VMCELL_TEST_CELL_ID").unwrap().as_str()).unwrap();
+            let operation_id = GuestOperationId::from_str(
+                std::env::var("VMCELL_TEST_OPERATION_ID").unwrap().as_str(),
+            )
+            .unwrap();
+            let store = StateStore::new(root);
+            let mutation = store.acquire_mutation_lock().unwrap();
+            let mut operation = store.load_guest_operation(operation_id).unwrap();
+            let now = Utc::now();
+            operation.updated_at = now;
+            operation.artifact_pruned_at = Some(now);
+            store.save_guest_operation(&operation).unwrap();
+            store
+                .remove_artifact_root(&mutation, cell_id, operation_id)
+                .unwrap();
+            std::process::exit(77);
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let cell_id = CellId::new();
+        let operation_id = GuestOperationId::new();
+        drop(store.acquire_mutation_lock().unwrap());
+        let guard = store.prepare_artifact_root(cell_id, operation_id).unwrap();
+        let relative = store
+            .write_artifact_file(&guard, 0, b"prune-crash")
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_artifact_new(
+                &guard,
+                &ArtifactRecord {
+                    schema_version: ARTIFACT_SCHEMA_VERSION,
+                    id: operation_id,
+                    cell_id,
+                    created_at: now,
+                    entries: vec![ArtifactEntry {
+                        guest_path: "results/prune-crash.bin".to_owned(),
+                        host_relative_path: relative,
+                        sha256: format!("{:x}", Sha256::digest(b"prune-crash")),
+                        size: 11,
+                    }],
+                },
+            )
+            .unwrap();
+        let mut operation =
+            GuestOperationRecord::intent(cell_id, GuestOperationKind::ArtifactCollect, now);
+        operation.id = operation_id;
+        operation.phase = GuestOperationPhase::Completed;
+        operation.updated_at = now;
+        operation.completed_at = Some(now);
+        operation.artifact_id = Some(operation_id);
+        store.save_guest_operation(&operation).unwrap();
+        drop(guard);
+
+        let output = subprocess_for(
+            "state::tests::artifact_prune_tombstone_survives_abort_before_exact_removal",
+        )
+        .env("VMCELL_TEST_ARTIFACT_PRUNE_CHILD", "1")
+        .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+        .env("VMCELL_TEST_ABORT_AT", "before_artifact_remove")
+        .env("VMCELL_TEST_STATE_ROOT", store.root())
+        .env("VMCELL_TEST_CELL_ID", cell_id.to_string())
+        .env("VMCELL_TEST_OPERATION_ID", operation_id.to_string())
+        .output()
+        .unwrap();
+        assert!(!output.status.success());
+        assert_ne!(output.status.code(), Some(77));
+        assert!(
+            store
+                .load_guest_operation(operation_id)
+                .unwrap()
+                .artifact_pruned_at
+                .is_some()
+        );
+        assert!(store.artifact_root_exists(cell_id, operation_id).unwrap());
+
+        // Simulate a process dying after recursive removal has deleted only part
+        // of the tombstoned, operation-owned artifact subtree. Recovery must not
+        // require the now-incomplete artifact manifest to validate again.
+        fs::remove_file(
+            store
+                .artifact_root(cell_id, operation_id)
+                .join("files")
+                .join("0000.bin"),
+        )
+        .unwrap();
+
+        let mutation = store.acquire_mutation_lock().unwrap();
+        assert!(
+            store
+                .remove_artifact_root(&mutation, cell_id, operation_id)
+                .unwrap()
+        );
+        assert!(!store.artifact_root_exists(cell_id, operation_id).unwrap());
+    }
+
+    #[test]
     fn guest_operation_unknown_and_artifact_boundaries_survive_process_abort() {
         if std::env::var_os("VMCELL_TEST_GUEST_OPERATION_CRASH_CHILD").is_some() {
             let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
@@ -2166,6 +2316,27 @@ mod tests {
         releaser.join().unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn mutation_lock_leaf_reparse_is_rejected_without_touching_target() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        drop(store.acquire_mutation_lock().unwrap());
+        let lock_path = store.root().join("locks").join("mutation.lock");
+        fs::remove_file(&lock_path).unwrap();
+        let external = directory.path().join("external-lock-target");
+        fs::write(&external, b"external-sentinel").unwrap();
+        if create_file_link(&external, &lock_path).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            store.acquire_mutation_lock(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(fs::read(&external).unwrap(), b"external-sentinel");
+    }
+
     #[test]
     fn manifest_phase_transitions_survive_real_process_abort_at_atomic_boundaries() {
         if std::env::var_os("VMCELL_TEST_ATOMIC_CRASH_CHILD").is_some() {
@@ -2248,6 +2419,17 @@ mod tests {
             let store = StateStore::new(root);
             match mode.to_string_lossy().as_ref() {
                 "busy" => assert!(store.acquire_mutation_lock().is_err()),
+                "wait_busy" => {
+                    let start = Instant::now();
+                    assert!(matches!(
+                        store
+                            .with_mutation_lock_timeout(Duration::from_millis(100))
+                            .acquire_mutation_lock(),
+                        Err(StateError::MutationBusy)
+                    ));
+                    assert!(start.elapsed() >= Duration::from_millis(75));
+                    assert!(start.elapsed() < Duration::from_secs(2));
+                }
                 "available" => drop(store.acquire_mutation_lock().unwrap()),
                 "rename" => {
                     let moved = store.root().join("cells-moved-by-child");
@@ -2261,7 +2443,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = StateStore::new(directory.path().join("state"));
         let guard = store.acquire_mutation_lock().unwrap();
-        for mode in ["busy", "rename"] {
+        for mode in ["busy", "wait_busy", "rename"] {
             let output = subprocess_for(
                 "state::tests::mutation_guard_blocks_cross_process_duplicate_root_and_directory_replacement",
             )

@@ -8,12 +8,16 @@
 State mutation remains serialized by one process-local plus filesystem lock per
 canonical state root. The default is fail-fast. Automation may request a
 bounded wait with global `--lock-timeout-ms`; the value is capped at 30 seconds
-and never steals, replaces, or infers staleness of another process's lock.
+per state-lock acquisition and never steals, replaces, or infers staleness of
+another process's lock. A command that dispatches serially to multiple provider
+engines may therefore consume one bounded interval per acquisition.
 Exhausting the wait returns the stable retryable `vmcell.state.contention`
 classification.
 
 Artifact retention is explicit and foreground-only. `artifact prune` selects
-completed artifacts at or before one cutoff, supports a nonmutating dry run,
+completed artifacts at or before one cutoff, supports a dry run that does not
+change operation or artifact records (but may initialize the state lock
+infrastructure on a new root),
 and processes at most 256 records per invocation. No daemon or implicit
 age-based cleanup is introduced. A collection remains bounded to 16 files,
 64 MiB per file, and 1 GiB total; the same limits are revalidated when a
