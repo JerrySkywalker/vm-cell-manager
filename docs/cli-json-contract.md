@@ -53,6 +53,14 @@ workspace. Windows QGA is not advertised by M3.
 
 Single-object responses contain `schema_version: 1`. List responses use:
 
+`doctor --json` additionally reports `contract: "vmcell.doctor.v1"`, overall
+`status` (`ready` or `unavailable`), and typed provider probe status (`ready`,
+`unsupported_host`, `unavailable`, or `probe_failed`). Each capability object
+carries its own `schema_version`. Provider `detail` is diagnostic prose and
+must not be parsed. `provider list --json` uses the same typed provider objects.
+`ready` means the bounded provider/capability probe completed; callers must
+still inspect the requested accelerator, guest, and transport capabilities.
+
 ```json
 {
   "schema_version": 1,
@@ -71,7 +79,24 @@ Lifecycle operations return:
 }
 ```
 
-Inspection includes the durable cell record, provider-observed VM when present, and one reconciliation classification. Reconciliation itself is read-only.
+Inspection includes the durable cell record, provider-observed VM when present,
+the detailed reconciliation payload, and a provider-neutral `classification`:
+
+```json
+{
+  "code": "state_drift",
+  "ownership": "proven",
+  "required_action": "retry_lifecycle"
+}
+```
+
+Stable codes are `exact_owned`, `manifest_only`, `provider_missing`,
+`unproven_provider_object`, `ownership_mismatch`, `state_drift`, `provisioning`,
+and `destroyed`. Ownership is `proven`, `phase_proven`, `unproven`, `mismatch`,
+or `not_applicable`; `phase_proven` is the narrower durable provisioning proof.
+Required action is `none`, `retry_lifecycle`, `recovery_required`, or
+`manual_review`. This classification is descriptive and never authorizes
+mutation. Reconciliation itself is read-only.
 
 Guest exec returns a generated `operation_id`, exact `cell_id`, exit code,
 UTF-8 stdout/stderr, byte counts, encoding, and truncation status. Output is
@@ -86,6 +111,8 @@ record only after revalidating the bound manifest and every file hash/size, and
 reports `recovery_required` without mutation for transport-active operations.
 Incomplete artifact staging without a committed manifest remains quarantined;
 M2 provides no broad or automatic staging deletion.
+The report uses the same `required_action` vocabulary; transport-active work is
+`manual_review`.
 
 Copy-out and artifact collection write only beneath the deterministic state
 artifact root. Each committed manifest binds CellId, operation ID, guest path,
