@@ -263,12 +263,9 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             .join(id.to_string())
             .join("qemu")
             .join("vm.json");
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let config: QemuVmConfig = serde_json::from_slice(&bytes).map_err(|_| {
-                    ProviderError::InvalidResponse("QEMU configuration JSON is invalid".to_owned())
-                })?;
-                config.validate(&path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let config = read_config(&path)?;
                 let matches = match lookup {
                     VmLookup::Id(value) => {
                         Uuid::parse_str(value).ok() == Uuid::parse_str(&config.id).ok()

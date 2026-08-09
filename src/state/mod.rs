@@ -230,6 +230,11 @@ impl StateStore {
             }
         };
 
+        if let Err(error) = ensure_private_open_file(&lock_path, &file) {
+            release_process_mutation_root(&process_key);
+            return Err(error);
+        }
+
         if let Err(source) = file.try_lock_exclusive() {
             release_process_mutation_root(&process_key);
             if source.kind() == std::io::ErrorKind::WouldBlock {
@@ -1408,6 +1413,14 @@ mod tests {
         );
         assert!(guard.validate_filesystem_identity().is_ok());
         drop(guard);
+
+        let lock_path = store.root().join("locks").join("mutation.lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.acquire_mutation_lock(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
 
         fs::set_permissions(store.root(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
