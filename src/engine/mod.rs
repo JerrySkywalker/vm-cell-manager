@@ -203,10 +203,10 @@ pub enum EngineError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
-    #[error("unsupported M1 provider: {0}")]
+    #[error("unsupported local provider: {0}")]
     UnsupportedProvider(String),
 
-    #[error("Hyper-V provider is unavailable: {0}")]
+    #[error("selected provider is unavailable: {0}")]
     ProviderUnavailable(String),
 
     #[error("invalid image: {0}")]
@@ -242,13 +242,18 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self.state
     }
 
+    #[must_use]
+    pub fn provider_name(&self) -> &'static str {
+        self.provider.name()
+    }
+
     pub fn register_image(
         &self,
         request: RegisterImageRequest,
     ) -> Result<ImageRecord, EngineError> {
-        self.require_hyperv_available()?;
+        self.require_provider_available()?;
         let _mutation = self.state.acquire_mutation_lock()?;
-        let canonical = canonical_vhdx_path(&request.path)?;
+        let canonical = canonical_image_path(&request.path)?;
         let mut handle = open_immutable_parent(&canonical)?;
         let file_size = handle
             .file
@@ -256,12 +261,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             .map_err(|error| EngineError::InvalidImage(error.to_string()))?
             .len();
         let provider_info = self.provider.inspect_image(canonical.clone())?;
-        validate_base_vhdx(&canonical, file_size, &provider_info)?;
+        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)?;
         let sha256 = sha256_file(&mut handle.file)?;
 
         let variant = ImageVariant {
-            provider: "hyperv".to_owned(),
-            disk_format: "vhdx".to_owned(),
+            provider: self.provider.name().to_owned(),
+            disk_format: provider_info.disk_format,
             path: canonical,
             sha256,
             file_size,
@@ -302,16 +307,17 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.state
             .list_cells()?
             .into_iter()
+            .filter(|record| record.provider == self.provider.name())
             .map(|record| self.inspect_cell(record.id))
             .collect()
     }
 
     pub fn create_cell(&self, spec: CellSpec) -> Result<CellRecord, EngineError> {
-        self.require_hyperv_available()?;
-        validate_cell_spec(&spec)?;
+        self.require_provider_available()?;
+        validate_cell_spec(&spec, self.provider.name())?;
         let mutation = self.state.acquire_mutation_lock()?;
         let image_record = self.state.load_image(&spec.image)?;
-        let variant = hyperv_variant(&image_record)?;
+        let variant = provider_variant(&image_record, self.provider.name())?;
         let parent_handle = self.verify_registered_image(variant)?;
 
         let installation = self.state.installation()?;
@@ -327,8 +333,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
             installation.install_id,
             cell_id,
             Uuid::new_v4(),
-            self.state.cell_configuration_path(cell_id),
-            self.state.cell_overlay_path(cell_id),
+            self.state
+                .cell_configuration_path_for(cell_id, self.provider.name()),
+            self.state
+                .cell_overlay_path_for(cell_id, &variant.disk_format),
         );
         let expires_at = spec
             .ttl_seconds
@@ -336,7 +344,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let mut record = CellRecord {
             schema_version: CELL_SCHEMA_VERSION,
             id: cell_id,
-            provider: "hyperv".to_owned(),
+            provider: self.provider.name().to_owned(),
             spec,
             image: ImageBinding::from_variant(
                 image_record.id.clone(),
@@ -353,7 +361,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             last_error: None,
         };
         self.state.save_cell(&record)?;
-        let runtime_authority = match self.state.prepare_cell_runtime(cell_id) {
+        let runtime_authority = match self.state.prepare_cell_runtime_for(
+            cell_id,
+            record.ownership.configuration_path.clone(),
+            record.ownership.overlay_path.clone(),
+        ) {
             Ok(runtime) => runtime,
             Err(error) => return self.fail_record(record, error.into()),
         };
@@ -396,7 +408,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             name: record.ownership.provider_object_name.clone(),
             configuration_path: record.ownership.configuration_path.clone(),
             overlay_path: record.ownership.overlay_path.clone(),
+            parent_path: record.image.path.clone(),
             memory_mib: record.spec.memory_mib,
+            cpu_count: record.spec.cpu_count,
+            accelerator: record.spec.accelerator.clone(),
+            allow_tcg: record.spec.allow_tcg,
         };
         let authority = ProviderMutationAuthority::new(
             &record,
@@ -507,7 +523,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
     }
 
     pub fn start_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
-        self.require_hyperv()?;
+        self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
         let mut record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "start", &[CellState::Stopped, CellState::Running])?;
@@ -522,9 +538,54 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 Ok(operation_report(&record, changed))
             }
             ProviderPowerState::Off if record.state != CellState::Destroyed => {
+                let _immutable_parent = if record.provider == "qemu" {
+                    Some(self.verify_registered_image(&ImageVariant {
+                        provider: record.image.provider.clone(),
+                        disk_format: record.image.disk_format.clone(),
+                        path: record.image.path.clone(),
+                        sha256: record.image.sha256.clone(),
+                        file_size: record.image.file_size,
+                    })?)
+                } else {
+                    None
+                };
                 let installation = self.state.acquire_installation_authority()?;
                 self.validate_local_ownership_against(&record, &installation)?;
-                let runtime = self.state.pin_cell_runtime(record.id)?;
+                let runtime = self.state.pin_cell_runtime_for(
+                    record.id,
+                    record.ownership.configuration_path.clone(),
+                    record.ownership.overlay_path.clone(),
+                )?;
+                let authority =
+                    ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+                self.provider.start_vm(&authority, &before)?;
+                let after = self.exact_owned_vm(&record)?;
+                if after.power_state != ProviderPowerState::Running {
+                    return Err(EngineError::UnexpectedPowerState(after.power_state));
+                }
+                record.state = CellState::Running;
+                record.phase = CellPhase::Ready;
+                record.updated_at = Utc::now();
+                self.state.save_cell(&record)?;
+                Ok(operation_report(&record, true))
+            }
+            ProviderPowerState::Paused
+                if record.provider == "qemu" && record.state != CellState::Destroyed =>
+            {
+                let _immutable_parent = self.verify_registered_image(&ImageVariant {
+                    provider: record.image.provider.clone(),
+                    disk_format: record.image.disk_format.clone(),
+                    path: record.image.path.clone(),
+                    sha256: record.image.sha256.clone(),
+                    file_size: record.image.file_size,
+                })?;
+                let installation = self.state.acquire_installation_authority()?;
+                self.validate_local_ownership_against(&record, &installation)?;
+                let runtime = self.state.pin_cell_runtime_for(
+                    record.id,
+                    record.ownership.configuration_path.clone(),
+                    record.ownership.overlay_path.clone(),
+                )?;
                 let authority =
                     ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
                 self.provider.start_vm(&authority, &before)?;
@@ -543,7 +604,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
     }
 
     pub fn stop_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
-        self.require_hyperv()?;
+        self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
         let mut record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "stop", &[CellState::Stopped, CellState::Running])?;
@@ -560,7 +621,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ProviderPowerState::Running => {
                 let installation = self.state.acquire_installation_authority()?;
                 self.validate_local_ownership_against(&record, &installation)?;
-                let runtime = self.state.pin_cell_runtime(record.id)?;
+                let runtime = self.state.pin_cell_runtime_for(
+                    record.id,
+                    record.ownership.configuration_path.clone(),
+                    record.ownership.overlay_path.clone(),
+                )?;
                 let authority =
                     ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
                 self.provider.stop_vm(&authority, &before)?;
@@ -789,11 +854,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         evaluated_at: chrono::DateTime<Utc>,
     ) -> Result<GcReport, EngineError> {
-        self.require_hyperv()?;
+        self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
         let operations = self.state.list_guest_operations()?;
         let mut entries = Vec::new();
         for record in self.state.list_cells()? {
+            if record.provider != self.provider.name() {
+                continue;
+            }
             let disposition = match record.expires_at {
                 None => GcDisposition::NoTtl,
                 Some(expires_at) if expires_at > evaluated_at => GcDisposition::NotExpired,
@@ -829,7 +897,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
     }
 
     pub fn destroy_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
-        self.require_hyperv()?;
+        self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
         self.destroy_cell_locked(cell_id, &mutation)
     }
@@ -873,7 +941,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
         };
 
         if let Some(mut vm) = provider_vm {
-            let runtime = self.state.pin_cell_runtime(record.id)?;
+            let runtime = self.state.pin_cell_runtime_for(
+                record.id,
+                record.ownership.configuration_path.clone(),
+                record.ownership.overlay_path.clone(),
+            )?;
             let destroying_provisioning = match record.phase {
                 CellPhase::ProviderObjectCreated => {
                     prove_creation_identity(&record, &vm, false)?;
@@ -976,7 +1048,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 ));
             }
             if self.state.runtime_entry_exists(cell_id)? {
-                let runtime = self.state.pin_cell_runtime(record.id)?;
+                let runtime = self.state.pin_cell_runtime_for(
+                    record.id,
+                    record.ownership.configuration_path.clone(),
+                    record.ownership.overlay_path.clone(),
+                )?;
                 self.validate_local_ownership_against(&record, &installation)?;
                 self.state.remove_cell_runtime(cell_id, runtime)?;
             }
@@ -990,8 +1066,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
         Ok(operation_report(&record, true))
     }
 
-    fn require_hyperv(&self) -> Result<(), EngineError> {
-        if self.provider.name() != "hyperv" {
+    fn require_provider(&self) -> Result<(), EngineError> {
+        if !matches!(self.provider.name(), "hyperv" | "qemu") {
             return Err(EngineError::UnsupportedProvider(
                 self.provider.name().to_owned(),
             ));
@@ -999,8 +1075,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
         Ok(())
     }
 
-    fn require_hyperv_available(&self) -> Result<(), EngineError> {
-        self.require_hyperv()?;
+    fn require_provider_available(&self) -> Result<(), EngineError> {
+        self.require_provider()?;
         let probe = self.provider.probe();
         if probe.available {
             Ok(())
@@ -1013,7 +1089,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         variant: &ImageVariant,
     ) -> Result<ImmutableParentGuard, EngineError> {
-        let canonical = canonical_vhdx_path(&variant.path)?;
+        let canonical = canonical_image_path(&variant.path)?;
         if !paths_equal(&canonical, &variant.path) {
             return Err(EngineError::InvalidImage(
                 "registered image path no longer resolves to the same file".to_owned(),
@@ -1031,7 +1107,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         let provider_info = self.provider.inspect_image(canonical.clone())?;
-        validate_base_vhdx(&canonical, file_size, &provider_info)?;
+        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)?;
         let sha256 = sha256_file(&mut handle.file)?;
         if sha256 != variant.sha256 {
             return Err(EngineError::InvalidImage(
@@ -1204,12 +1280,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 "cell installation identity does not match the current state store".to_owned(),
             ));
         }
-        if record.provider != "hyperv"
-            || record.spec.provider.as_deref() != Some("hyperv")
-            || record.image.provider != "hyperv"
+        if record.provider != self.provider.name()
+            || record.spec.provider.as_deref() != Some(self.provider.name())
+            || record.image.provider != self.provider.name()
         {
             return Err(EngineError::OwnershipNotProven(
-                "manifest provider binding is not Hyper-V".to_owned(),
+                "manifest provider binding does not match the selected provider".to_owned(),
             ));
         }
         if record.spec.image != record.image.image_id {
@@ -1226,12 +1302,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
         if let Some(identity) = &record.provider_object {
             let provider_id = Uuid::parse_str(&identity.id).map_err(|_| {
                 EngineError::OwnershipNotProven(
-                    "recorded Hyper-V provider object id is not a GUID".to_owned(),
+                    "recorded provider object id is not a GUID".to_owned(),
                 )
             })?;
             if provider_id.to_string() != identity.id {
                 return Err(EngineError::OwnershipNotProven(
-                    "recorded Hyper-V provider object id is not canonical".to_owned(),
+                    "recorded provider object id is not canonical".to_owned(),
                 ));
             }
             if identity.name != record.ownership.provider_object_name {
@@ -1259,10 +1335,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if !paths_equal(
             &record.ownership.configuration_path,
-            &self.state.cell_configuration_path(record.id),
+            &self
+                .state
+                .cell_configuration_path_for(record.id, self.provider.name()),
         ) || !paths_equal(
             &record.ownership.overlay_path,
-            &self.state.cell_overlay_path(record.id),
+            &self
+                .state
+                .cell_overlay_path_for(record.id, &record.image.disk_format),
         ) {
             return Err(EngineError::OwnershipNotProven(
                 "manifest runtime paths are outside the CellId-scoped root".to_owned(),
@@ -1375,7 +1455,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             GuestOperationId,
         ) -> Result<(T, GuestCompletion), EngineError>,
     {
-        self.require_hyperv()?;
+        self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
         let record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "run a guest operation on", &[CellState::Running])?;
@@ -1384,9 +1464,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 "guest operations require a ready cell".to_owned(),
             ));
         }
-        if record.image.guest_os != Some(GuestOs::Windows) {
+        let guest_os = record.image.guest_os.ok_or_else(|| {
+            EngineError::InvalidCellRequest(
+                "guest operations require a cell with a persisted guest OS".to_owned(),
+            )
+        })?;
+        if !transport.supports(&record.provider, guest_os) {
             return Err(EngineError::InvalidCellRequest(
-                "PowerShell Direct requires a cell bound to a Windows image".to_owned(),
+                "selected guest transport is incompatible with the provider/guest OS".to_owned(),
             ));
         }
         let expected = self.exact_owned_vm(&record)?;
@@ -1399,7 +1484,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let execution = (|| {
             let installation = self.state.acquire_installation_authority()?;
             self.validate_local_ownership_against(&record, &installation)?;
-            let runtime = self.state.pin_cell_runtime(cell_id)?;
+            let runtime = self.state.pin_cell_runtime_for(
+                cell_id,
+                record.ownership.configuration_path.clone(),
+                record.ownership.overlay_path.clone(),
+            )?;
             let authority =
                 GuestActionAuthority::new(&record, &expected, &installation, &runtime, &mutation)?;
             operation.phase = GuestOperationPhase::TransportActive;
@@ -1670,12 +1759,32 @@ fn guest_failure_class(error: &EngineError) -> (GuestFailureClass, bool) {
     }
 }
 
-fn validate_cell_spec(spec: &CellSpec) -> Result<(), EngineError> {
-    if spec.provider.as_deref() != Some("hyperv") {
+fn validate_cell_spec(spec: &CellSpec, provider: &str) -> Result<(), EngineError> {
+    if !matches!(provider, "hyperv" | "qemu") || spec.provider.as_deref() != Some(provider) {
         return Err(EngineError::UnsupportedProvider(
             spec.provider
                 .clone()
                 .unwrap_or_else(|| "<missing>".to_owned()),
+        ));
+    }
+    if provider == "hyperv" && (spec.accelerator.is_some() || spec.allow_tcg) {
+        return Err(EngineError::InvalidCellRequest(
+            "QEMU accelerator policy cannot be applied to Hyper-V".to_owned(),
+        ));
+    }
+    if let Some(accelerator) = &spec.accelerator {
+        if !matches!(
+            accelerator.as_str(),
+            "auto" | "whpx" | "kvm" | "hvf" | "tcg"
+        ) {
+            return Err(EngineError::InvalidCellRequest(
+                "accelerator must be auto, whpx, kvm, hvf, or tcg".to_owned(),
+            ));
+        }
+    }
+    if spec.accelerator.as_deref() == Some("tcg") && !spec.allow_tcg {
+        return Err(EngineError::InvalidCellRequest(
+            "TCG requires explicit allow_tcg".to_owned(),
         ));
     }
     if !(1..=MAX_CPU_COUNT).contains(&spec.cpu_count) {
@@ -1713,7 +1822,7 @@ fn require_lifecycle_state(
     }
 }
 
-fn canonical_vhdx_path(path: &Path) -> Result<PathBuf, EngineError> {
+fn canonical_image_path(path: &Path) -> Result<PathBuf, EngineError> {
     for ancestor in path.ancestors() {
         if ancestor.as_os_str().is_empty() || !ancestor.exists() {
             continue;
@@ -1738,10 +1847,12 @@ fn canonical_vhdx_path(path: &Path) -> Result<PathBuf, EngineError> {
     if !path
         .extension()
         .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("vhdx"))
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("vhdx") || value.eq_ignore_ascii_case("qcow2")
+        })
     {
         return Err(EngineError::InvalidImage(
-            "Hyper-V base image must use the .vhdx extension".to_owned(),
+            "base image must use the provider-native .vhdx or .qcow2 extension".to_owned(),
         ));
     }
     path.canonicalize()
@@ -1817,20 +1928,26 @@ fn sha256_file(file: &mut File) -> Result<String, EngineError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn validate_base_vhdx(
+fn validate_base_image(
+    provider: &str,
     expected_path: &Path,
     file_size: u64,
     info: &ProviderImageInfo,
 ) -> Result<(), EngineError> {
+    let expected_format = match provider {
+        "hyperv" => "vhdx",
+        "qemu" => "qcow2",
+        _ => return Err(EngineError::UnsupportedProvider(provider.to_owned())),
+    };
     if !paths_equal(expected_path, &info.path) {
         return Err(EngineError::InvalidImage(
-            "Hyper-V reported a different VHDX path".to_owned(),
+            "provider reported a different base image path".to_owned(),
         ));
     }
-    if !info.disk_format.eq_ignore_ascii_case("vhdx") {
-        return Err(EngineError::InvalidImage(
-            "Hyper-V image format is not VHDX".to_owned(),
-        ));
+    if !info.disk_format.eq_ignore_ascii_case(expected_format) {
+        return Err(EngineError::InvalidImage(format!(
+            "provider image format is not {expected_format}"
+        )));
     }
     if info.parent_path.is_some() || info.disk_type.eq_ignore_ascii_case("differencing") {
         return Err(EngineError::InvalidImage(
@@ -1839,7 +1956,7 @@ fn validate_base_vhdx(
     }
     if info.file_size != file_size {
         return Err(EngineError::InvalidImage(
-            "filesystem and Hyper-V VHDX sizes disagree".to_owned(),
+            "filesystem and provider image sizes disagree".to_owned(),
         ));
     }
     Ok(())
@@ -1847,15 +1964,18 @@ fn validate_base_vhdx(
 
 fn validate_overlay(record: &CellRecord, info: &ProviderImageInfo) -> Result<(), EngineError> {
     if !paths_equal(&record.ownership.overlay_path, &info.path)
-        || !info.disk_format.eq_ignore_ascii_case("vhdx")
-        || !info.disk_type.eq_ignore_ascii_case("differencing")
+        || !info
+            .disk_format
+            .eq_ignore_ascii_case(&record.image.disk_format)
+        || !(info.disk_type.eq_ignore_ascii_case("differencing")
+            || info.disk_type.eq_ignore_ascii_case("overlay"))
         || info
             .parent_path
             .as_ref()
             .is_none_or(|path| !paths_equal(path, &record.image.path))
     {
         return Err(EngineError::ProviderDrift(
-            "created overlay did not match the requested VHDX parent/path".to_owned(),
+            "created overlay did not match the requested immutable parent/path".to_owned(),
         ));
     }
     Ok(())
@@ -1868,13 +1988,13 @@ fn normalize_provider_identity(
     let id = Uuid::parse_str(&identity.id)
         .map_err(|_| {
             EngineError::ProviderDrift(
-                "Hyper-V create response did not contain a GUID provider id".to_owned(),
+                "provider create response did not contain a GUID provider id".to_owned(),
             )
         })?
         .to_string();
     if identity.name != record.ownership.provider_object_name {
         return Err(EngineError::ProviderDrift(
-            "Hyper-V create response name did not match the requested CellId name".to_owned(),
+            "provider create response name did not match the requested CellId name".to_owned(),
         ));
     }
     Ok(ProviderVmIdentity {
@@ -2019,18 +2139,21 @@ fn power_state_matches(cell: CellState, provider: &ProviderPowerState) -> bool {
     )
 }
 
-fn hyperv_variant(image: &ImageRecord) -> Result<&ImageVariant, EngineError> {
+fn provider_variant<'a>(
+    image: &'a ImageRecord,
+    provider: &str,
+) -> Result<&'a ImageVariant, EngineError> {
     let mut variants = image
         .variants
         .iter()
-        .filter(|variant| variant.provider == "hyperv");
+        .filter(|variant| variant.provider == provider);
     let variant = variants
         .next()
-        .ok_or_else(|| EngineError::InvalidImage("image has no Hyper-V VHDX variant".to_owned()))?;
+        .ok_or_else(|| EngineError::InvalidImage(format!("image has no {provider} variant")))?;
     if variants.next().is_some() {
-        return Err(EngineError::InvalidImage(
-            "image has more than one Hyper-V variant".to_owned(),
-        ));
+        return Err(EngineError::InvalidImage(format!(
+            "image has more than one {provider} variant"
+        )));
     }
     Ok(variant)
 }
@@ -2146,6 +2269,11 @@ mod tests {
     #[derive(Clone)]
     struct MockHyperV {
         base_size: u64,
+        provider_name: &'static str,
+        disk_format: &'static str,
+        base_disk_type: &'static str,
+        overlay_disk_type: &'static str,
+        initial_network_adapters: u32,
         use_path_aliases: bool,
         state: Arc<Mutex<MockState>>,
     }
@@ -2155,9 +2283,24 @@ mod tests {
             let base_size = fs::metadata(&base_path).unwrap().len();
             Self {
                 base_size,
+                provider_name: "hyperv",
+                disk_format: "vhdx",
+                base_disk_type: "dynamic",
+                overlay_disk_type: "differencing",
+                initial_network_adapters: 1,
                 use_path_aliases: false,
                 state: Arc::new(Mutex::new(MockState::default())),
             }
+        }
+
+        fn new_qemu(base_path: PathBuf) -> Self {
+            let mut provider = Self::new(base_path);
+            provider.provider_name = "qemu";
+            provider.disk_format = "qcow2";
+            provider.base_disk_type = "base";
+            provider.overlay_disk_type = "overlay";
+            provider.initial_network_adapters = 0;
+            provider
         }
 
         #[cfg(windows)]
@@ -2197,12 +2340,12 @@ mod tests {
 
     impl LocalVmProvider for MockHyperV {
         fn name(&self) -> &'static str {
-            "hyperv"
+            self.provider_name
         }
 
         fn probe(&self) -> ProviderProbe {
             ProviderProbe {
-                name: "hyperv",
+                name: self.provider_name,
                 available: true,
                 detail: "mock".to_owned(),
                 capabilities: ProviderCapabilities::unavailable(),
@@ -2213,8 +2356,8 @@ mod tests {
             self.state.lock().unwrap().calls.push("inspect_image");
             Ok(ProviderImageInfo {
                 path: self.provider_path(&path),
-                disk_format: "vhdx".to_owned(),
-                disk_type: "dynamic".to_owned(),
+                disk_format: self.disk_format.to_owned(),
+                disk_type: self.base_disk_type.to_owned(),
                 parent_path: None,
                 file_size: self.base_size,
                 virtual_size: 1024 * 1024,
@@ -2230,8 +2373,8 @@ mod tests {
             fs::write(&request.overlay_path, b"overlay").unwrap();
             Ok(ProviderImageInfo {
                 path: self.provider_path(&request.overlay_path),
-                disk_format: "vhdx".to_owned(),
-                disk_type: "differencing".to_owned(),
+                disk_format: self.disk_format.to_owned(),
+                disk_type: self.overlay_disk_type.to_owned(),
                 parent_path: Some(self.provider_path(&request.parent_path)),
                 file_size: 7,
                 virtual_size: 1024 * 1024,
@@ -2264,7 +2407,7 @@ mod tests {
                 ownership_marker: String::new(),
                 configuration_path: self.provider_path(&request.configuration_path),
                 attached_disks: vec![self.provider_path(&request.overlay_path)],
-                network_adapter_count: 1,
+                network_adapter_count: self.initial_network_adapters,
                 cpu_count: 1,
                 memory_mib: request.memory_mib,
             };
@@ -2425,6 +2568,61 @@ mod tests {
         (directory, engine, image_id)
     }
 
+    fn qemu_fixture() -> (tempfile::TempDir, CellEngine<MockHyperV>, ImageId) {
+        let directory = tempdir().unwrap();
+        let base_path = directory.path().join("base.qcow2");
+        fs::write(&base_path, b"immutable qcow2 base").unwrap();
+        let provider = MockHyperV::new_qemu(base_path.clone());
+        let engine = CellEngine::new(StateStore::new(directory.path().join("state")), provider);
+        let image_id = ImageId::parse("linux-qemu").unwrap();
+        engine
+            .register_image(RegisterImageRequest {
+                id: image_id.clone(),
+                guest_os: GuestOs::Linux,
+                guest_arch: Architecture::X86_64,
+                path: base_path,
+            })
+            .unwrap();
+        (directory, engine, image_id)
+    }
+
+    fn qemu_spec(image: ImageId) -> CellSpec {
+        CellSpec {
+            image,
+            provider: Some("qemu".to_owned()),
+            cpu_count: 2,
+            memory_mib: 2048,
+            ttl_seconds: None,
+            accelerator: Some("auto".to_owned()),
+            allow_tcg: true,
+        }
+    }
+
+    #[test]
+    fn provider_neutral_engine_runs_qemu_lifecycle_with_qcow2_paths() {
+        let (_directory, engine, image_id) = qemu_fixture();
+        let cell = engine.create_cell(qemu_spec(image_id)).unwrap();
+        assert_eq!(cell.provider, "qemu");
+        assert_eq!(cell.image.disk_format, "qcow2");
+        assert_eq!(cell.ownership.overlay_path.extension().unwrap(), "qcow2");
+        assert_eq!(
+            cell.ownership.configuration_path.file_name().unwrap(),
+            "qemu"
+        );
+        assert_eq!(cell.state, CellState::Stopped);
+        assert_eq!(
+            engine.start_cell(cell.id).unwrap().state,
+            CellState::Running
+        );
+        assert_eq!(engine.stop_cell(cell.id).unwrap().state, CellState::Stopped);
+        assert!(engine.destroy_cell(cell.id).unwrap().changed);
+        assert!(!engine.destroy_cell(cell.id).unwrap().changed);
+        let calls = engine.provider.state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&"create_overlay"));
+        assert!(calls.contains(&"start_vm"));
+        assert!(calls.contains(&"remove_vm"));
+    }
+
     fn spec(image: ImageId) -> CellSpec {
         CellSpec {
             image,
@@ -2432,6 +2630,8 @@ mod tests {
             cpu_count: 2,
             memory_mib: 4096,
             ttl_seconds: None,
+            accelerator: None,
+            allow_tcg: false,
         }
     }
 
@@ -2512,6 +2712,10 @@ mod tests {
     impl GuestTransport for MockGuest {
         fn name(&self) -> &'static str {
             "mock-guest"
+        }
+
+        fn supports(&self, _provider: &str, _guest_os: GuestOs) -> bool {
+            true
         }
 
         fn probe_ready(

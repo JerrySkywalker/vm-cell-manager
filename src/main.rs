@@ -6,8 +6,8 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Serialize;
 use vm_cell_manager::cli::{
-    ArtifactCommand, Cli, Command, CredentialArgs, DoctorReport, ErrorBody, ErrorEnvelope,
-    GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
+    ArtifactCommand, Cli, CliProvider, Command, CredentialArgs, DoctorReport, ErrorBody,
+    ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
@@ -15,9 +15,11 @@ use vm_cell_manager::engine::{
     RegisterImageRequest,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
+use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
 use vm_cell_manager::guest::{GuestCommand, GuestCredentials, ReadinessPolicy};
-use vm_cell_manager::providers::builtin_provider_probes;
 use vm_cell_manager::providers::hyperv::HyperVProvider;
+use vm_cell_manager::providers::qemu::QemuProvider;
+use vm_cell_manager::providers::{LocalVmProvider, builtin_provider_probes};
 use vm_cell_manager::state::StateStore;
 use zeroize::Zeroizing;
 
@@ -86,19 +88,65 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 }
             })?;
         }
+        Command::Reconcile { cell_id: None } => {
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let mut items =
+                CellEngine::new(StateStore::new(root.clone()), HyperVProvider::system())
+                    .reconcile_all()?;
+            items.extend(
+                CellEngine::new(StateStore::new(root.clone()), QemuProvider::system(root))
+                    .reconcile_all()?,
+            );
+            let response = ListEnvelope::new(items);
+            emit(&response, cli.json, || {
+                for inspection in &response.items {
+                    println!("{}\t{:?}", inspection.cell.id, inspection.reconciliation);
+                }
+            })?;
+        }
+        Command::Gc => {
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let evaluated_at = chrono::Utc::now();
+            let mut report =
+                CellEngine::new(StateStore::new(root.clone()), HyperVProvider::system())
+                    .gc_expired_at(evaluated_at)?;
+            report.entries.extend(
+                CellEngine::new(StateStore::new(root.clone()), QemuProvider::system(root))
+                    .gc_expired_at(evaluated_at)?
+                    .entries,
+            );
+            emit(&report, cli.json, || {
+                for entry in &report.entries {
+                    println!("{}\t{:?}", entry.cell_id, entry.disposition);
+                }
+            })?;
+        }
         command => {
-            let state = StateStore::new(state_root.unwrap_or_else(StateStore::default_root));
-            let engine = CellEngine::new(state, HyperVProvider::system());
-            run_m2(command, cli.json, &engine)?;
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let state = StateStore::new(root.clone());
+            let provider = provider_for_command(&command, &state)?;
+            match provider.as_str() {
+                "hyperv" => run_m2(
+                    command,
+                    cli.json,
+                    &CellEngine::new(state, HyperVProvider::system()),
+                )?,
+                "qemu" => run_m2(
+                    command,
+                    cli.json,
+                    &CellEngine::new(state, QemuProvider::system(root)),
+                )?,
+                value => return Err(format!("unsupported persisted provider: {value}").into()),
+            }
         }
     }
     Ok(())
 }
 
-fn run_m2(
+fn run_m2<P: LocalVmProvider>(
     command: Command,
     json: bool,
-    engine: &CellEngine<HyperVProvider>,
+    engine: &CellEngine<P>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
         Command::Image { command } => match command {
@@ -107,6 +155,7 @@ fn run_m2(
                 path,
                 guest_os,
                 guest_arch,
+                provider: _,
             } => {
                 let image = engine.register_image(RegisterImageRequest {
                     id,
@@ -134,13 +183,18 @@ fn run_m2(
             cpu_count,
             memory_mib,
             ttl_seconds,
+            provider: _,
+            accelerator,
+            allow_tcg,
         } => {
             let cell = engine.create_cell(CellSpec {
                 image,
-                provider: Some("hyperv".to_owned()),
+                provider: Some(engine.provider_name().to_owned()),
                 cpu_count,
                 memory_mib,
                 ttl_seconds,
+                accelerator: accelerator.map(|value| value.as_str().to_owned()),
+                allow_tcg,
             })?;
             emit(&cell, json, || {
                 println!("created cell {} ({:?})", cell.id, cell.state)
@@ -197,12 +251,10 @@ fn run_m2(
             max_output_bytes,
             mut command,
         } => {
-            let credentials = read_credentials(credential)?;
             let program = command.remove(0);
-            let transport = PowerShellDirectTransport::system();
-            let report = engine.exec_guest(
-                &transport,
-                &credentials,
+            let report = exec_guest(
+                engine,
+                credential,
                 GuestExecRequest {
                     cell_id,
                     command: GuestCommand {
@@ -228,11 +280,9 @@ fn run_m2(
             timeout_seconds,
             max_bytes,
         } => {
-            let credentials = read_credentials(credential)?;
-            let transport = PowerShellDirectTransport::system();
-            let report = engine.copy_into_guest(
-                &transport,
-                &credentials,
+            let report = copy_in_guest(
+                engine,
+                credential,
                 GuestCopyInRequest {
                     cell_id,
                     source,
@@ -255,11 +305,9 @@ fn run_m2(
             timeout_seconds,
             max_bytes,
         } => {
-            let credentials = read_credentials(credential)?;
-            let transport = PowerShellDirectTransport::system();
-            let report = engine.copy_out_of_guest(
-                &transport,
-                &credentials,
+            let report = copy_out_guest(
+                engine,
+                credential,
                 GuestCopyOutRequest {
                     cell_id,
                     source,
@@ -281,11 +329,9 @@ fn run_m2(
                 timeout_seconds,
                 max_bytes_per_file,
             } => {
-                let credentials = read_credentials(credential)?;
-                let transport = PowerShellDirectTransport::system();
-                let report = engine.collect_artifacts(
-                    &transport,
-                    &credentials,
+                let report = collect_guest_artifacts(
+                    engine,
+                    credential,
                     ArtifactCollectRequest {
                         cell_id,
                         sources: paths,
@@ -339,6 +385,104 @@ fn run_m2(
     Ok(())
 }
 
+fn provider_for_command(command: &Command, state: &StateStore) -> Result<String, Box<dyn Error>> {
+    let provider = match command {
+        Command::Image {
+            command: ImageCommand::Add { provider, .. },
+        }
+        | Command::Create { provider, .. } => provider.as_str().to_owned(),
+        Command::Inspect { cell_id }
+        | Command::Start { cell_id }
+        | Command::Stop { cell_id }
+        | Command::Destroy { cell_id }
+        | Command::Exec { cell_id, .. }
+        | Command::CopyIn { cell_id, .. }
+        | Command::CopyOut { cell_id, .. }
+        | Command::Reconcile {
+            cell_id: Some(cell_id),
+        } => state.load_cell(*cell_id)?.provider,
+        Command::Artifact {
+            command:
+                ArtifactCommand::Collect { cell_id, .. } | ArtifactCommand::Inspect { cell_id, .. },
+        } => state.load_cell(*cell_id)?.provider,
+        Command::List
+        | Command::Image { .. }
+        | Command::Operation { .. }
+        | Command::Doctor
+        | Command::Provider { .. } => CliProvider::Hyperv.as_str().to_owned(),
+        Command::Reconcile { cell_id: None } | Command::Gc => {
+            return Err("multi-provider command was not routed before provider selection".into());
+        }
+    };
+    Ok(provider)
+}
+
+fn exec_guest<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: GuestExecRequest,
+) -> Result<vm_cell_manager::engine::GuestExecReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)?;
+    Ok(match engine.provider_name() {
+        "hyperv" => {
+            engine.exec_guest(&PowerShellDirectTransport::system(), &credentials, request)?
+        }
+        "qemu" => engine.exec_guest(&QemuGuestAgentTransport::system(), &credentials, request)?,
+        _ => return Err("unsupported guest provider".into()),
+    })
+}
+
+fn copy_in_guest<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: GuestCopyInRequest,
+) -> Result<vm_cell_manager::engine::GuestCopyInReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)?;
+    Ok(match engine.provider_name() {
+        "hyperv" => {
+            engine.copy_into_guest(&PowerShellDirectTransport::system(), &credentials, request)?
+        }
+        "qemu" => {
+            engine.copy_into_guest(&QemuGuestAgentTransport::system(), &credentials, request)?
+        }
+        _ => return Err("unsupported guest provider".into()),
+    })
+}
+
+fn copy_out_guest<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: GuestCopyOutRequest,
+) -> Result<vm_cell_manager::engine::ArtifactReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)?;
+    Ok(match engine.provider_name() {
+        "hyperv" => {
+            engine.copy_out_of_guest(&PowerShellDirectTransport::system(), &credentials, request)?
+        }
+        "qemu" => {
+            engine.copy_out_of_guest(&QemuGuestAgentTransport::system(), &credentials, request)?
+        }
+        _ => return Err("unsupported guest provider".into()),
+    })
+}
+
+fn collect_guest_artifacts<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: ArtifactCollectRequest,
+) -> Result<vm_cell_manager::engine::ArtifactReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)?;
+    Ok(match engine.provider_name() {
+        "hyperv" => {
+            engine.collect_artifacts(&PowerShellDirectTransport::system(), &credentials, request)?
+        }
+        "qemu" => {
+            engine.collect_artifacts(&QemuGuestAgentTransport::system(), &credentials, request)?
+        }
+        _ => return Err("unsupported guest provider".into()),
+    })
+}
+
 fn readiness(timeout_seconds: u64) -> ReadinessPolicy {
     ReadinessPolicy {
         timeout: Duration::from_secs(timeout_seconds),
@@ -346,10 +490,22 @@ fn readiness(timeout_seconds: u64) -> ReadinessPolicy {
     }
 }
 
-fn read_credentials(args: CredentialArgs) -> Result<GuestCredentials, Box<dyn Error>> {
+fn read_credentials(
+    provider: &str,
+    args: CredentialArgs,
+) -> Result<GuestCredentials, Box<dyn Error>> {
+    if provider == "qemu" {
+        if args.username.is_some() || args.password_stdin {
+            return Err("QGA is credentialless; do not pass username or password flags".into());
+        }
+        return Ok(GuestCredentials::not_required());
+    }
     if !args.password_stdin {
         return Err("guest password must be provided with --password-stdin".into());
     }
+    let username = args
+        .username
+        .ok_or("PowerShell Direct requires --username")?;
     let mut password = Zeroizing::new(String::new());
     std::io::stdin().take(4097).read_to_string(&mut password)?;
     while password.ends_with(['\r', '\n']) {
@@ -359,7 +515,7 @@ fn read_credentials(args: CredentialArgs) -> Result<GuestCredentials, Box<dyn Er
         return Err("guest password stdin must contain one bounded line".into());
     }
     Ok(GuestCredentials::new(
-        args.username,
+        username,
         std::mem::take(&mut *password),
     )?)
 }
