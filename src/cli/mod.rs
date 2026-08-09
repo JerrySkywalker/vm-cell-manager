@@ -1,10 +1,15 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::core::cell::CellId;
+use crate::core::guest::GuestOperationId;
 use crate::core::image::{Architecture, GuestOs, ImageId};
+use crate::guest::{
+    DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_READINESS_TIMEOUT_SECONDS, GuestPath, OverwritePolicy,
+};
 use crate::providers::{ProviderProbe, builtin_provider_probes};
 use crate::state::StateStore;
 
@@ -54,6 +59,9 @@ pub enum Command {
 
         #[arg(long, default_value_t = 4096)]
         memory_mib: u64,
+
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
     },
 
     /// List locally recorded cells.
@@ -73,6 +81,152 @@ pub enum Command {
 
     /// Reconcile local manifests with provider-observed state without mutation.
     Reconcile { cell_id: Option<CellId> },
+
+    /// Execute a process in an exact-owned running Windows guest.
+    Exec {
+        cell_id: CellId,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
+        max_output_bytes: u64,
+
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Atomically copy one ordinary host file into the guest workspace.
+    CopyIn {
+        cell_id: CellId,
+
+        #[arg(long)]
+        source: PathBuf,
+
+        #[arg(long)]
+        destination: GuestPath,
+
+        #[arg(long, value_enum, default_value_t = CliOverwritePolicy::Deny)]
+        overwrite: CliOverwritePolicy,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_COPY_BYTES)]
+        max_bytes: u64,
+    },
+
+    /// Copy one guest-workspace file into the deterministic artifact store.
+    CopyOut {
+        cell_id: CellId,
+
+        #[arg(long)]
+        source: GuestPath,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_COPY_BYTES)]
+        max_bytes: u64,
+    },
+
+    /// Collect or inspect deterministic guest artifacts.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
+
+    /// Inspect durable non-secret guest operation records.
+    Operation {
+        #[command(subcommand)]
+        command: GuestOperationCommand,
+    },
+
+    /// Explicitly destroy expired exact-owned cells; no daemon is used.
+    Gc,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CredentialArgs {
+    #[arg(long)]
+    pub username: String,
+
+    #[arg(long, required = true)]
+    pub password_stdin: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArtifactCommand {
+    /// Collect one or more guest-workspace files into one atomic artifact record.
+    Collect {
+        cell_id: CellId,
+
+        #[arg(long = "path", required = true)]
+        paths: Vec<GuestPath>,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_COPY_BYTES)]
+        max_bytes_per_file: u64,
+    },
+
+    /// Inspect one committed artifact manifest.
+    Inspect {
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GuestOperationCommand {
+    /// List operation records, optionally filtered to one cell.
+    List { cell_id: Option<CellId> },
+
+    /// Inspect one operation record.
+    Inspect { operation_id: GuestOperationId },
+
+    /// Reconcile a durable operation without replaying guest side effects.
+    Reconcile { operation_id: GuestOperationId },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliOverwritePolicy {
+    Deny,
+    Replace,
+}
+
+impl From<CliOverwritePolicy> for OverwritePolicy {
+    fn from(value: CliOverwritePolicy) -> Self {
+        match value {
+            CliOverwritePolicy::Deny => Self::Deny,
+            CliOverwritePolicy::Replace => Self::Replace,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -246,5 +400,64 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["vmcell", "provider-list"]).is_err());
+    }
+
+    #[test]
+    fn parses_m2_exec_copy_artifact_and_gc_surfaces_without_password_argv() {
+        let cell_id = CellId::new();
+        let exec = Cli::try_parse_from([
+            "vmcell",
+            "exec",
+            &cell_id.to_string(),
+            "--username",
+            "Administrator",
+            "--password-stdin",
+            "--",
+            "cmd.exe",
+            "/c",
+            "echo ok",
+        ])
+        .unwrap();
+        assert!(matches!(exec.command, Command::Exec { .. }));
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "exec",
+                &cell_id.to_string(),
+                "--username",
+                "Administrator",
+                "--password",
+                "secret",
+                "--",
+                "cmd.exe",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "copy-in",
+                &cell_id.to_string(),
+                "--source",
+                "input.bin",
+                "--destination",
+                "input\\file.bin",
+                "--username",
+                "Administrator",
+                "--password-stdin",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["vmcell", "gc"]).is_ok());
+        let operation_id = GuestOperationId::new();
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "operation",
+                "reconcile",
+                &operation_id.to_string(),
+            ])
+            .is_ok()
+        );
     }
 }

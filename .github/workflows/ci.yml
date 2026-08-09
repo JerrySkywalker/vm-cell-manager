@@ -31,7 +31,7 @@ jobs:
       - core
       - trusted
 
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     env:
       CARGO_HOME: C:\ProgramData\jerry-ci\cargo
@@ -169,6 +169,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           cargo fmt --all -- --check
+
+      - name: PowerShell AST and static safety
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\check-powershell.ps1
 
       - name: Clippy
         shell: pwsh

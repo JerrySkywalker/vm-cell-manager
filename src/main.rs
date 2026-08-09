@@ -1,17 +1,25 @@
 use std::error::Error;
+use std::io::Read;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use serde::Serialize;
 use vm_cell_manager::cli::{
-    Cli, Command, DoctorReport, ErrorBody, ErrorEnvelope, ImageCommand, ListEnvelope,
-    ProviderCommand,
+    ArtifactCommand, Cli, Command, CredentialArgs, DoctorReport, ErrorBody, ErrorEnvelope,
+    GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
 };
 use vm_cell_manager::core::cell::CellSpec;
-use vm_cell_manager::engine::{CellEngine, RegisterImageRequest};
+use vm_cell_manager::engine::{
+    ArtifactCollectRequest, CellEngine, GuestCopyInRequest, GuestCopyOutRequest, GuestExecRequest,
+    RegisterImageRequest,
+};
+use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
+use vm_cell_manager::guest::{GuestCommand, GuestCredentials, ReadinessPolicy};
 use vm_cell_manager::providers::builtin_provider_probes;
 use vm_cell_manager::providers::hyperv::HyperVProvider;
 use vm_cell_manager::state::StateStore;
+use zeroize::Zeroizing;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -81,13 +89,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         command => {
             let state = StateStore::new(state_root.unwrap_or_else(StateStore::default_root));
             let engine = CellEngine::new(state, HyperVProvider::system());
-            run_m1(command, cli.json, &engine)?;
+            run_m2(command, cli.json, &engine)?;
         }
     }
     Ok(())
 }
 
-fn run_m1(
+fn run_m2(
     command: Command,
     json: bool,
     engine: &CellEngine<HyperVProvider>,
@@ -125,13 +133,14 @@ fn run_m1(
             image,
             cpu_count,
             memory_mib,
+            ttl_seconds,
         } => {
             let cell = engine.create_cell(CellSpec {
                 image,
                 provider: Some("hyperv".to_owned()),
                 cpu_count,
                 memory_mib,
-                ttl_seconds: None,
+                ttl_seconds,
             })?;
             emit(&cell, json, || {
                 println!("created cell {} ({:?})", cell.id, cell.state)
@@ -180,11 +189,179 @@ fn run_m1(
                 })?;
             }
         }
+        Command::Exec {
+            cell_id,
+            credential,
+            readiness_timeout_seconds,
+            timeout_seconds,
+            max_output_bytes,
+            mut command,
+        } => {
+            let credentials = read_credentials(credential)?;
+            let program = command.remove(0);
+            let transport = PowerShellDirectTransport::system();
+            let report = engine.exec_guest(
+                &transport,
+                &credentials,
+                GuestExecRequest {
+                    cell_id,
+                    command: GuestCommand {
+                        program,
+                        args: command,
+                        timeout: Duration::from_secs(timeout_seconds),
+                        max_output_bytes,
+                    },
+                    readiness: readiness(readiness_timeout_seconds),
+                },
+            )?;
+            emit(&report, json, || {
+                println!("guest exec {}", report.operation_id)
+            })?;
+        }
+        Command::CopyIn {
+            cell_id,
+            source,
+            destination,
+            overwrite,
+            credential,
+            readiness_timeout_seconds,
+            timeout_seconds,
+            max_bytes,
+        } => {
+            let credentials = read_credentials(credential)?;
+            let transport = PowerShellDirectTransport::system();
+            let report = engine.copy_into_guest(
+                &transport,
+                &credentials,
+                GuestCopyInRequest {
+                    cell_id,
+                    source,
+                    destination,
+                    overwrite: overwrite.into(),
+                    timeout: Duration::from_secs(timeout_seconds),
+                    max_bytes,
+                    readiness: readiness(readiness_timeout_seconds),
+                },
+            )?;
+            emit(&report, json, || {
+                println!("copied into guest {}", report.operation_id)
+            })?;
+        }
+        Command::CopyOut {
+            cell_id,
+            source,
+            credential,
+            readiness_timeout_seconds,
+            timeout_seconds,
+            max_bytes,
+        } => {
+            let credentials = read_credentials(credential)?;
+            let transport = PowerShellDirectTransport::system();
+            let report = engine.copy_out_of_guest(
+                &transport,
+                &credentials,
+                GuestCopyOutRequest {
+                    cell_id,
+                    source,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    max_bytes,
+                    readiness: readiness(readiness_timeout_seconds),
+                },
+            )?;
+            emit(&report, json, || {
+                println!("artifact {}", report.operation_id)
+            })?;
+        }
+        Command::Artifact { command } => match command {
+            ArtifactCommand::Collect {
+                cell_id,
+                paths,
+                credential,
+                readiness_timeout_seconds,
+                timeout_seconds,
+                max_bytes_per_file,
+            } => {
+                let credentials = read_credentials(credential)?;
+                let transport = PowerShellDirectTransport::system();
+                let report = engine.collect_artifacts(
+                    &transport,
+                    &credentials,
+                    ArtifactCollectRequest {
+                        cell_id,
+                        sources: paths,
+                        timeout: Duration::from_secs(timeout_seconds),
+                        max_bytes_per_file,
+                        readiness: readiness(readiness_timeout_seconds),
+                    },
+                )?;
+                emit(&report, json, || {
+                    println!("artifact {}", report.operation_id)
+                })?;
+            }
+            ArtifactCommand::Inspect {
+                cell_id,
+                operation_id,
+            } => {
+                let artifact = engine.inspect_artifact(cell_id, operation_id)?;
+                emit(&artifact, json, || println!("{artifact:#?}"))?;
+            }
+        },
+        Command::Operation { command } => match command {
+            GuestOperationCommand::List { cell_id } => {
+                let response = ListEnvelope::new(engine.list_guest_operations(cell_id)?);
+                emit(&response, json, || {
+                    for operation in &response.items {
+                        println!("{}\t{:?}", operation.id, operation.phase);
+                    }
+                })?;
+            }
+            GuestOperationCommand::Inspect { operation_id } => {
+                let operation = engine.inspect_guest_operation(operation_id)?;
+                emit(&operation, json, || println!("{operation:#?}"))?;
+            }
+            GuestOperationCommand::Reconcile { operation_id } => {
+                let report = engine.reconcile_guest_operation(operation_id)?;
+                emit(&report, json, || println!("{report:#?}"))?;
+            }
+        },
+        Command::Gc => {
+            let report = engine.gc_expired()?;
+            emit(&report, json, || {
+                for entry in &report.entries {
+                    println!("{}\t{:?}", entry.cell_id, entry.disposition);
+                }
+            })?;
+        }
         Command::Doctor | Command::Provider { .. } => {
             unreachable!("handled before engine creation")
         }
     }
     Ok(())
+}
+
+fn readiness(timeout_seconds: u64) -> ReadinessPolicy {
+    ReadinessPolicy {
+        timeout: Duration::from_secs(timeout_seconds),
+        poll_interval: Duration::from_secs(2),
+    }
+}
+
+fn read_credentials(args: CredentialArgs) -> Result<GuestCredentials, Box<dyn Error>> {
+    if !args.password_stdin {
+        return Err("guest password must be provided with --password-stdin".into());
+    }
+    let mut password = Zeroizing::new(String::new());
+    std::io::stdin().take(4097).read_to_string(&mut password)?;
+    while password.ends_with(['\r', '\n']) {
+        password.pop();
+    }
+    if password.len() > 4096 || password.contains(['\r', '\n']) {
+        return Err("guest password stdin must contain one bounded line".into());
+    }
+    Ok(GuestCredentials::new(
+        args.username,
+        std::mem::take(&mut *password),
+    )?)
 }
 
 fn emit<T: Serialize>(

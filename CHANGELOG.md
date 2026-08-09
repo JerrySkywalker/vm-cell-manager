@@ -10,6 +10,9 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - Initial open-source repository governance and project bootstrap.
 - M1 ownership/state manifests, immutable VHDX registration, Hyper-V differencing-disk and VM lifecycle contracts, read-only reconciliation, versioned JSON output, and mock-driven safety tests.
 - Subprocess crash-consistency, duplicate-root, cross-installation authority, tombstone stress, and cross-process state-containment coverage for the M1 real-acceptance boundary.
+- M2 engine-issued guest authority, bounded PowerShell Direct execution and copy contracts, non-secret durable operation records, hash-bound artifact storage, TTL creation, and explicit exact-owned garbage collection.
+- Mock, schema, credential-redaction, timeout/output, artifact-crash, concurrent-GC, and Windows reparse safety coverage for M2.
 
 ### Changed
 - Hardened M1 provider authority, physical runtime containment, persisted identity binding, partial-provisioning recovery, and tombstone reconciliation before real Hyper-V acceptance.
+- Narrowed advertised Hyper-V guest transports to the implemented PowerShell Direct path; QGA, SSH, and QEMU guest mutation remain unsupported stubs.

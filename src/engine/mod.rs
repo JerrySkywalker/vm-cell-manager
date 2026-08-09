@@ -1,6 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,20 +11,33 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState};
+use crate::core::guest::{
+    ARTIFACT_SCHEMA_VERSION, ArtifactEntry, ArtifactRecord, GuestFailureClass, GuestOperationId,
+    GuestOperationKind, GuestOperationPhase, GuestOperationRecord,
+};
 use crate::core::image::{
     Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
 };
 use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObjectIdentity};
+use crate::guest::{
+    GuestActionAuthority, GuestCommand, GuestCommandResult, GuestCopyInAction, GuestCopyOutAction,
+    GuestCredentials, GuestIoError, GuestPath, GuestReadiness, GuestTransport, MAX_COPY_BYTES,
+    OverwritePolicy, ReadinessPolicy,
+};
 use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
     ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderPowerState, ProviderVm,
     ProviderVmIdentity, VmLookup,
 };
-use crate::state::{InstallationAuthority, StateError, StateStore};
+use crate::state::{InstallationAuthority, MutationGuard, StateError, StateStore};
 
 const MIN_MEMORY_MIB: u64 = 512;
 const MAX_MEMORY_MIB: u64 = 1_048_576;
 const MAX_CPU_COUNT: u16 = 64;
+const MIN_TTL_SECONDS: u64 = 1;
+const MAX_TTL_SECONDS: u64 = 31_536_000;
+const MAX_ARTIFACT_FILES: usize = 16;
+const MAX_ARTIFACT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub struct CellEngine<P> {
     state: StateStore,
@@ -51,6 +66,111 @@ pub struct CellInspection {
     pub cell: CellRecord,
     pub provider_vm: Option<ProviderVm>,
     pub reconciliation: ReconciliationStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestExecRequest {
+    pub cell_id: CellId,
+    pub command: GuestCommand,
+    pub readiness: ReadinessPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestExecReport {
+    pub schema_version: u32,
+    pub operation_id: GuestOperationId,
+    pub cell_id: CellId,
+    pub result: GuestCommandResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestCopyInRequest {
+    pub cell_id: CellId,
+    pub source: PathBuf,
+    pub destination: GuestPath,
+    pub overwrite: OverwritePolicy,
+    pub timeout: StdDuration,
+    pub max_bytes: u64,
+    pub readiness: ReadinessPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestCopyOutRequest {
+    pub cell_id: CellId,
+    pub source: GuestPath,
+    pub timeout: StdDuration,
+    pub max_bytes: u64,
+    pub readiness: ReadinessPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactCollectRequest {
+    pub cell_id: CellId,
+    pub sources: Vec<GuestPath>,
+    pub timeout: StdDuration,
+    pub max_bytes_per_file: u64,
+    pub readiness: ReadinessPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestCopyInReport {
+    pub schema_version: u32,
+    pub operation_id: GuestOperationId,
+    pub cell_id: CellId,
+    pub guest_path: GuestPath,
+    pub size: u64,
+    pub overwrite: OverwritePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactReport {
+    pub schema_version: u32,
+    pub operation_id: GuestOperationId,
+    pub cell_id: CellId,
+    pub artifact: ArtifactRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    pub schema_version: u32,
+    pub evaluated_at: chrono::DateTime<Utc>,
+    pub entries: Vec<GcEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcEntry {
+    pub cell_id: CellId,
+    pub expires_at: Option<chrono::DateTime<Utc>>,
+    pub disposition: GcDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestOperationRecoveryDisposition {
+    AlreadyTerminal,
+    InterruptedBeforeTransport,
+    ArtifactCompletionRecovered,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestOperationRecoveryReport {
+    pub schema_version: u32,
+    pub operation: GuestOperationRecord,
+    pub disposition: GuestOperationRecoveryDisposition,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcDisposition {
+    NoTtl,
+    NotExpired,
+    InFlightGuestOperation,
+    Destroyed,
+    AlreadyDestroyed,
+    OwnershipMismatch,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +226,9 @@ pub enum EngineError {
 
     #[error("unexpected provider power state: {0:?}")]
     UnexpectedPowerState(ProviderPowerState),
+
+    #[error(transparent)]
+    Guest(#[from] GuestIoError),
 }
 
 impl<P: LocalVmProvider> CellEngine<P> {
@@ -124,16 +247,17 @@ impl<P: LocalVmProvider> CellEngine<P> {
         request: RegisterImageRequest,
     ) -> Result<ImageRecord, EngineError> {
         self.require_hyperv_available()?;
-        let _guard = self.state.acquire_mutation_lock()?;
+        let _mutation = self.state.acquire_mutation_lock()?;
         let canonical = canonical_vhdx_path(&request.path)?;
         let mut handle = open_immutable_parent(&canonical)?;
         let file_size = handle
+            .file
             .metadata()
             .map_err(|error| EngineError::InvalidImage(error.to_string()))?
             .len();
         let provider_info = self.provider.inspect_image(canonical.clone())?;
         validate_base_vhdx(&canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle)?;
+        let sha256 = sha256_file(&mut handle.file)?;
 
         let variant = ImageVariant {
             provider: "hyperv".to_owned(),
@@ -185,7 +309,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
     pub fn create_cell(&self, spec: CellSpec) -> Result<CellRecord, EngineError> {
         self.require_hyperv_available()?;
         validate_cell_spec(&spec)?;
-        let _guard = self.state.acquire_mutation_lock()?;
+        let mutation = self.state.acquire_mutation_lock()?;
         let image_record = self.state.load_image(&spec.image)?;
         let variant = hyperv_variant(&image_record)?;
         let parent_handle = self.verify_registered_image(variant)?;
@@ -214,7 +338,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             id: cell_id,
             provider: "hyperv".to_owned(),
             spec,
-            image: ImageBinding::from_variant(image_record.id.clone(), variant),
+            image: ImageBinding::from_variant(
+                image_record.id.clone(),
+                image_record.guest_os,
+                variant,
+            ),
             ownership,
             provider_object: None,
             state: CellState::Creating,
@@ -246,8 +374,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             parent_path: record.image.path.clone(),
             overlay_path: record.ownership.overlay_path.clone(),
         };
-        let authority =
-            ProviderMutationAuthority::new(&record, &installation_authority, &runtime_authority);
+        let authority = ProviderMutationAuthority::new(
+            &record,
+            &installation_authority,
+            &runtime_authority,
+            &mutation,
+        );
         let overlay = match self.provider.create_overlay(&authority, &overlay_request) {
             Ok(overlay) => overlay,
             Err(error) => return self.fail_record(record, error.into()),
@@ -266,8 +398,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             overlay_path: record.ownership.overlay_path.clone(),
             memory_mib: record.spec.memory_mib,
         };
-        let authority =
-            ProviderMutationAuthority::new(&record, &installation_authority, &runtime_authority);
+        let authority = ProviderMutationAuthority::new(
+            &record,
+            &installation_authority,
+            &runtime_authority,
+            &mutation,
+        );
         let provider_identity = match self.provider.create_vm(&authority, &create_request) {
             Ok(provider_identity) => provider_identity,
             Err(error) => return self.fail_record(record, error.into()),
@@ -313,8 +449,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             expected: provider_vm,
             ownership_marker: record.ownership.provider_marker.clone(),
         };
-        let authority =
-            ProviderMutationAuthority::new(&record, &installation_authority, &runtime_authority);
+        let authority = ProviderMutationAuthority::new(
+            &record,
+            &installation_authority,
+            &runtime_authority,
+            &mutation,
+        );
         let claimed_vm = match self.provider.claim_vm(&authority, &claim_request) {
             Ok(provider_vm) => provider_vm,
             Err(error) => return self.fail_record(record, error.into()),
@@ -330,8 +470,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             expected: claimed_vm,
             cpu_count: record.spec.cpu_count,
         };
-        let authority =
-            ProviderMutationAuthority::new(&record, &installation_authority, &runtime_authority);
+        let authority = ProviderMutationAuthority::new(
+            &record,
+            &installation_authority,
+            &runtime_authority,
+            &mutation,
+        );
         let provider_vm = match self.provider.configure_vm(&authority, &configure_request) {
             Ok(provider_vm) => provider_vm,
             Err(error) => return self.fail_record(record, error.into()),
@@ -364,7 +508,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     pub fn start_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
         self.require_hyperv()?;
-        let _guard = self.state.acquire_mutation_lock()?;
+        let mutation = self.state.acquire_mutation_lock()?;
         let mut record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "start", &[CellState::Stopped, CellState::Running])?;
         let before = self.exact_owned_vm(&record)?;
@@ -381,7 +525,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let installation = self.state.acquire_installation_authority()?;
                 self.validate_local_ownership_against(&record, &installation)?;
                 let runtime = self.state.pin_cell_runtime(record.id)?;
-                let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+                let authority =
+                    ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
                 self.provider.start_vm(&authority, &before)?;
                 let after = self.exact_owned_vm(&record)?;
                 if after.power_state != ProviderPowerState::Running {
@@ -399,7 +544,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     pub fn stop_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
         self.require_hyperv()?;
-        let _guard = self.state.acquire_mutation_lock()?;
+        let mutation = self.state.acquire_mutation_lock()?;
         let mut record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "stop", &[CellState::Stopped, CellState::Running])?;
         let before = self.exact_owned_vm(&record)?;
@@ -416,7 +561,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let installation = self.state.acquire_installation_authority()?;
                 self.validate_local_ownership_against(&record, &installation)?;
                 let runtime = self.state.pin_cell_runtime(record.id)?;
-                let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+                let authority =
+                    ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
                 self.provider.stop_vm(&authority, &before)?;
                 let after = self.exact_owned_vm(&record)?;
                 if after.power_state != ProviderPowerState::Off {
@@ -432,9 +578,267 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
     }
 
+    pub fn exec_guest<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: GuestExecRequest,
+    ) -> Result<GuestExecReport, EngineError> {
+        request.command.validate()?;
+        validate_readiness_policy(request.readiness)?;
+        let cell_id = request.cell_id;
+        let command = request.command;
+        let result = self.run_guest_operation(
+            transport,
+            credentials,
+            cell_id,
+            GuestOperationKind::Exec,
+            request.readiness,
+            |authority, expected, operation_id| {
+                let result = transport.exec(authority, expected, credentials, &command)?;
+                validate_guest_command_result(&command, &result)?;
+                let completion = GuestCompletion {
+                    exit_code: Some(result.exit_code),
+                    stdout_bytes: Some(result.stdout_bytes),
+                    stderr_bytes: Some(result.stderr_bytes),
+                    artifact_id: None,
+                };
+                Ok((
+                    GuestExecReport {
+                        schema_version: 1,
+                        operation_id,
+                        cell_id,
+                        result,
+                    },
+                    completion,
+                ))
+            },
+        )?;
+        Ok(result)
+    }
+
+    pub fn copy_into_guest<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: GuestCopyInRequest,
+    ) -> Result<GuestCopyInReport, EngineError> {
+        validate_guest_timeout_and_size(request.timeout, request.max_bytes)?;
+        validate_readiness_policy(request.readiness)?;
+        let content = read_ordinary_copy_source(&request.source, request.max_bytes)?;
+        let cell_id = request.cell_id;
+        let destination = request.destination;
+        let overwrite = request.overwrite;
+        let timeout = request.timeout;
+        let size = content.len() as u64;
+        self.run_guest_operation(
+            transport,
+            credentials,
+            cell_id,
+            GuestOperationKind::CopyIn,
+            request.readiness,
+            |authority, expected, operation_id| {
+                transport.copy_in(
+                    authority,
+                    expected,
+                    credentials,
+                    GuestCopyInAction {
+                        operation_id,
+                        destination: &destination,
+                        content: &content,
+                        overwrite,
+                        timeout,
+                    },
+                )?;
+                Ok((
+                    GuestCopyInReport {
+                        schema_version: 1,
+                        operation_id,
+                        cell_id,
+                        guest_path: destination,
+                        size,
+                        overwrite,
+                    },
+                    GuestCompletion::default(),
+                ))
+            },
+        )
+    }
+
+    pub fn copy_out_of_guest<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: GuestCopyOutRequest,
+    ) -> Result<ArtifactReport, EngineError> {
+        self.collect_artifacts_with_kind(
+            transport,
+            credentials,
+            ArtifactCollectRequest {
+                cell_id: request.cell_id,
+                sources: vec![request.source],
+                timeout: request.timeout,
+                max_bytes_per_file: request.max_bytes,
+                readiness: request.readiness,
+            },
+            GuestOperationKind::CopyOut,
+        )
+    }
+
+    pub fn collect_artifacts<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: ArtifactCollectRequest,
+    ) -> Result<ArtifactReport, EngineError> {
+        self.collect_artifacts_with_kind(
+            transport,
+            credentials,
+            request,
+            GuestOperationKind::ArtifactCollect,
+        )
+    }
+
+    pub fn inspect_guest_operation(
+        &self,
+        operation_id: GuestOperationId,
+    ) -> Result<GuestOperationRecord, EngineError> {
+        Ok(self.state.load_guest_operation(operation_id)?)
+    }
+
+    pub fn list_guest_operations(
+        &self,
+        cell_id: Option<CellId>,
+    ) -> Result<Vec<GuestOperationRecord>, EngineError> {
+        let mut operations = self.state.list_guest_operations()?;
+        if let Some(cell_id) = cell_id {
+            operations.retain(|record| record.cell_id == cell_id);
+        }
+        Ok(operations)
+    }
+
+    pub fn inspect_artifact(
+        &self,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<ArtifactRecord, EngineError> {
+        Ok(self.state.load_artifact(cell_id, operation_id)?)
+    }
+
+    pub fn reconcile_guest_operation(
+        &self,
+        operation_id: GuestOperationId,
+    ) -> Result<GuestOperationRecoveryReport, EngineError> {
+        let _mutation = self.state.acquire_mutation_lock()?;
+        let mut operation = self.state.load_guest_operation(operation_id)?;
+        let (disposition, changed) = match operation.phase {
+            GuestOperationPhase::Completed | GuestOperationPhase::Failed => {
+                (GuestOperationRecoveryDisposition::AlreadyTerminal, false)
+            }
+            GuestOperationPhase::IntentRecorded => {
+                let now = Utc::now();
+                operation.phase = GuestOperationPhase::Failed;
+                operation.failure = Some(GuestFailureClass::Interrupted);
+                operation.updated_at = now;
+                operation.completed_at = Some(now);
+                self.state.save_guest_operation(&operation)?;
+                (
+                    GuestOperationRecoveryDisposition::InterruptedBeforeTransport,
+                    true,
+                )
+            }
+            GuestOperationPhase::ArtifactCommitted => {
+                let artifact_id = operation.artifact_id.ok_or_else(|| {
+                    EngineError::InvalidCellRequest(
+                        "artifact-committed operation is missing its artifact id".to_owned(),
+                    )
+                })?;
+                if artifact_id != operation.id {
+                    return Err(EngineError::InvalidCellRequest(
+                        "artifact id does not match its operation id".to_owned(),
+                    ));
+                }
+                self.state.load_artifact(operation.cell_id, artifact_id)?;
+                let now = Utc::now();
+                operation.phase = GuestOperationPhase::Completed;
+                operation.updated_at = now;
+                operation.completed_at = Some(now);
+                self.state.save_guest_operation(&operation)?;
+                (
+                    GuestOperationRecoveryDisposition::ArtifactCompletionRecovered,
+                    true,
+                )
+            }
+            GuestOperationPhase::TransportActive => {
+                (GuestOperationRecoveryDisposition::RecoveryRequired, false)
+            }
+        };
+        Ok(GuestOperationRecoveryReport {
+            schema_version: 1,
+            operation,
+            disposition,
+            changed,
+        })
+    }
+
+    pub fn gc_expired(&self) -> Result<GcReport, EngineError> {
+        self.gc_expired_at(Utc::now())
+    }
+
+    pub fn gc_expired_at(
+        &self,
+        evaluated_at: chrono::DateTime<Utc>,
+    ) -> Result<GcReport, EngineError> {
+        self.require_hyperv()?;
+        let mutation = self.state.acquire_mutation_lock()?;
+        let operations = self.state.list_guest_operations()?;
+        let mut entries = Vec::new();
+        for record in self.state.list_cells()? {
+            let disposition = match record.expires_at {
+                None => GcDisposition::NoTtl,
+                Some(expires_at) if expires_at > evaluated_at => GcDisposition::NotExpired,
+                Some(_)
+                    if operations.iter().any(|operation| {
+                        operation.cell_id == record.id && !operation.phase.is_terminal()
+                    }) =>
+                {
+                    GcDisposition::InFlightGuestOperation
+                }
+                Some(_) => match self.destroy_cell_locked(record.id, &mutation) {
+                    Ok(report) if report.changed => GcDisposition::Destroyed,
+                    Ok(_) => GcDisposition::AlreadyDestroyed,
+                    Err(
+                        EngineError::OwnershipNotProven(_)
+                        | EngineError::ProviderDrift(_)
+                        | EngineError::UnexpectedPowerState(_),
+                    ) => GcDisposition::OwnershipMismatch,
+                    Err(_) => GcDisposition::Failed,
+                },
+            };
+            entries.push(GcEntry {
+                cell_id: record.id,
+                expires_at: record.expires_at,
+                disposition,
+            });
+        }
+        Ok(GcReport {
+            schema_version: 1,
+            evaluated_at,
+            entries,
+        })
+    }
+
     pub fn destroy_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
         self.require_hyperv()?;
-        let _guard = self.state.acquire_mutation_lock()?;
+        let mutation = self.state.acquire_mutation_lock()?;
+        self.destroy_cell_locked(cell_id, &mutation)
+    }
+
+    fn destroy_cell_locked(
+        &self,
+        cell_id: CellId,
+        mutation: &MutationGuard,
+    ) -> Result<OperationReport, EngineError> {
         let mut record = self.state.load_cell(cell_id)?;
         if record.state == CellState::Destroyed {
             let (_, reconciliation) = self.reconcile_record(&record)?;
@@ -478,7 +882,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                         ownership_marker: record.ownership.provider_marker.clone(),
                     };
                     let authority =
-                        ProviderMutationAuthority::new(&record, &installation, &runtime);
+                        ProviderMutationAuthority::new(&record, &installation, &runtime, mutation);
                     vm = self.provider.claim_vm(&authority, &claim_request)?;
                     prove_creation_identity(&record, &vm, true)?;
                     record.phase = CellPhase::ProviderObjectClaimed;
@@ -515,7 +919,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
             if vm.power_state != ProviderPowerState::Off {
                 self.validate_local_ownership_against(&record, &installation)?;
-                let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+                let authority =
+                    ProviderMutationAuthority::new(&record, &installation, &runtime, mutation);
                 self.provider.stop_vm(&authority, &vm)?;
                 vm = self
                     .provider
@@ -532,7 +937,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
             }
             self.validate_local_ownership_against(&record, &installation)?;
             prove_destroy_identity(&record, &vm)?;
-            let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+            let authority =
+                ProviderMutationAuthority::new(&record, &installation, &runtime, mutation);
             self.provider.remove_vm(&authority, &vm)?;
             if self
                 .provider
@@ -603,7 +1009,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
     }
 
-    fn verify_registered_image(&self, variant: &ImageVariant) -> Result<File, EngineError> {
+    fn verify_registered_image(
+        &self,
+        variant: &ImageVariant,
+    ) -> Result<ImmutableParentGuard, EngineError> {
         let canonical = canonical_vhdx_path(&variant.path)?;
         if !paths_equal(&canonical, &variant.path) {
             return Err(EngineError::InvalidImage(
@@ -612,6 +1021,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         let mut handle = open_immutable_parent(&canonical)?;
         let file_size = handle
+            .file
             .metadata()
             .map_err(|error| EngineError::InvalidImage(error.to_string()))?
             .len();
@@ -622,7 +1032,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         let provider_info = self.provider.inspect_image(canonical.clone())?;
         validate_base_vhdx(&canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle)?;
+        let sha256 = sha256_file(&mut handle.file)?;
         if sha256 != variant.sha256 {
             return Err(EngineError::InvalidImage(
                 "registered image SHA-256 changed".to_owned(),
@@ -861,12 +1271,402 @@ impl<P: LocalVmProvider> CellEngine<P> {
         Ok(())
     }
 
+    fn collect_artifacts_with_kind<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: ArtifactCollectRequest,
+        kind: GuestOperationKind,
+    ) -> Result<ArtifactReport, EngineError> {
+        validate_guest_timeout_and_size(request.timeout, request.max_bytes_per_file)?;
+        validate_readiness_policy(request.readiness)?;
+        if request.sources.is_empty() || request.sources.len() > MAX_ARTIFACT_FILES {
+            return Err(EngineError::InvalidCellRequest(format!(
+                "artifact collection requires between 1 and {MAX_ARTIFACT_FILES} guest files"
+            )));
+        }
+        let maximum_total = request
+            .max_bytes_per_file
+            .checked_mul(request.sources.len() as u64)
+            .ok_or_else(|| {
+                EngineError::InvalidCellRequest("artifact collection size overflow".to_owned())
+            })?;
+        if maximum_total > MAX_ARTIFACT_TOTAL_BYTES {
+            return Err(EngineError::InvalidCellRequest(format!(
+                "artifact collection maximum exceeds {MAX_ARTIFACT_TOTAL_BYTES} bytes"
+            )));
+        }
+        let cell_id = request.cell_id;
+        let sources = request.sources;
+        let timeout = request.timeout;
+        let max_bytes = request.max_bytes_per_file;
+        self.run_guest_operation(
+            transport,
+            credentials,
+            cell_id,
+            kind,
+            request.readiness,
+            |authority, expected, operation_id| {
+                let artifact_guard = self.state.prepare_artifact_root(cell_id, operation_id)?;
+                let mut entries = Vec::with_capacity(sources.len());
+                for (index, source) in sources.iter().enumerate() {
+                    let bytes = transport.copy_out(
+                        authority,
+                        expected,
+                        credentials,
+                        GuestCopyOutAction {
+                            operation_id,
+                            source,
+                            max_bytes,
+                            timeout,
+                        },
+                    )?;
+                    if bytes.len() as u64 > max_bytes {
+                        return Err(GuestIoError::InvalidResponse.into());
+                    }
+                    let host_relative_path =
+                        self.state
+                            .write_artifact_file(&artifact_guard, index, &bytes)?;
+                    entries.push(ArtifactEntry {
+                        guest_path: source.as_str().to_owned(),
+                        host_relative_path,
+                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        size: bytes.len() as u64,
+                    });
+                }
+                let artifact = ArtifactRecord {
+                    schema_version: ARTIFACT_SCHEMA_VERSION,
+                    id: operation_id,
+                    cell_id,
+                    created_at: Utc::now(),
+                    entries,
+                };
+                self.state.save_artifact_new(&artifact_guard, &artifact)?;
+                Ok((
+                    ArtifactReport {
+                        schema_version: 1,
+                        operation_id,
+                        cell_id,
+                        artifact,
+                    },
+                    GuestCompletion {
+                        artifact_id: Some(operation_id),
+                        ..GuestCompletion::default()
+                    },
+                ))
+            },
+        )
+    }
+
+    fn run_guest_operation<G, T, F>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        cell_id: CellId,
+        kind: GuestOperationKind,
+        readiness: ReadinessPolicy,
+        action: F,
+    ) -> Result<T, EngineError>
+    where
+        G: GuestTransport,
+        F: FnOnce(
+            &GuestActionAuthority<'_>,
+            &ProviderVm,
+            GuestOperationId,
+        ) -> Result<(T, GuestCompletion), EngineError>,
+    {
+        self.require_hyperv()?;
+        let mutation = self.state.acquire_mutation_lock()?;
+        let record = self.state.load_cell(cell_id)?;
+        require_lifecycle_state(&record, "run a guest operation on", &[CellState::Running])?;
+        if record.phase != CellPhase::Ready {
+            return Err(EngineError::InvalidCellRequest(
+                "guest operations require a ready cell".to_owned(),
+            ));
+        }
+        if record.image.guest_os != Some(GuestOs::Windows) {
+            return Err(EngineError::InvalidCellRequest(
+                "PowerShell Direct requires a cell bound to a Windows image".to_owned(),
+            ));
+        }
+        let expected = self.exact_owned_vm(&record)?;
+        if expected.power_state != ProviderPowerState::Running {
+            return Err(EngineError::UnexpectedPowerState(expected.power_state));
+        }
+
+        let mut operation = GuestOperationRecord::intent(cell_id, kind, Utc::now());
+        self.state.save_guest_operation(&operation)?;
+        let execution = (|| {
+            let installation = self.state.acquire_installation_authority()?;
+            self.validate_local_ownership_against(&record, &installation)?;
+            let runtime = self.state.pin_cell_runtime(cell_id)?;
+            let authority =
+                GuestActionAuthority::new(&record, &expected, &installation, &runtime, &mutation)?;
+            operation.phase = GuestOperationPhase::TransportActive;
+            operation.updated_at = Utc::now();
+            self.state.save_guest_operation(&operation)?;
+            wait_for_guest_ready(transport, &authority, &expected, credentials, readiness)?;
+            action(&authority, &expected, operation.id)
+        })();
+
+        match execution {
+            Ok((value, completion)) => {
+                operation.phase = if completion.artifact_id.is_some() {
+                    GuestOperationPhase::ArtifactCommitted
+                } else {
+                    GuestOperationPhase::Completed
+                };
+                operation.updated_at = Utc::now();
+                operation.exit_code = completion.exit_code;
+                operation.stdout_bytes = completion.stdout_bytes;
+                operation.stderr_bytes = completion.stderr_bytes;
+                operation.artifact_id = completion.artifact_id;
+                if operation.phase == GuestOperationPhase::ArtifactCommitted {
+                    self.state.save_guest_operation(&operation)?;
+                    operation.phase = GuestOperationPhase::Completed;
+                    operation.updated_at = Utc::now();
+                }
+                operation.completed_at = Some(operation.updated_at);
+                self.state.save_guest_operation(&operation)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let (failure, terminal) = guest_failure_class(&error);
+                operation.failure = Some(failure);
+                operation.updated_at = Utc::now();
+                if terminal {
+                    operation.phase = GuestOperationPhase::Failed;
+                    operation.completed_at = Some(operation.updated_at);
+                }
+                self.state.save_guest_operation(&operation)?;
+                Err(error)
+            }
+        }
+    }
+
     fn fail_record<T>(&self, mut record: CellRecord, error: EngineError) -> Result<T, EngineError> {
         record.state = CellState::Failed;
         record.updated_at = Utc::now();
         record.last_error = Some(error.to_string());
         self.state.save_cell(&record)?;
         Err(error)
+    }
+}
+
+#[derive(Default)]
+struct GuestCompletion {
+    exit_code: Option<i32>,
+    stdout_bytes: Option<u64>,
+    stderr_bytes: Option<u64>,
+    artifact_id: Option<GuestOperationId>,
+}
+
+fn wait_for_guest_ready<G: GuestTransport>(
+    transport: &G,
+    authority: &GuestActionAuthority<'_>,
+    expected: &ProviderVm,
+    credentials: &GuestCredentials,
+    policy: ReadinessPolicy,
+) -> Result<(), GuestIoError> {
+    validate_readiness_policy(policy).map_err(|_| {
+        GuestIoError::InvalidRequest("readiness policy is outside the supported bounds")
+    })?;
+    let deadline = Instant::now() + policy.timeout;
+    let mut last = GuestReadiness::GuestNotReady;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(match last {
+                GuestReadiness::AuthenticationFailed => GuestIoError::AuthenticationFailed,
+                GuestReadiness::SessionFailed => GuestIoError::SessionFailed,
+                _ => GuestIoError::GuestNotReady,
+            });
+        }
+        let attempt_timeout = remaining.min(StdDuration::from_secs(15));
+        match transport.probe_ready(authority, expected, credentials, attempt_timeout)? {
+            GuestReadiness::Ready => return Ok(()),
+            GuestReadiness::AuthenticationFailed => {
+                return Err(GuestIoError::AuthenticationFailed);
+            }
+            status @ (GuestReadiness::GuestNotReady | GuestReadiness::SessionFailed) => {
+                last = status;
+            }
+        }
+        let sleep_for = policy
+            .poll_interval
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+        }
+    }
+}
+
+fn validate_readiness_policy(policy: ReadinessPolicy) -> Result<(), EngineError> {
+    if policy.timeout.is_zero()
+        || policy.timeout > StdDuration::from_secs(crate::guest::MAX_ACTION_TIMEOUT_SECONDS)
+        || policy.poll_interval > policy.timeout
+    {
+        return Err(EngineError::InvalidCellRequest(
+            "readiness timeout/poll interval is outside the supported bounds".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_guest_timeout_and_size(
+    timeout: StdDuration,
+    max_bytes: u64,
+) -> Result<(), EngineError> {
+    if timeout.is_zero()
+        || timeout > StdDuration::from_secs(crate::guest::MAX_ACTION_TIMEOUT_SECONDS)
+    {
+        return Err(EngineError::InvalidCellRequest(
+            "guest copy timeout is outside the supported bounds".to_owned(),
+        ));
+    }
+    if max_bytes == 0 || max_bytes > MAX_COPY_BYTES {
+        return Err(EngineError::InvalidCellRequest(format!(
+            "guest copy size must be between 1 and {MAX_COPY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_guest_command_result(
+    command: &GuestCommand,
+    result: &GuestCommandResult,
+) -> Result<(), EngineError> {
+    let stdout_bytes = result.stdout.len() as u64;
+    let stderr_bytes = result.stderr.len() as u64;
+    if result.encoding != "utf-8"
+        || result.stdout_bytes != stdout_bytes
+        || result.stderr_bytes != stderr_bytes
+        || stdout_bytes.saturating_add(stderr_bytes) > command.max_output_bytes
+        || result.truncated
+    {
+        return Err(GuestIoError::InvalidResponse.into());
+    }
+    Ok(())
+}
+
+fn read_ordinary_copy_source(path: &Path, max_bytes: u64) -> Result<Vec<u8>, EngineError> {
+    if max_bytes == 0 || max_bytes > MAX_COPY_BYTES {
+        return Err(EngineError::InvalidCellRequest(format!(
+            "copy-in size must be between 1 and {MAX_COPY_BYTES} bytes"
+        )));
+    }
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() || !ancestor.exists() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(ancestor).map_err(|_| {
+            EngineError::InvalidCellRequest("copy-in source metadata is unavailable".to_owned())
+        })?;
+        if is_reparse_point(&metadata) {
+            return Err(GuestIoError::PathViolation.into());
+        }
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| EngineError::InvalidCellRequest("copy-in source is absent".to_owned()))?;
+    #[cfg(windows)]
+    let _ancestor_handles = pin_ordinary_copy_source_ancestors(&canonical)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(&canonical).map_err(|_| {
+        EngineError::InvalidCellRequest("copy-in source could not be pinned".to_owned())
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        EngineError::InvalidCellRequest("copy-in source metadata is unavailable".to_owned())
+    })?;
+    if !metadata.is_file() || is_reparse_point(&metadata) || metadata.len() > max_bytes {
+        return Err(GuestIoError::PathViolation.into());
+    }
+    if path
+        .canonicalize()
+        .map(|rechecked| !paths_equal(&rechecked, &canonical))
+        .unwrap_or(true)
+    {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| EngineError::InvalidCellRequest("copy-in source read failed".to_owned()))?;
+    if bytes.len() as u64 > max_bytes
+        || file.metadata().map(|value| value.len()).ok() != Some(bytes.len() as u64)
+    {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn pin_ordinary_copy_source_ancestors(path: &Path) -> Result<Vec<File>, EngineError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut ancestors = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut handles = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let handle = options
+            .open(ancestor)
+            .map_err(|_| GuestIoError::PathViolation)?;
+        let metadata = handle.metadata().map_err(|_| GuestIoError::PathViolation)?;
+        if !metadata.is_dir() || is_reparse_point(&metadata) {
+            return Err(GuestIoError::PathViolation.into());
+        }
+        handles.push(handle);
+    }
+    Ok(handles)
+}
+
+fn guest_failure_class(error: &EngineError) -> (GuestFailureClass, bool) {
+    match error {
+        EngineError::Guest(GuestIoError::GuestNotReady) => (GuestFailureClass::GuestNotReady, true),
+        EngineError::Guest(GuestIoError::AuthenticationFailed) => {
+            (GuestFailureClass::Authentication, true)
+        }
+        EngineError::Guest(GuestIoError::SessionFailed) => (GuestFailureClass::Session, true),
+        EngineError::Guest(GuestIoError::OwnershipChanged)
+        | EngineError::OwnershipNotProven(_)
+        | EngineError::ProviderDrift(_) => (GuestFailureClass::OwnershipChanged, true),
+        EngineError::Guest(GuestIoError::PathViolation)
+        | EngineError::Guest(GuestIoError::InvalidRequest(_)) => {
+            (GuestFailureClass::PathViolation, true)
+        }
+        EngineError::Guest(GuestIoError::Timeout) => (GuestFailureClass::Timeout, false),
+        EngineError::Guest(GuestIoError::OutputLimit) => (GuestFailureClass::OutputLimit, false),
+        EngineError::Guest(GuestIoError::PartialCopy) => (GuestFailureClass::PartialCopy, false),
+        EngineError::Guest(GuestIoError::InvalidResponse) => {
+            (GuestFailureClass::InvalidEncoding, false)
+        }
+        _ => (GuestFailureClass::Unknown, false),
     }
 }
 
@@ -888,10 +1688,12 @@ fn validate_cell_spec(spec: &CellSpec) -> Result<(), EngineError> {
             "memory_mib must be between {MIN_MEMORY_MIB} and {MAX_MEMORY_MIB}"
         )));
     }
-    if spec.ttl_seconds.is_some() {
-        return Err(EngineError::InvalidCellRequest(
-            "TTL is not implemented until M2".to_owned(),
-        ));
+    if let Some(ttl_seconds) = spec.ttl_seconds {
+        if !(MIN_TTL_SECONDS..=MAX_TTL_SECONDS).contains(&ttl_seconds) {
+            return Err(EngineError::InvalidCellRequest(format!(
+                "ttl_seconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"
+            )));
+        }
     }
     Ok(())
 }
@@ -946,7 +1748,20 @@ fn canonical_vhdx_path(path: &Path) -> Result<PathBuf, EngineError> {
         .map_err(|error| EngineError::InvalidImage(error.to_string()))
 }
 
-fn open_immutable_parent(path: &Path) -> Result<File, EngineError> {
+struct ImmutableParentGuard {
+    file: File,
+    _ancestor_handles: Vec<File>,
+}
+
+fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineError> {
+    #[cfg(windows)]
+    let ancestor_handles = pin_ordinary_copy_source_ancestors(path).map_err(|_| {
+        EngineError::InvalidImage(
+            "base image ancestors could not be pinned as ordinary directories".to_owned(),
+        )
+    })?;
+    #[cfg(not(windows))]
+    let ancestor_handles = Vec::new();
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -954,11 +1769,35 @@ fn open_immutable_parent(path: &Path) -> Result<File, EngineError> {
         use std::os::windows::fs::OpenOptionsExt;
 
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        options.share_mode(FILE_SHARE_READ);
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    options
+    let file = options
         .open(path)
-        .map_err(|error| EngineError::InvalidImage(format!("{}: {error}", path.display())))
+        .map_err(|error| EngineError::InvalidImage(format!("{}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| EngineError::InvalidImage(error.to_string()))?;
+    if !metadata.is_file() || is_reparse_point(&metadata) {
+        return Err(EngineError::InvalidImage(
+            "base image handle is not an ordinary file".to_owned(),
+        ));
+    }
+    if path
+        .canonicalize()
+        .map(|rechecked| !paths_equal(&rechecked, path))
+        .unwrap_or(true)
+    {
+        return Err(EngineError::InvalidImage(
+            "base image identity changed while acquiring its immutable handle".to_owned(),
+        ));
+    }
+    Ok(ImmutableParentGuard {
+        file,
+        _ancestor_handles: ancestor_handles,
+    })
 }
 
 fn sha256_file(file: &mut File) -> Result<String, EngineError> {
@@ -1255,6 +2094,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
@@ -1592,6 +2432,200 @@ mod tests {
             cpu_count: 2,
             memory_mib: 4096,
             ttl_seconds: None,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InjectedGuestFailure {
+        Timeout,
+        PartialCopy,
+        OutputLimit,
+        Transport,
+    }
+
+    #[derive(Debug)]
+    struct MockGuestState {
+        calls: Vec<&'static str>,
+        readiness: VecDeque<GuestReadiness>,
+        failure: Option<InjectedGuestFailure>,
+        exec_result: GuestCommandResult,
+        copy_in: Option<(GuestPath, Vec<u8>, OverwritePolicy)>,
+        copy_out: VecDeque<Vec<u8>>,
+        drift_on_probe: bool,
+    }
+
+    impl Default for MockGuestState {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                readiness: VecDeque::from([GuestReadiness::Ready]),
+                failure: None,
+                exec_result: GuestCommandResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    encoding: "utf-8".to_owned(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    truncated: false,
+                },
+                copy_in: None,
+                copy_out: VecDeque::new(),
+                drift_on_probe: false,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockGuest {
+        provider: Arc<Mutex<MockState>>,
+        state: Arc<Mutex<MockGuestState>>,
+    }
+
+    impl MockGuest {
+        fn new(provider: Arc<Mutex<MockState>>) -> Self {
+            Self {
+                provider,
+                state: Arc::new(Mutex::new(MockGuestState::default())),
+            }
+        }
+
+        fn take_failure(&self) -> Result<(), GuestIoError> {
+            match self.state.lock().unwrap().failure.take() {
+                None => Ok(()),
+                Some(InjectedGuestFailure::Timeout) => Err(GuestIoError::Timeout),
+                Some(InjectedGuestFailure::PartialCopy) => Err(GuestIoError::PartialCopy),
+                Some(InjectedGuestFailure::OutputLimit) => Err(GuestIoError::OutputLimit),
+                Some(InjectedGuestFailure::Transport) => Err(GuestIoError::Transport),
+            }
+        }
+
+        fn prove_current(&self, expected: &ProviderVm) -> Result<(), GuestIoError> {
+            if self.provider.lock().unwrap().vm.as_ref() == Some(expected) {
+                Ok(())
+            } else {
+                Err(GuestIoError::OwnershipChanged)
+            }
+        }
+    }
+
+    impl GuestTransport for MockGuest {
+        fn name(&self) -> &'static str {
+            "mock-guest"
+        }
+
+        fn probe_ready(
+            &self,
+            authority: &GuestActionAuthority<'_>,
+            expected: &ProviderVm,
+            _credentials: &GuestCredentials,
+            _timeout: StdDuration,
+        ) -> Result<GuestReadiness, GuestIoError> {
+            authority.validate(expected)?;
+            let drift = {
+                let mut state = self.state.lock().unwrap();
+                state.calls.push("probe_ready");
+                std::mem::take(&mut state.drift_on_probe)
+            };
+            if drift {
+                self.provider
+                    .lock()
+                    .unwrap()
+                    .vm
+                    .as_mut()
+                    .unwrap()
+                    .ownership_marker = "foreign-guest-race".to_owned();
+            }
+            self.prove_current(expected)?;
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .readiness
+                .pop_front()
+                .unwrap_or(GuestReadiness::GuestNotReady))
+        }
+
+        fn exec(
+            &self,
+            authority: &GuestActionAuthority<'_>,
+            expected: &ProviderVm,
+            _credentials: &GuestCredentials,
+            _command: &GuestCommand,
+        ) -> Result<GuestCommandResult, GuestIoError> {
+            authority.validate(expected)?;
+            self.prove_current(expected)?;
+            self.state.lock().unwrap().calls.push("exec");
+            self.take_failure()?;
+            Ok(self.state.lock().unwrap().exec_result.clone())
+        }
+
+        fn copy_in(
+            &self,
+            authority: &GuestActionAuthority<'_>,
+            expected: &ProviderVm,
+            _credentials: &GuestCredentials,
+            action: GuestCopyInAction<'_>,
+        ) -> Result<(), GuestIoError> {
+            authority.validate(expected)?;
+            self.prove_current(expected)?;
+            self.state.lock().unwrap().calls.push("copy_in");
+            self.take_failure()?;
+            self.state.lock().unwrap().copy_in = Some((
+                action.destination.clone(),
+                action.content.to_vec(),
+                action.overwrite,
+            ));
+            Ok(())
+        }
+
+        fn copy_out(
+            &self,
+            authority: &GuestActionAuthority<'_>,
+            expected: &ProviderVm,
+            _credentials: &GuestCredentials,
+            action: GuestCopyOutAction<'_>,
+        ) -> Result<Vec<u8>, GuestIoError> {
+            authority.validate(expected)?;
+            self.prove_current(expected)?;
+            self.state.lock().unwrap().calls.push("copy_out");
+            self.take_failure()?;
+            let bytes = self
+                .state
+                .lock()
+                .unwrap()
+                .copy_out
+                .pop_front()
+                .unwrap_or_default();
+            if bytes.len() as u64 > action.max_bytes {
+                return Err(GuestIoError::OutputLimit);
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn running_fixture() -> (
+        tempfile::TempDir,
+        CellEngine<MockHyperV>,
+        CellRecord,
+        MockGuest,
+        GuestCredentials,
+    ) {
+        let (directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id)).unwrap();
+        engine.start_cell(cell.id).unwrap();
+        let cell = engine.state.load_cell(cell.id).unwrap();
+        let guest = MockGuest::new(engine.provider.state.clone());
+        let credentials =
+            GuestCredentials::new("Administrator".to_owned(), "credential-sentinel".to_owned())
+                .unwrap();
+        (directory, engine, cell, guest, credentials)
+    }
+
+    fn readiness_for_test() -> ReadinessPolicy {
+        ReadinessPolicy {
+            timeout: StdDuration::from_millis(100),
+            poll_interval: StdDuration::ZERO,
         }
     }
 
@@ -2480,5 +3514,526 @@ mod tests {
             .filter(|call| **call == "start_vm")
             .count();
         assert_eq!(starts_before, starts_after);
+    }
+
+    #[test]
+    fn guest_exec_retries_readiness_returns_nonzero_and_persists_no_secrets() {
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness =
+                VecDeque::from([GuestReadiness::GuestNotReady, GuestReadiness::Ready]);
+            state.exec_result = GuestCommandResult {
+                exit_code: 7,
+                stdout: "utf8-✓".to_owned(),
+                stderr: "expected nonzero".to_owned(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: "utf8-✓".len() as u64,
+                stderr_bytes: "expected nonzero".len() as u64,
+                truncated: false,
+            };
+        }
+        let report = engine
+            .exec_guest(
+                &guest,
+                &credentials,
+                GuestExecRequest {
+                    cell_id: cell.id,
+                    command: GuestCommand {
+                        program: "cmd.exe".to_owned(),
+                        args: vec!["/c".to_owned(), "argument-token-sentinel".to_owned()],
+                        timeout: StdDuration::from_secs(1),
+                        max_output_bytes: 1024,
+                    },
+                    readiness: readiness_for_test(),
+                },
+            )
+            .unwrap();
+        assert_eq!(report.result.exit_code, 7);
+        assert_eq!(report.result.stdout, "utf8-✓");
+        let operation = engine.inspect_guest_operation(report.operation_id).unwrap();
+        assert_eq!(operation.phase, GuestOperationPhase::Completed);
+        assert_eq!(operation.exit_code, Some(7));
+        let persisted = serde_json::to_string(&operation).unwrap();
+        assert!(!persisted.contains("credential-sentinel"));
+        assert!(!persisted.contains("argument-token-sentinel"));
+        assert_eq!(
+            guest
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|call| **call == "probe_ready")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn guest_operation_reconcile_never_replays_and_validates_committed_artifacts() {
+        let (_directory, engine, cell, _guest, _credentials) = running_fixture();
+
+        let intent = GuestOperationRecord::intent(cell.id, GuestOperationKind::Exec, Utc::now());
+        engine.state.save_guest_operation(&intent).unwrap();
+        let report = engine.reconcile_guest_operation(intent.id).unwrap();
+        assert_eq!(
+            report.disposition,
+            GuestOperationRecoveryDisposition::InterruptedBeforeTransport
+        );
+        assert!(report.changed);
+        assert_eq!(report.operation.phase, GuestOperationPhase::Failed);
+        assert_eq!(
+            report.operation.failure,
+            Some(GuestFailureClass::Interrupted)
+        );
+
+        let mut active =
+            GuestOperationRecord::intent(cell.id, GuestOperationKind::CopyIn, Utc::now());
+        active.phase = GuestOperationPhase::TransportActive;
+        engine.state.save_guest_operation(&active).unwrap();
+        let report = engine.reconcile_guest_operation(active.id).unwrap();
+        assert_eq!(
+            report.disposition,
+            GuestOperationRecoveryDisposition::RecoveryRequired
+        );
+        assert!(!report.changed);
+        assert_eq!(report.operation.phase, GuestOperationPhase::TransportActive);
+
+        let mut committed =
+            GuestOperationRecord::intent(cell.id, GuestOperationKind::ArtifactCollect, Utc::now());
+        committed.phase = GuestOperationPhase::ArtifactCommitted;
+        committed.artifact_id = Some(committed.id);
+        let artifact_guard = engine
+            .state
+            .prepare_artifact_root(cell.id, committed.id)
+            .unwrap();
+        let host_relative_path = engine
+            .state
+            .write_artifact_file(&artifact_guard, 0, b"recovery-artifact")
+            .unwrap();
+        let artifact_file = engine.state.root().join(&host_relative_path);
+        let artifact = ArtifactRecord {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            id: committed.id,
+            cell_id: cell.id,
+            created_at: Utc::now(),
+            entries: vec![ArtifactEntry {
+                guest_path: "recovered.bin".to_owned(),
+                host_relative_path,
+                sha256: format!("{:x}", Sha256::digest(b"recovery-artifact")),
+                size: 17,
+            }],
+        };
+        engine
+            .state
+            .save_artifact_new(&artifact_guard, &artifact)
+            .unwrap();
+        engine.state.save_guest_operation(&committed).unwrap();
+        let report = engine.reconcile_guest_operation(committed.id).unwrap();
+        assert_eq!(
+            report.disposition,
+            GuestOperationRecoveryDisposition::ArtifactCompletionRecovered
+        );
+        assert!(report.changed);
+        assert_eq!(report.operation.phase, GuestOperationPhase::Completed);
+
+        fs::write(artifact_file, b"tampered").unwrap();
+        let mut interrupted_completion = report.operation;
+        interrupted_completion.phase = GuestOperationPhase::ArtifactCommitted;
+        interrupted_completion.completed_at = None;
+        engine
+            .state
+            .save_guest_operation(&interrupted_completion)
+            .unwrap();
+        assert!(matches!(
+            engine.reconcile_guest_operation(interrupted_completion.id),
+            Err(EngineError::State(StateError::ArtifactIntegrity { .. }))
+        ));
+    }
+
+    #[test]
+    fn credential_failure_is_terminal_but_timeout_and_large_output_are_nonreplayable() {
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        guest.state.lock().unwrap().readiness =
+            VecDeque::from([GuestReadiness::AuthenticationFailed]);
+        let request = || GuestExecRequest {
+            cell_id: cell.id,
+            command: GuestCommand {
+                program: "cmd.exe".to_owned(),
+                args: vec!["/c".to_owned(), "exit 0".to_owned()],
+                timeout: StdDuration::from_secs(1),
+                max_output_bytes: 16,
+            },
+            readiness: readiness_for_test(),
+        };
+        assert!(matches!(
+            engine.exec_guest(&guest, &credentials, request()),
+            Err(EngineError::Guest(GuestIoError::AuthenticationFailed))
+        ));
+        let mut operations = engine.list_guest_operations(Some(cell.id)).unwrap();
+        assert_eq!(operations.pop().unwrap().phase, GuestOperationPhase::Failed);
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready]);
+            state.failure = Some(InjectedGuestFailure::Timeout);
+        }
+        assert!(matches!(
+            engine.exec_guest(&guest, &credentials, request()),
+            Err(EngineError::Guest(GuestIoError::Timeout))
+        ));
+        operations = engine.list_guest_operations(Some(cell.id)).unwrap();
+        assert!(operations.iter().any(|operation| {
+            operation.phase == GuestOperationPhase::TransportActive
+                && operation.failure == Some(GuestFailureClass::Timeout)
+        }));
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready]);
+            state.failure = None;
+            state.exec_result = GuestCommandResult {
+                exit_code: 0,
+                stdout: "too-large-for-limit".to_owned(),
+                stderr: String::new(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: "too-large-for-limit".len() as u64,
+                stderr_bytes: 0,
+                truncated: false,
+            };
+        }
+        assert!(matches!(
+            engine.exec_guest(&guest, &credentials, request()),
+            Err(EngineError::Guest(GuestIoError::InvalidResponse))
+        ));
+        assert!(
+            engine
+                .list_guest_operations(Some(cell.id))
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.phase == GuestOperationPhase::TransportActive
+                        && operation.failure == Some(GuestFailureClass::InvalidEncoding)
+                })
+        );
+
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready]);
+            state.failure = Some(InjectedGuestFailure::OutputLimit);
+        }
+        assert!(matches!(
+            engine.exec_guest(&guest, &credentials, request()),
+            Err(EngineError::Guest(GuestIoError::OutputLimit))
+        ));
+        assert!(
+            engine
+                .list_guest_operations(Some(cell.id))
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.phase == GuestOperationPhase::TransportActive
+                        && operation.failure == Some(GuestFailureClass::OutputLimit)
+                })
+        );
+
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready]);
+            state.failure = Some(InjectedGuestFailure::Transport);
+        }
+        assert!(matches!(
+            engine.exec_guest(&guest, &credentials, request()),
+            Err(EngineError::Guest(GuestIoError::Transport))
+        ));
+        assert!(
+            engine
+                .list_guest_operations(Some(cell.id))
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.phase == GuestOperationPhase::TransportActive
+                        && operation.failure == Some(GuestFailureClass::Unknown)
+                })
+        );
+    }
+
+    #[test]
+    fn provider_drift_between_proof_and_guest_action_fails_before_exec() {
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        guest.state.lock().unwrap().drift_on_probe = true;
+        assert!(matches!(
+            engine.exec_guest(
+                &guest,
+                &credentials,
+                GuestExecRequest {
+                    cell_id: cell.id,
+                    command: GuestCommand {
+                        program: "cmd.exe".to_owned(),
+                        args: Vec::new(),
+                        timeout: StdDuration::from_secs(1),
+                        max_output_bytes: 1024,
+                    },
+                    readiness: readiness_for_test(),
+                }
+            ),
+            Err(EngineError::Guest(GuestIoError::OwnershipChanged))
+        ));
+        let state = guest.state.lock().unwrap();
+        assert!(!state.calls.contains(&"exec"));
+        drop(state);
+        let operation = engine
+            .list_guest_operations(Some(cell.id))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(operation.phase, GuestOperationPhase::Failed);
+        assert_eq!(operation.failure, Some(GuestFailureClass::OwnershipChanged));
+    }
+
+    #[test]
+    fn installation_rotation_blocks_guest_authority_before_transport() {
+        let (directory, engine, cell, guest, credentials) = running_fixture();
+        let replacement = crate::state::InstallationRecord {
+            schema_version: crate::state::INSTALL_SCHEMA_VERSION,
+            install_id: Uuid::new_v4(),
+        };
+        fs::write(
+            directory.path().join("state").join("installation.json"),
+            serde_json::to_vec(&replacement).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.exec_guest(
+                &guest,
+                &credentials,
+                GuestExecRequest {
+                    cell_id: cell.id,
+                    command: GuestCommand {
+                        program: "cmd.exe".to_owned(),
+                        args: Vec::new(),
+                        timeout: StdDuration::from_secs(1),
+                        max_output_bytes: 1024,
+                    },
+                    readiness: readiness_for_test(),
+                }
+            ),
+            Err(EngineError::OwnershipNotProven(_))
+        ));
+        assert!(guest.state.lock().unwrap().calls.is_empty());
+        assert!(
+            engine
+                .list_guest_operations(Some(cell.id))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn copy_in_is_handle_bounded_and_partial_copy_is_nonreplayable() {
+        let (directory, engine, cell, guest, credentials) = running_fixture();
+        let source = directory.path().join("input.bin");
+        fs::write(&source, b"copy-content").unwrap();
+        let destination = GuestPath::parse("inputs/data.bin").unwrap();
+        let report = engine
+            .copy_into_guest(
+                &guest,
+                &credentials,
+                GuestCopyInRequest {
+                    cell_id: cell.id,
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    overwrite: OverwritePolicy::Deny,
+                    timeout: StdDuration::from_secs(1),
+                    max_bytes: 1024,
+                    readiness: readiness_for_test(),
+                },
+            )
+            .unwrap();
+        assert_eq!(report.size, 12);
+        assert_eq!(
+            guest.state.lock().unwrap().copy_in,
+            Some((
+                destination.clone(),
+                b"copy-content".to_vec(),
+                OverwritePolicy::Deny
+            ))
+        );
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready]);
+            state.failure = Some(InjectedGuestFailure::PartialCopy);
+        }
+        assert!(matches!(
+            engine.copy_into_guest(
+                &guest,
+                &credentials,
+                GuestCopyInRequest {
+                    cell_id: cell.id,
+                    source,
+                    destination,
+                    overwrite: OverwritePolicy::Replace,
+                    timeout: StdDuration::from_secs(1),
+                    max_bytes: 1024,
+                    readiness: readiness_for_test(),
+                }
+            ),
+            Err(EngineError::Guest(GuestIoError::PartialCopy))
+        ));
+        assert!(
+            engine
+                .list_guest_operations(Some(cell.id))
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.phase == GuestOperationPhase::TransportActive
+                        && operation.failure == Some(GuestFailureClass::PartialCopy)
+                })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_in_rejects_reparse_source_before_guest_transport() {
+        let (directory, engine, cell, guest, credentials) = running_fixture();
+        let external = directory.path().join("external.bin");
+        let source = directory.path().join("linked.bin");
+        fs::write(&external, b"foreign-content").unwrap();
+        if std::os::windows::fs::symlink_file(&external, &source).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            engine.copy_into_guest(
+                &guest,
+                &credentials,
+                GuestCopyInRequest {
+                    cell_id: cell.id,
+                    source,
+                    destination: GuestPath::parse("inputs/data.bin").unwrap(),
+                    overwrite: OverwritePolicy::Deny,
+                    timeout: StdDuration::from_secs(1),
+                    max_bytes: 1024,
+                    readiness: readiness_for_test(),
+                },
+            ),
+            Err(EngineError::Guest(GuestIoError::PathViolation))
+        ));
+        assert!(guest.state.lock().unwrap().calls.is_empty());
+        assert!(
+            engine
+                .list_guest_operations(Some(cell.id))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn copy_out_and_artifact_collection_commit_hash_bound_files() {
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        guest.state.lock().unwrap().copy_out =
+            VecDeque::from([b"first".to_vec(), b"second".to_vec()]);
+        let report = engine
+            .collect_artifacts(
+                &guest,
+                &credentials,
+                ArtifactCollectRequest {
+                    cell_id: cell.id,
+                    sources: vec![
+                        GuestPath::parse("results/first.txt").unwrap(),
+                        GuestPath::parse("results/second.txt").unwrap(),
+                    ],
+                    timeout: StdDuration::from_secs(1),
+                    max_bytes_per_file: 1024,
+                    readiness: readiness_for_test(),
+                },
+            )
+            .unwrap();
+        assert_eq!(report.artifact.entries.len(), 2);
+        assert_eq!(report.artifact.entries[0].size, 5);
+        assert_eq!(report.artifact.entries[1].size, 6);
+        for (entry, expected) in report
+            .artifact
+            .entries
+            .iter()
+            .zip([b"first".as_slice(), b"second".as_slice()])
+        {
+            let path = engine.state.root().join(&entry.host_relative_path);
+            assert_eq!(fs::read(path).unwrap(), expected);
+            assert_eq!(entry.sha256, format!("{:x}", Sha256::digest(expected)));
+        }
+        assert_eq!(
+            engine
+                .inspect_artifact(cell.id, report.operation_id)
+                .unwrap(),
+            report.artifact
+        );
+        assert_eq!(
+            engine
+                .inspect_guest_operation(report.operation_id)
+                .unwrap()
+                .phase,
+            GuestOperationPhase::Completed
+        );
+    }
+
+    #[test]
+    fn ttl_gc_is_boundary_exact_idempotent_and_blocks_unknown_guest_work() {
+        let (_directory, engine, image_id) = fixture();
+        let mut ttl_spec = spec(image_id);
+        ttl_spec.ttl_seconds = Some(1);
+        let cell = engine.create_cell(ttl_spec).unwrap();
+        let expiry = cell.expires_at.unwrap();
+        let before = engine
+            .gc_expired_at(expiry - Duration::milliseconds(1))
+            .unwrap();
+        assert_eq!(before.entries[0].disposition, GcDisposition::NotExpired);
+        let at = engine.gc_expired_at(expiry).unwrap();
+        assert_eq!(at.entries[0].disposition, GcDisposition::Destroyed);
+        let again = engine.gc_expired_at(expiry).unwrap();
+        assert_eq!(
+            again.entries[0].disposition,
+            GcDisposition::AlreadyDestroyed
+        );
+
+        let (_directory, engine, image_id) = fixture();
+        let mut ttl_spec = spec(image_id);
+        ttl_spec.ttl_seconds = Some(1);
+        let cell = engine.create_cell(ttl_spec).unwrap();
+        let operation = GuestOperationRecord::intent(cell.id, GuestOperationKind::Exec, Utc::now());
+        engine.state.save_guest_operation(&operation).unwrap();
+        let report = engine.gc_expired_at(cell.expires_at.unwrap()).unwrap();
+        assert_eq!(
+            report.entries[0].disposition,
+            GcDisposition::InFlightGuestOperation
+        );
+        assert!(engine.provider.state.lock().unwrap().vm.is_some());
+    }
+
+    #[test]
+    fn gc_reports_running_drift_and_rejects_manual_contention_without_mutation() {
+        let (_directory, engine, image_id) = fixture();
+        let mut ttl_spec = spec(image_id);
+        ttl_spec.ttl_seconds = Some(1);
+        let cell = engine.create_cell(ttl_spec).unwrap();
+        engine.start_cell(cell.id).unwrap();
+        engine.provider.alter_marker();
+        let report = engine.gc_expired_at(cell.expires_at.unwrap()).unwrap();
+        assert_eq!(
+            report.entries[0].disposition,
+            GcDisposition::OwnershipMismatch
+        );
+        assert!(engine.provider.state.lock().unwrap().vm.is_some());
+
+        let (_directory, engine, image_id) = fixture();
+        let mut ttl_spec = spec(image_id);
+        ttl_spec.ttl_seconds = Some(1);
+        let cell = engine.create_cell(ttl_spec).unwrap();
+        let guard = engine.state.acquire_mutation_lock().unwrap();
+        assert!(matches!(
+            engine.gc_expired_at(cell.expires_at.unwrap()),
+            Err(EngineError::State(StateError::MutationBusy))
+        ));
+        assert!(engine.provider.state.lock().unwrap().vm.is_some());
+        drop(guard);
     }
 }

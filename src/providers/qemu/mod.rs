@@ -96,8 +96,9 @@ mod tests {
 
     #[test]
     fn m1_qemu_mutation_is_explicitly_unsupported() {
-        let (_directory, _state, installation, runtime, record) =
+        let (_directory, state, installation, runtime, record) =
             crate::providers::test_mutation_fixture();
+        let mutation = state.acquire_mutation_lock().unwrap();
         let expected = ProviderVm {
             id: "not-a-qemu-object".to_owned(),
             name: "not-a-qemu-object".to_owned(),
@@ -109,7 +110,7 @@ mod tests {
             cpu_count: 1,
             memory_mib: 512,
         };
-        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
         let error = QemuProvider.start_vm(&authority, &expected).unwrap_err();
         assert!(matches!(
             error,

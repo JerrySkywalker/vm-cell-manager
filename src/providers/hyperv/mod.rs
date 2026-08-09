@@ -74,7 +74,7 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
                         accelerators: vec!["hyper-v".to_owned()],
                         guest_os: vec!["windows".to_owned(), "linux".to_owned()],
                         guest_arch: vec![std::env::consts::ARCH.to_owned()],
-                        guest_transports: vec!["powershell-direct".to_owned(), "ssh".to_owned()],
+                        guest_transports: vec!["powershell-direct".to_owned()],
                         networkless_guest_exec: true,
                     },
                 },
@@ -137,7 +137,7 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
         authority: &ProviderMutationAuthority<'_>,
         request: &ConfigureVmRequest,
     ) -> Result<ProviderVm, ProviderError> {
-        authority.validate_vm(&request.expected)?;
+        authority.validate_configure_request(request)?;
         self.execute(HyperVAction::ConfigureVm {
             request: request.clone(),
         })
@@ -225,8 +225,9 @@ mod tests {
 
     #[test]
     fn create_vm_uses_one_typed_executor_action() {
-        let (_directory, _state, installation, runtime, record) =
+        let (_directory, state, installation, runtime, record) =
             crate::providers::test_mutation_fixture();
+        let mutation = state.acquire_mutation_lock().unwrap();
         let executor = RecordingExecutor {
             actions: Mutex::new(Vec::new()),
             response: json!({
@@ -241,7 +242,7 @@ mod tests {
             overlay_path: record.ownership.overlay_path.clone(),
             memory_mib: 4096,
         };
-        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
 
         let identity = provider.create_vm(&authority, &request).unwrap();
 
@@ -254,8 +255,9 @@ mod tests {
 
     #[test]
     fn mutation_authority_rejects_out_of_cell_provider_path() {
-        let (_directory, _state, installation, runtime, record) =
+        let (_directory, state, installation, runtime, record) =
             crate::providers::test_mutation_fixture();
+        let mutation = state.acquire_mutation_lock().unwrap();
         let executor = RecordingExecutor {
             actions: Mutex::new(Vec::new()),
             response: json!(null),
@@ -267,10 +269,53 @@ mod tests {
             overlay_path: record.ownership.overlay_path.clone(),
             memory_mib: 4096,
         };
-        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
 
         assert!(matches!(
             provider.create_vm(&authority, &request),
+            Err(ProviderError::Authority(_))
+        ));
+        assert!(provider.executor.actions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mutation_authority_rejects_ready_vm_cpu_and_memory_drift() {
+        let (_directory, state, installation, runtime, mut record) =
+            crate::providers::test_mutation_fixture();
+        let mutation = state.acquire_mutation_lock().unwrap();
+        record.phase = crate::core::cell::CellPhase::Ready;
+        let expected = ProviderVm {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: record.ownership.provider_object_name.clone(),
+            power_state: crate::providers::ProviderPowerState::Running,
+            ownership_marker: record.ownership.provider_marker.clone(),
+            configuration_path: record.ownership.configuration_path.clone(),
+            attached_disks: vec![record.ownership.overlay_path.clone()],
+            network_adapter_count: 0,
+            cpu_count: record.spec.cpu_count,
+            memory_mib: record.spec.memory_mib,
+        };
+        record.provider_object = Some(crate::core::ownership::ProviderObjectIdentity {
+            id: expected.id.clone(),
+            name: expected.name.clone(),
+        });
+        let executor = RecordingExecutor {
+            actions: Mutex::new(Vec::new()),
+            response: json!(null),
+        };
+        let provider = HyperVProvider::new(executor);
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+
+        let mut drifted = expected.clone();
+        drifted.cpu_count += 1;
+        assert!(matches!(
+            provider.start_vm(&authority, &drifted),
+            Err(ProviderError::Authority(_))
+        ));
+        drifted = expected;
+        drifted.memory_mib += 1;
+        assert!(matches!(
+            provider.stop_vm(&authority, &drifted),
             Err(ProviderError::Authority(_))
         ));
         assert!(provider.executor.actions.lock().unwrap().is_empty());

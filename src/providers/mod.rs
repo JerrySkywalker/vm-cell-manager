@@ -8,8 +8,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::core::capability::ProviderCapabilities;
-use crate::core::cell::{CellId, CellRecord};
-use crate::state::{CellRuntimeGuard, InstallationAuthority};
+use crate::core::cell::{CellId, CellPhase, CellRecord};
+use crate::state::{CellRuntimeGuard, InstallationAuthority, MutationGuard};
 
 /// Unforgeable authority for one bounded provider mutation.
 ///
@@ -21,11 +21,17 @@ pub struct ProviderMutationAuthority<'a> {
     install_id: Uuid,
     cell_id: CellId,
     provider_name: &'a str,
+    provider_id: Option<&'a str>,
     provider_marker: &'a str,
     configuration_path: &'a std::path::Path,
     overlay_path: &'a std::path::Path,
+    parent_image_path: &'a std::path::Path,
+    phase: CellPhase,
+    cpu_count: u16,
+    memory_mib: u64,
     _installation: &'a InstallationAuthority,
     _runtime: &'a CellRuntimeGuard,
+    _mutation: &'a MutationGuard,
 }
 
 impl<'a> ProviderMutationAuthority<'a> {
@@ -33,16 +39,26 @@ impl<'a> ProviderMutationAuthority<'a> {
         record: &'a CellRecord,
         installation: &'a InstallationAuthority,
         runtime: &'a CellRuntimeGuard,
+        mutation: &'a MutationGuard,
     ) -> Self {
         Self {
             install_id: record.ownership.install_id,
             cell_id: record.id,
             provider_name: &record.provider,
+            provider_id: record
+                .provider_object
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
             provider_marker: &record.ownership.provider_marker,
             configuration_path: &record.ownership.configuration_path,
             overlay_path: &record.ownership.overlay_path,
+            parent_image_path: &record.image.path,
+            phase: record.phase,
+            cpu_count: record.spec.cpu_count,
+            memory_mib: record.spec.memory_mib,
             _installation: installation,
             _runtime: runtime,
+            _mutation: mutation,
         }
     }
 
@@ -66,7 +82,9 @@ impl<'a> ProviderMutationAuthority<'a> {
         request: &CreateOverlayRequest,
     ) -> Result<(), ProviderError> {
         self.validate_common()?;
-        if !provider_paths_equal(&request.overlay_path, self.overlay_path) {
+        if !provider_paths_equal(&request.parent_path, self.parent_image_path)
+            || !provider_paths_equal(&request.overlay_path, self.overlay_path)
+        {
             return Err(ProviderError::Authority(
                 "overlay request is outside the authorized CellId runtime".to_owned(),
             ));
@@ -82,6 +100,7 @@ impl<'a> ProviderMutationAuthority<'a> {
         if request.name != format!("vmcell-{}", self.cell_id)
             || !provider_paths_equal(&request.configuration_path, self.configuration_path)
             || !provider_paths_equal(&request.overlay_path, self.overlay_path)
+            || request.memory_mib != self.memory_mib
         {
             return Err(ProviderError::Authority(
                 "VM create request does not match the authorized CellId".to_owned(),
@@ -93,10 +112,15 @@ impl<'a> ProviderMutationAuthority<'a> {
     pub(crate) fn validate_vm(&self, vm: &ProviderVm) -> Result<(), ProviderError> {
         self.validate_common()?;
         if vm.name != format!("vmcell-{}", self.cell_id)
+            || self.provider_id != Some(vm.id.as_str())
             || vm.ownership_marker != self.provider_marker
             || !provider_paths_equal(&vm.configuration_path, self.configuration_path)
             || vm.attached_disks.len() != 1
             || !provider_paths_equal(&vm.attached_disks[0], self.overlay_path)
+            || (matches!(self.phase, CellPhase::Ready | CellPhase::Destroying)
+                && (vm.network_adapter_count != 0
+                    || vm.cpu_count != self.cpu_count
+                    || vm.memory_mib != self.memory_mib))
         {
             return Err(ProviderError::Authority(
                 "provider VM snapshot does not match the authorized owned cell".to_owned(),
@@ -111,6 +135,7 @@ impl<'a> ProviderMutationAuthority<'a> {
     ) -> Result<(), ProviderError> {
         self.validate_common()?;
         if request.ownership_marker != self.provider_marker
+            || self.provider_id != Some(request.expected.id.as_str())
             || request.expected.name != format!("vmcell-{}", self.cell_id)
             || !provider_paths_equal(
                 &request.expected.configuration_path,
@@ -118,11 +143,38 @@ impl<'a> ProviderMutationAuthority<'a> {
             )
             || request.expected.attached_disks.len() != 1
             || !provider_paths_equal(&request.expected.attached_disks[0], self.overlay_path)
+            || request.expected.memory_mib != self.memory_mib
             || (!request.expected.ownership_marker.is_empty()
                 && request.expected.ownership_marker != self.provider_marker)
         {
             return Err(ProviderError::Authority(
                 "VM claim request does not match the authorized creation receipt".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_configure_request(
+        &self,
+        request: &ConfigureVmRequest,
+    ) -> Result<(), ProviderError> {
+        self.validate_common()?;
+        if request.cpu_count != self.cpu_count
+            || self.provider_id != Some(request.expected.id.as_str())
+            || request.expected.name != format!("vmcell-{}", self.cell_id)
+            || request.expected.ownership_marker != self.provider_marker
+            || !provider_paths_equal(
+                &request.expected.configuration_path,
+                self.configuration_path,
+            )
+            || request.expected.attached_disks.len() != 1
+            || !provider_paths_equal(&request.expected.attached_disks[0], self.overlay_path)
+            || request.expected.memory_mib != self.memory_mib
+            || request.expected.power_state != ProviderPowerState::Off
+            || request.expected.network_adapter_count > 1
+        {
+            return Err(ProviderError::Authority(
+                "VM configure request does not match the authorized cell specification".to_owned(),
             ));
         }
         Ok(())
@@ -440,6 +492,7 @@ pub(crate) fn test_mutation_fixture() -> (
         },
         image: ImageBinding {
             image_id,
+            guest_os: Some(crate::core::image::GuestOs::Windows),
             provider: "hyperv".to_owned(),
             disk_format: "vhdx".to_owned(),
             path: directory.path().join("base.vhdx"),
