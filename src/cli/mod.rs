@@ -8,7 +8,7 @@ use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
 use crate::core::cell::{CellId, CellIdError};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
-use crate::engine::{EngineError, RunCellError, RunFailureReport};
+use crate::engine::{EngineError, RunCellError, RunCleanupDisposition, RunFailureReport, RunStage};
 use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
@@ -518,18 +518,18 @@ impl ErrorEnvelope {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RunErrorEnvelope<'a> {
+pub struct RunErrorEnvelope {
     pub schema_version: u32,
     pub error: ErrorBody,
-    pub run: &'a RunFailureReport,
+    pub run: RunErrorReport,
 }
 
-impl<'a> RunErrorEnvelope<'a> {
+impl RunErrorEnvelope {
     #[must_use]
     pub fn new(
         classification: CliErrorClassification,
         message: impl Into<String>,
-        run: &'a RunFailureReport,
+        run: &RunFailureReport,
     ) -> Self {
         Self {
             schema_version: CLI_JSON_SCHEMA_VERSION,
@@ -540,7 +540,53 @@ impl<'a> RunErrorEnvelope<'a> {
                 retryable: classification.retryable,
                 exit_code: classification.exit_code.as_u8(),
             },
-            run,
+            run: RunErrorReport::from(run),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunErrorReport {
+    pub schema_version: u32,
+    pub cell_id: Option<CellId>,
+    pub operation_id: Option<GuestOperationId>,
+    pub stage: RunStage,
+    pub cleanup: RunCleanupDisposition,
+    pub error_code: String,
+    pub cleanup_error_code: Option<String>,
+    pub result: Option<RunErrorResult>,
+}
+
+impl From<&RunFailureReport> for RunErrorReport {
+    fn from(report: &RunFailureReport) -> Self {
+        Self {
+            schema_version: report.schema_version,
+            cell_id: report.cell_id,
+            operation_id: report.operation_id,
+            stage: report.stage,
+            cleanup: report.cleanup,
+            error_code: report.error_code.clone(),
+            cleanup_error_code: report.cleanup_error_code.clone(),
+            result: report.result.as_ref().map(RunErrorResult::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunErrorResult {
+    pub exit_code: i32,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub truncated: bool,
+}
+
+impl From<&crate::guest::GuestCommandResult> for RunErrorResult {
+    fn from(result: &crate::guest::GuestCommandResult) -> Self {
+        Self {
+            exit_code: result.exit_code,
+            stdout_bytes: result.stdout_bytes,
+            stderr_bytes: result.stderr_bytes,
+            truncated: result.truncated,
         }
     }
 }
@@ -1053,6 +1099,44 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn run_error_envelope_omits_guest_stream_contents() {
+        let report = RunFailureReport {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            cell_id: Some(CellId::new()),
+            operation_id: Some(GuestOperationId::new()),
+            stage: RunStage::Cleanup,
+            cleanup: RunCleanupDisposition::Failed,
+            error_code: "vmcell.provider.failed".to_owned(),
+            cleanup_error_code: None,
+            result: Some(crate::guest::GuestCommandResult {
+                exit_code: 23,
+                stdout: "stdout-secret-sentinel".to_owned(),
+                stderr: "stderr-secret-sentinel".to_owned(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: 22,
+                stderr_bytes: 22,
+                truncated: false,
+            }),
+        };
+        let classification = classify_cli_error(&ProviderError::Command("redacted".to_owned()));
+        let value = serde_json::to_value(RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            &report,
+        ))
+        .unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert!(!serialized.contains("stdout-secret-sentinel"));
+        assert!(!serialized.contains("stderr-secret-sentinel"));
+        assert!(value["run"]["result"].get("stdout").is_none());
+        assert!(value["run"]["result"].get("stderr").is_none());
+        assert_eq!(value["run"]["result"]["exit_code"], 23);
+        assert_eq!(value["run"]["result"]["stdout_bytes"], 22);
+        assert_eq!(value["run"]["result"]["stderr_bytes"], 22);
     }
 
     #[test]
