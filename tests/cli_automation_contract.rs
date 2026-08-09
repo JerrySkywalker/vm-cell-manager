@@ -33,7 +33,15 @@ fn json_and_human_modes_share_the_same_stable_exit_classification() {
     assert_eq!(envelope["error"]["category"], "not_found");
     assert_eq!(envelope["error"]["retryable"], false);
     assert_eq!(envelope["error"]["exit_code"], 3);
+    assert_eq!(
+        envelope["error"]["message"],
+        "requested state object was not found"
+    );
+    assert!(!String::from_utf8_lossy(&json.stderr).contains(&state.path().display().to_string()));
 
     let human_stderr = String::from_utf8(human.stderr).unwrap();
-    assert!(human_stderr.starts_with("vmcell: "));
+    assert_eq!(
+        human_stderr.trim(),
+        "vmcell: vmcell.state.not_found: requested state object was not found"
+    );
 }

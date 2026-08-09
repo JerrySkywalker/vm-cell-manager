@@ -150,13 +150,15 @@ vmcell copy-in CELL_ID --source HOST_FILE --destination GUEST_PATH --username US
 vmcell copy-out CELL_ID --source GUEST_PATH --username USER --password-stdin
 vmcell artifact collect CELL_ID --path GUEST_PATH --username USER --password-stdin
 vmcell artifact inspect CELL_ID OPERATION_ID
+vmcell artifact prune [--older-than-seconds N] [--max-artifacts N] [--dry-run]
 vmcell operation list [CELL_ID]
 vmcell operation inspect OPERATION_ID
 vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
-All commands support global `--json` and `--state-root PATH` options. Guest
+All commands support global `--json`, `--state-root PATH`, and bounded
+`--lock-timeout-ms N` options. Guest
 credentials are accepted only through bounded stdin and are never written to
 state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses
@@ -182,6 +184,9 @@ Initial implementation rules:
 - never persist guest credentials, command arguments, command output, or raw transport errors;
 - never automatically replay an unknown or partially completed guest action;
 - keep artifacts in a CellId/operation-bound, hash-verified state subtree;
+- prune artifacts only through an explicit bounded dry-runnable command that
+  persists `artifact_pruned` before exact-subtree deletion;
+- emit and persist stable redacted error codes instead of raw provider stderr;
 - run TTL cleanup only through explicit `vmcell gc` and the existing exact-owned destroy path.
 
 `vmcell doctor` is expected to report missing prerequisites rather than attempting to repair the host automatically.

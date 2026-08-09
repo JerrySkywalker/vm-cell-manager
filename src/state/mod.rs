@@ -2,6 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -14,16 +16,20 @@ use uuid::Uuid;
 use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellRecord};
 use crate::core::guest::{
     ARTIFACT_SCHEMA_VERSION, ArtifactRecord, GUEST_OPERATION_SCHEMA_VERSION, GuestOperationId,
-    GuestOperationRecord,
+    GuestOperationRecord, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_TOTAL_BYTES,
 };
 use crate::core::image::{IMAGE_SCHEMA_VERSION, ImageId, ImageRecord};
 use crate::core::ownership::OWNERSHIP_MARKER_SCHEMA;
 
 pub const INSTALL_SCHEMA_VERSION: u32 = 1;
+pub const MAX_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const MUTATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const REDACTED_LEGACY_ERROR_CODE: &str = "vmcell.legacy.redacted";
 
 #[derive(Debug, Clone)]
 pub struct StateStore {
     root: PathBuf,
+    mutation_lock_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,7 +175,16 @@ impl StateStore {
                 .map(|directory| directory.join(&root))
                 .unwrap_or(root)
         };
-        Self { root }
+        Self {
+            root,
+            mutation_lock_timeout: Duration::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub fn with_mutation_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.mutation_lock_timeout = timeout.min(MAX_MUTATION_LOCK_TIMEOUT);
+        self
     }
 
     #[must_use]
@@ -185,6 +200,21 @@ impl StateStore {
     }
 
     pub(crate) fn acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
+        let deadline = Instant::now()
+            .checked_add(self.mutation_lock_timeout)
+            .unwrap_or_else(Instant::now);
+        loop {
+            match self.try_acquire_mutation_lock() {
+                Err(StateError::MutationBusy) if Instant::now() < deadline => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::sleep(remaining.min(MUTATION_LOCK_POLL_INTERVAL));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn try_acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
         ensure_directory(&self.root)?;
         let state_root_handle = open_ordinary_directory(&self.root)?;
         let mut state_directories = Vec::new();
@@ -331,13 +361,15 @@ impl StateStore {
 
     pub(crate) fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
         let path = self.cell_path(record.id);
-        validate_cell_schema(&path, record)?;
-        write_json_atomic(&path, record)
+        let mut record = record.clone();
+        redact_cell_diagnostic(&mut record);
+        validate_cell_schema(&path, &record)?;
+        write_json_atomic(&path, &record)
     }
 
     pub fn load_cell(&self, cell_id: CellId) -> Result<CellRecord, StateError> {
         let path = self.cell_path(cell_id);
-        let record = read_json(&path)?;
+        let mut record = read_json(&path)?;
         validate_cell_schema(&path, &record)?;
         if record.id != cell_id {
             return Err(StateError::IdentityMismatch {
@@ -346,11 +378,14 @@ impl StateStore {
                 expected: cell_id.to_string(),
             });
         }
+        redact_cell_diagnostic(&mut record);
         Ok(record)
     }
 
     pub fn list_cells(&self) -> Result<Vec<CellRecord>, StateError> {
-        read_json_directory(&self.root.join("cells"), validate_cell_schema)
+        let mut records = read_json_directory(&self.root.join("cells"), validate_cell_schema)?;
+        records.iter_mut().for_each(redact_cell_diagnostic);
+        Ok(records)
     }
 
     pub(crate) fn save_guest_operation(
@@ -484,6 +519,77 @@ impl StateStore {
         }
         validate_artifact_files(&root, &record)?;
         Ok(record)
+    }
+
+    pub(crate) fn remove_artifact_root(
+        &self,
+        mutation: &MutationGuard,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<bool, StateError> {
+        mutation.validate_filesystem_identity()?;
+        let artifacts_root = self.root.join("artifacts");
+        let artifacts_handle = open_ordinary_directory(&artifacts_root)?;
+        let cell_root = artifacts_root.join(cell_id.to_string());
+        let cell_handle = match open_ordinary_directory(&cell_root) {
+            Ok(handle) => handle,
+            Err(StateError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let operation_root = cell_root.join(operation_id.to_string());
+        let operation_handle = match open_ordinary_directory(&operation_root) {
+            Ok(handle) => handle,
+            Err(StateError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        ensure_existing_ancestors_are_ordinary(&operation_root)?;
+        ensure_no_reparse_tree(&operation_root)?;
+
+        let physical_state_root = self
+            .root
+            .canonicalize()
+            .map_err(|source| io_error(&self.root, source))?;
+        let physical_artifacts_root = artifacts_root
+            .canonicalize()
+            .map_err(|source| io_error(&artifacts_root, source))?;
+        let physical_cell_root = cell_root
+            .canonicalize()
+            .map_err(|source| io_error(&cell_root, source))?;
+        let physical_operation_root = operation_root
+            .canonicalize()
+            .map_err(|source| io_error(&operation_root, source))?;
+        if physical_artifacts_root.parent() != Some(physical_state_root.as_path())
+            || physical_cell_root.parent() != Some(physical_artifacts_root.as_path())
+            || physical_operation_root.parent() != Some(physical_cell_root.as_path())
+        {
+            return Err(StateError::UnsafeRuntimePath(operation_root));
+        }
+
+        drop(operation_handle);
+        fs::remove_dir_all(&physical_operation_root)
+            .map_err(|source| io_error(&physical_operation_root, source))?;
+        mutation.validate_filesystem_identity()?;
+        drop(cell_handle);
+        drop(artifacts_handle);
+        Ok(true)
+    }
+
+    pub(crate) fn artifact_root_exists(
+        &self,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<bool, StateError> {
+        let root = self.artifact_root(cell_id, operation_id);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() && !is_reparse_point(&root)? => Ok(true),
+            Ok(_) => Err(StateError::UnsafeRuntimePath(root)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(io_error(&root, source)),
+        }
     }
 
     #[must_use]
@@ -702,6 +808,19 @@ fn process_mutation_roots() -> &'static Mutex<std::collections::HashSet<PathBuf>
 fn release_process_mutation_root(root: &Path) {
     if let Ok(mut roots) = process_mutation_roots().lock() {
         roots.remove(root);
+    }
+}
+
+fn redact_cell_diagnostic(record: &mut CellRecord) {
+    let is_safe = record.last_error.as_deref().is_none_or(|value| {
+        value.len() <= 128
+            && value.starts_with("vmcell.")
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+    });
+    if !is_safe {
+        record.last_error = Some(REDACTED_LEGACY_ERROR_CODE.to_owned());
     }
 }
 
@@ -1185,6 +1304,14 @@ fn validate_guest_operation_schema(
                     .artifact_id
                     .is_none_or(|artifact_id| artifact_id == record.id)
         }
+        crate::core::guest::GuestOperationPhase::ArtifactPruned => {
+            record.completed_at.is_some()
+                && record.failure.is_none()
+                && record.artifact_id == Some(record.id)
+                && record.exit_code.is_none()
+                && record.stdout_bytes.is_none()
+                && record.stderr_bytes.is_none()
+        }
         crate::core::guest::GuestOperationPhase::Failed => {
             record.completed_at.is_some()
                 && record.failure.is_some_and(|failure| {
@@ -1216,16 +1343,36 @@ fn validate_artifact_schema(path: &Path, record: &ArtifactRecord) -> Result<(), 
         "artifact record",
         record.schema_version,
         ARTIFACT_SCHEMA_VERSION,
-    )
+    )?;
+    if record.entries.is_empty() || record.entries.len() > MAX_ARTIFACT_FILES {
+        return Err(StateError::ArtifactIntegrity {
+            path: path.to_path_buf(),
+            reason: "artifact file count is outside the bounded policy",
+        });
+    }
+    if record
+        .entries
+        .iter()
+        .any(|entry| entry.size > MAX_ARTIFACT_FILE_BYTES)
+    {
+        return Err(StateError::ArtifactIntegrity {
+            path: path.to_path_buf(),
+            reason: "artifact file size exceeds the bounded policy",
+        });
+    }
+    let total = record.entries.iter().try_fold(0_u64, |total, entry| {
+        total.checked_add(entry.size).ok_or(())
+    });
+    if total.is_err() || total.is_ok_and(|total| total > MAX_ARTIFACT_TOTAL_BYTES) {
+        return Err(StateError::ArtifactIntegrity {
+            path: path.to_path_buf(),
+            reason: "artifact total size exceeds the bounded policy",
+        });
+    }
+    Ok(())
 }
 
 fn validate_artifact_files(root: &Path, record: &ArtifactRecord) -> Result<(), StateError> {
-    if record.entries.is_empty() {
-        return Err(StateError::ArtifactIntegrity {
-            path: root.to_path_buf(),
-            reason: "manifest contains no files",
-        });
-    }
     let files_root = root.join("files");
     let _files_handle = open_ordinary_directory(&files_root)?;
     ensure_no_reparse_tree(root)?;
@@ -1468,7 +1615,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             expires_at: None,
-            last_error: Some("baseline".to_owned()),
+            last_error: Some("vmcell.test.baseline".to_owned()),
         }
     }
 
@@ -1572,11 +1719,27 @@ mod tests {
         store.save_cell(&cell).unwrap();
         assert_eq!(store.load_cell(cell_id).unwrap().id, cell_id);
 
-        cell.last_error = Some("updated atomically".to_owned());
+        cell.last_error = Some("vmcell.test.updated_atomically".to_owned());
         store.save_cell(&cell).unwrap();
         assert_eq!(
             store.load_cell(cell_id).unwrap().last_error.as_deref(),
-            Some("updated atomically")
+            Some("vmcell.test.updated_atomically")
+        );
+
+        let mut legacy = cell.clone();
+        legacy.last_error = Some("credential-sentinel raw provider stderr".to_owned());
+        fs::write(
+            store.cell_path(cell_id),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.load_cell(cell_id).unwrap().last_error.as_deref(),
+            Some(REDACTED_LEGACY_ERROR_CODE)
+        );
+        assert_eq!(
+            store.list_cells().unwrap()[0].last_error.as_deref(),
+            Some(REDACTED_LEGACY_ERROR_CODE)
         );
     }
 
@@ -1625,6 +1788,19 @@ mod tests {
         };
         store.save_artifact_new(&guard, &artifact).unwrap();
         assert_eq!(store.load_artifact(cell_id, artifact_id).unwrap(), artifact);
+
+        let mut oversized_file = artifact.clone();
+        oversized_file.entries[0].size = MAX_ARTIFACT_FILE_BYTES + 1;
+        assert!(matches!(
+            store.save_artifact_new(&guard, &oversized_file),
+            Err(StateError::ArtifactIntegrity { .. })
+        ));
+        let mut too_many_files = artifact.clone();
+        too_many_files.entries = vec![artifact.entries[0].clone(); MAX_ARTIFACT_FILES + 1];
+        assert!(matches!(
+            store.save_artifact_new(&guard, &too_many_files),
+            Err(StateError::ArtifactIntegrity { .. })
+        ));
 
         let artifact_file = guard.files_root.join("0000.bin");
         fs::write(&artifact_file, b"tampered-artifact").unwrap();
@@ -1958,6 +2134,29 @@ mod tests {
     }
 
     #[test]
+    fn mutation_lock_wait_is_bounded_and_acquires_after_release() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("state");
+        let first = StateStore::new(root.clone())
+            .acquire_mutation_lock()
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            drop(first);
+        });
+        let start = Instant::now();
+        let second = StateStore::new(root)
+            .with_mutation_lock_timeout(Duration::from_secs(1))
+            .acquire_mutation_lock()
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(50));
+        assert!(elapsed < Duration::from_secs(1));
+        drop(second);
+        releaser.join().unwrap();
+    }
+
+    #[test]
     fn manifest_phase_transitions_survive_real_process_abort_at_atomic_boundaries() {
         if std::env::var_os("VMCELL_TEST_ATOMIC_CRASH_CHILD").is_some() {
             let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
@@ -1969,7 +2168,7 @@ mod tests {
             let mut record = store.load_cell(cell_id).unwrap();
             record.phase = phase;
             record.state = state;
-            record.last_error = Some(label);
+            record.last_error = Some(format!("vmcell.test.{label}"));
             store.save_cell(&record).unwrap();
             std::process::exit(77);
         }
@@ -2024,7 +2223,10 @@ mod tests {
             let (phase, state) = phase_and_state(label);
             assert_eq!(committed.phase, phase);
             assert_eq!(committed.state, state);
-            assert_eq!(committed.last_error.as_deref(), Some(label));
+            assert_eq!(
+                committed.last_error.as_deref(),
+                Some(format!("vmcell.test.{label}").as_str())
+            );
         }
     }
 

@@ -64,13 +64,14 @@ pub enum GuestOperationPhase {
     TransportActive,
     ArtifactCommitted,
     Completed,
+    ArtifactPruned,
     Failed,
 }
 
 impl GuestOperationPhase {
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::ArtifactPruned | Self::Failed)
     }
 }
 
@@ -144,3 +145,7 @@ pub struct ArtifactRecord {
     pub created_at: DateTime<Utc>,
     pub entries: Vec<ArtifactEntry>,
 }
+
+pub const MAX_ARTIFACT_FILES: usize = 16;
+pub const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ARTIFACT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
