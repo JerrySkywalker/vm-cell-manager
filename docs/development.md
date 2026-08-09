@@ -23,6 +23,24 @@ cargo test --locked --workspace --all-features --doc
 
 Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
 
+## Rapid integration policy
+
+Development is trunk-oriented. Start each independently reviewable slice from
+green `main`, keep active product PR depth at zero or one, and never exceed a
+transient depth of two during retarget or recovery. A slice completes branch
+validation, exact-head CI, focused review, merge, exact-main CI, and branch
+cleanup before the next product slice starts.
+
+Do not repeat a canonical gate for an unchanged head and claim. Classify CI
+failures before changing product code, and fix-forward or revert promptly if
+`main` regresses. The self-hosted core workflow is push/workflow-dispatch only;
+do not add an automatic untrusted-fork `pull_request` path to that runner.
+
+Repository-local merge eligibility and real-platform acceptance are distinct.
+P0/P1-clean, exact-head-green work may merge while separately documented
+Hyper-V, PowerShell Direct, QEMU, KVM, WHPX, or HVF acceptance remains pending.
+Never describe mock, WSL2, or core CI evidence as real-provider acceptance.
+
 On a native Linux development host, `tools/check-linux.sh` runs the locked
 repository-local portability suite. It does not install Rust, QEMU, KVM
 components, packages, or change `/dev/kvm` permissions. WSL2 output is useful

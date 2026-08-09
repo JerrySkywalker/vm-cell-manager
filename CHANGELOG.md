@@ -17,5 +17,8 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - M4 Unix private-state/no-follow identity gates, Linux KVM device usability filtering, canonical QEMU executable discovery, Unix QMP socket coverage, and a native-Linux validation workflow.
 
 ### Changed
+- Adopted rapid trunk-oriented CI/CD: short branches, at most one active product
+  PR, exact-head and exact-main gates, immediate cleanup, and real-platform
+  acceptance tracked separately from repository-local merge eligibility.
 - Hardened M1 provider authority, physical runtime containment, persisted identity binding, partial-provisioning recovery, and tombstone reconciliation before real Hyper-V acceptance.
 - Narrowed advertised Hyper-V guest transports to PowerShell Direct and QEMU guest transport to implemented Linux QGA behavior; SSH remains unsupported.

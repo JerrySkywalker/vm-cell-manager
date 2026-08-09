@@ -22,7 +22,8 @@ No VM creation is authorized by M0.
 
 Goal: first useful Windows-native disposable full-system cell.
 
-Status: implementation review candidate; dedicated real Hyper-V acceptance remains pending.
+Status: repository-local foundation is implemented and merged to `main`;
+dedicated real Hyper-V acceptance remains pending.
 
 Planned acceptance:
 
@@ -50,10 +51,9 @@ Planned acceptance:
 - TTL model and explicit `vmcell gc`;
 - guest-control recovery layered on the M1 ownership reconciliation model.
 
-Architecture admission is complete on the stacked M2 branch. Repository-local
-implementation and mock/fault validation do not constitute real PowerShell
-Direct acceptance; that remains a dedicated-host gate after M1 real-provider
-acceptance.
+Status: repository-local implementation is merged to `main`. Mock and fault
+validation do not constitute real PowerShell Direct acceptance; that remains a
+dedicated-host gate after M1 real-provider acceptance.
 
 ## M3 — QEMU reference provider
 
@@ -68,8 +68,8 @@ Planned acceptance:
 - explicit hardware-accelerator discovery;
 - TCG/cross-architecture emulation only through explicit opt-in.
 
-Status: repository-local implementation in progress on the stacked M3 branch.
-Real QEMU/WHPX, KVM, and HVF acceptance remain environment-gated and are not
+Status: repository-local QEMU/QMP/QGA implementation is merged to `main`. Real
+QEMU/WHPX, KVM, and HVF acceptance remains environment-gated and is not
 performed by the core/trusted Windows CI runner.
 
 ## M4 — Linux portability foundation and host acceptance
@@ -84,16 +84,15 @@ Planned acceptance:
 - architecture mismatch diagnostics;
 - documented guest support matrix.
 
-The stacked M4 foundation prioritizes Linux conditional compilation, Unix
+The merged M4 foundation prioritizes Linux conditional compilation, Unix
 process trees, permissions, locking, symlink containment, and QEMU/KVM
 capability behavior. macOS abstractions remain non-breaking, while real HVF
 acceptance is deferred.
 
-Status: repository-local portability implementation is active on the stacked
-M4 branch. Unix private-state and no-follow identity gates, KVM device
-usability filtering, canonical executable discovery, and portable validation
-workflow are implemented; native Linux/KVM acceptance remains environment
-gated.
+Status: repository-local portability implementation is merged to `main`. Unix
+private-state and no-follow identity gates, KVM device usability filtering,
+canonical executable discovery, and portable validation workflow are
+implemented; native Linux/KVM acceptance remains environment-gated.
 
 WSL or nested environments may be used for development experiments but are not substitutes for final host acceptance.
 
@@ -110,6 +109,9 @@ Planned acceptance:
 - deterministic failure categories;
 - concurrency-lock hardening beyond the narrow M1 exclusive mutation lock;
 - artifact/log retention policy.
+
+Status: active. M5 is delivered as sequential short PRs against green `main`;
+no unfinished M5 slice becomes the base for another.
 
 ## Later candidates
 
