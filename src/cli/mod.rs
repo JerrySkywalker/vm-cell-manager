@@ -364,6 +364,24 @@ pub enum ImageCommand {
         provider: CliProvider,
     },
 
+    /// Validate a prepared base or revalidate one registered image without mutation.
+    Validate {
+        #[arg(long, conflicts_with_all = ["path", "guest_os"])]
+        id: Option<ImageId>,
+
+        #[arg(long, required_unless_present = "id")]
+        path: Option<PathBuf>,
+
+        #[arg(long, value_enum, required_unless_present = "id")]
+        guest_os: Option<CliGuestOs>,
+
+        #[arg(long, value_enum, default_value_t = CliArchitecture::X86_64)]
+        guest_arch: CliArchitecture,
+
+        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
+        provider: CliProvider,
+    },
+
     /// List registered images.
     List,
 
@@ -1563,5 +1581,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn image_validate_accepts_exactly_one_registered_or_candidate_target() {
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "image",
+                "validate",
+                "--path",
+                "base.vhdx",
+                "--guest-os",
+                "windows",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "image",
+                "validate",
+                "--id",
+                "windows-dev",
+                "--provider",
+                "hyperv",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "image",
+                "validate",
+                "--id",
+                "windows-dev",
+                "--path",
+                "base.vhdx",
+                "--guest-os",
+                "windows",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["vmcell", "image", "validate"]).is_err());
     }
 }

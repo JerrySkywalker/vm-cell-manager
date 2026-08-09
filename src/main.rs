@@ -6,15 +6,17 @@ use std::time::Duration;
 use clap::{Parser, error::ErrorKind};
 use serde::Serialize;
 use vm_cell_manager::cli::{
-    ArtifactCommand, Cli, CliInputError, CliProvider, Command, CredentialArgs, DoctorReport,
-    ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
-    RunErrorEnvelope, classify_cli_error, public_error_message,
+    ArtifactCommand, Cli, CliExitCode, CliInputError, CliProvider, Command, CredentialArgs,
+    DoctorReport, ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope,
+    ProviderCommand, RunErrorEnvelope, classify_cli_error, public_error_message,
 };
 use vm_cell_manager::core::cell::CellSpec;
+use vm_cell_manager::core::image::{Architecture, GuestOs, ImageRecord};
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, EngineError, GuestCopyInRequest,
-    GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest, RunCellError, RunCellReport,
-    RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
+    GuestCopyOutRequest, GuestExecRequest, ImageValidationReport, ImageValidationStatus,
+    RegisterImageRequest, RunCellError, RunCellReport, RunCellRequest, RunCleanupPolicy,
+    RunControl, RunObserver, RunProgressEvent, ValidateImageRequest,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -251,19 +253,62 @@ fn run_m2<P: LocalVmProvider>(
                     guest_arch: guest_arch.into(),
                     path,
                 })?;
-                emit(&image, json, || println!("registered image {}", image.id))?;
+                emit(&image, json, || {
+                    let mut stdout = std::io::stdout().lock();
+                    write_registered_image(&image, &mut stdout)
+                        .expect("stdout should remain writable");
+                })?;
+            }
+            ImageCommand::Validate {
+                id,
+                path,
+                guest_os,
+                guest_arch,
+                provider: _,
+            } => {
+                let report = if let Some(id) = id {
+                    engine.validate_registered_image(&id)?
+                } else {
+                    engine.validate_image(ValidateImageRequest {
+                        guest_os: guest_os
+                            .ok_or_else(|| CliInputError("--guest-os is required".to_owned()))?
+                            .into(),
+                        guest_arch: guest_arch.into(),
+                        path: path.ok_or_else(|| CliInputError("--path is required".to_owned()))?,
+                    })?
+                };
+                emit(&report, json, || {
+                    let mut stdout = std::io::stdout().lock();
+                    write_image_validation(&report, &mut stdout)
+                        .expect("stdout should remain writable");
+                })?;
+                if report.status == ImageValidationStatus::Unusable {
+                    return Ok(ExitCode::from(CliExitCode::Integrity.as_u8()));
+                }
             }
             ImageCommand::List => {
                 let response = ListEnvelope::new(engine.list_images()?);
                 emit(&response, json, || {
                     for image in &response.items {
-                        println!("{}", image.id);
+                        let mut stdout = std::io::stdout().lock();
+                        write_registered_image(image, &mut stdout)
+                            .expect("stdout should remain writable");
                     }
                 })?;
             }
             ImageCommand::Inspect { id } => {
                 let image = engine.inspect_image(&id)?;
-                emit(&image, json, || println!("{image:#?}"))?;
+                if json {
+                    emit(&image, true, || {})?;
+                } else {
+                    let report = engine.validate_registered_image(&id)?;
+                    let mut stdout = std::io::stdout().lock();
+                    write_registered_image(&image, &mut stdout)?;
+                    write_image_validation(&report, &mut stdout)?;
+                    if report.status == ImageValidationStatus::Unusable {
+                        return Ok(ExitCode::from(CliExitCode::Integrity.as_u8()));
+                    }
+                }
             }
         },
         Command::Create {
@@ -554,7 +599,7 @@ fn run_m2<P: LocalVmProvider>(
 fn provider_for_command(command: &Command, state: &StateStore) -> Result<String, Box<dyn Error>> {
     let provider = match command {
         Command::Image {
-            command: ImageCommand::Add { provider, .. },
+            command: ImageCommand::Add { provider, .. } | ImageCommand::Validate { provider, .. },
         }
         | Command::Create { provider, .. }
         | Command::Run { provider, .. } => provider.as_str().to_owned(),
@@ -575,8 +620,22 @@ fn provider_for_command(command: &Command, state: &StateStore) -> Result<String,
         Command::Artifact {
             command: ArtifactCommand::Prune { .. },
         } => CliProvider::Hyperv.as_str().to_owned(),
+        Command::Image {
+            command: ImageCommand::Inspect { id },
+        } => {
+            let image = state.load_image(id)?;
+            if image.variants.len() != 1 {
+                return Err(EngineError::ImageIntegrity(
+                    "registered image does not contain exactly one provider variant".to_owned(),
+                )
+                .into());
+            }
+            image.variants[0].provider.clone()
+        }
         Command::List
-        | Command::Image { .. }
+        | Command::Image {
+            command: ImageCommand::List,
+        }
         | Command::Operation { .. }
         | Command::Doctor
         | Command::Provider { .. } => CliProvider::Hyperv.as_str().to_owned(),
@@ -604,6 +663,101 @@ fn exec_guest<P: LocalVmProvider>(
             );
         }
     })
+}
+
+fn write_registered_image(image: &ImageRecord, output: &mut impl Write) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "image={} guest_os={} guest_arch={} registered_at={}",
+        image.id,
+        guest_os_name(image.guest_os),
+        architecture_name(image.guest_arch),
+        image.registered_at.to_rfc3339()
+    )?;
+    for variant in &image.variants {
+        writeln!(
+            output,
+            "  provider={} format={} size={} sha256={} path={}",
+            variant.provider,
+            variant.disk_format,
+            variant.file_size,
+            variant.sha256,
+            variant.path.display()
+        )?;
+    }
+    Ok(())
+}
+
+fn write_image_validation(
+    report: &ImageValidationReport,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let image = report
+        .image_id
+        .as_ref()
+        .map_or("none", |image_id| image_id.as_str());
+    let observed_format = report.observed_format.as_deref().unwrap_or("unknown");
+    let sha256 = report.sha256.as_deref().unwrap_or("unavailable");
+    let parent = report
+        .parent_path
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |path| path.display().to_string());
+    let issues = if report.issues.is_empty() {
+        "none".to_owned()
+    } else {
+        report
+            .issues
+            .iter()
+            .map(|issue| issue.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    writeln!(
+        output,
+        "validation={} image={} registered={} provider={} guest_os={} guest_arch={}",
+        report.status.as_str(),
+        image,
+        report.registered,
+        report.provider,
+        guest_os_name(report.guest_os),
+        architecture_name(report.guest_arch)
+    )?;
+    writeln!(
+        output,
+        "  expected_format={} observed_format={} size={} virtual_size={} sha256={}",
+        report.expected_format,
+        observed_format,
+        report
+            .file_size
+            .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
+        report
+            .virtual_size
+            .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
+        sha256
+    )?;
+    writeln!(
+        output,
+        "  backing_parent={} issues={} path={}",
+        parent,
+        issues,
+        report.path.display()
+    )?;
+    Ok(())
+}
+
+const fn guest_os_name(guest_os: GuestOs) -> &'static str {
+    match guest_os {
+        GuestOs::Windows => "windows",
+        GuestOs::Linux => "linux",
+        GuestOs::Macos => "macos",
+    }
+}
+
+const fn architecture_name(architecture: Architecture) -> &'static str {
+    match architecture {
+        Architecture::X86_64 => "x86_64",
+        Architecture::Aarch64 => "aarch64",
+    }
 }
 
 fn run_cell_guest<P: LocalVmProvider>(
@@ -945,5 +1099,38 @@ mod tests {
             "vmcell: cleanup refused: cell={cell_id} reason=ambiguous_state"
         )));
         assert!(!output.contains("credential-sentinel"));
+    }
+
+    #[test]
+    fn human_image_validation_reports_identity_hash_backing_and_issues() {
+        let report = ImageValidationReport {
+            schema_version: 1,
+            image_id: Some("windows-dev".parse().unwrap()),
+            registered: true,
+            provider: "hyperv".to_owned(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            path: std::path::PathBuf::from(r"C:\images\base.vhdx"),
+            expected_format: "vhdx".to_owned(),
+            observed_format: Some("vhdx".to_owned()),
+            disk_type: Some("fixed".to_owned()),
+            parent_path: None,
+            file_size: Some(1024),
+            virtual_size: Some(4096),
+            sha256: Some("a".repeat(64)),
+            registered_sha256: Some("b".repeat(64)),
+            status: ImageValidationStatus::Unusable,
+            issues: vec![vm_cell_manager::engine::ImageValidationIssue::RegisteredHashDrift],
+        };
+        let mut output = Vec::new();
+
+        write_image_validation(&report, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("validation=unusable image=windows-dev registered=true"));
+        assert!(output.contains("provider=hyperv guest_os=windows guest_arch=x86_64"));
+        assert!(output.contains(&"a".repeat(64)));
+        assert!(output.contains("backing_parent=none issues=registered_hash_drift"));
+        assert!(!output.contains(&"b".repeat(64)));
     }
 }

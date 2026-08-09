@@ -136,6 +136,8 @@ vmcell doctor
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows --provider hyperv
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
+vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv
+vmcell image validate --id IMAGE --provider hyperv
 vmcell image list
 vmcell image inspect IMAGE
 vmcell create --image IMAGE --provider PROVIDER --cpu-count 2 --memory-mib 4096 [--accelerator POLICY] [--allow-tcg] [--ttl-seconds N]
@@ -173,6 +175,14 @@ forwards bounded guest stdout/stderr to their matching streams, and returns the
 guest exit code after a completed command. `--json` suppresses progress and
 emits the versioned run report; failure envelopes include safe recovery
 identifiers and cleanup disposition but never guest stream contents.
+
+`vmcell image validate` is read-only. Candidate-path mode proves that the
+ordinary non-reparse base file has the selected provider's format, has no
+backing parent, and can be hashed. Registered-image mode repeats those checks
+and compares canonical path, size, format, and SHA-256 with the durable image
+record. Human `image add`, `list`, and `inspect` output includes guest/provider
+identity and immutable content identity; `--json` retains versioned records and
+validation reports. vmcell does not build, mount, or modify guest images.
 
 ## Safety and ownership
 
