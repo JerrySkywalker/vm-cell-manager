@@ -149,6 +149,30 @@ one timestamp, skips cells with nonterminal guest operations, and delegates
 eligible cells to the M1 exact-ownership destroy path. It is not a daemon or
 background timer.
 
+## Run workflow output
+
+`vmcell run --image IMAGE [options] -- PROGRAM [ARG...]` composes the existing
+create, start, guest-exec, and exact-owned destroy operations. In default human
+mode, lifecycle progress and the final cleanup disposition are written to
+stderr. Bounded guest stdout is written to stdout and bounded guest stderr is
+written to stderr. Progress records contain only image/cell identifiers,
+stages, exit status, and cleanup classification; they never echo credentials,
+the guest command, host paths, or raw provider diagnostics.
+
+With `--json`, progress is suppressed and success emits one schema-v1
+`RunCellReport` to stdout. It contains `cell_id`, `operation_id`, `outcome`, the
+bounded `result`, and `cleanup`. A run failure uses the normal error body plus a
+`run` object containing the safe stage, cell/operation identifiers, durable
+error codes, cleanup disposition, and optional result metadata. Guest stdout
+and stderr content are never included in an error envelope.
+
+After a completed guest command, `vmcell run` returns the guest exit code when
+it is in `1..=255`; an out-of-range nonzero guest code maps to `1`. This
+run-specific success-path rule can numerically overlap the vmcell error table,
+so automation that needs to distinguish guest failure from orchestration
+failure must use `--json` and inspect `outcome` or `error`. Orchestration
+failures always use the stable taxonomy below.
+
 ## Error output
 
 ```json
