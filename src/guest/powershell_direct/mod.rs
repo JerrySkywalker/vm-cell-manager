@@ -50,6 +50,10 @@ impl<E: PowerShellDirectCommandExecutor> GuestTransport for PowerShellDirectTran
         "powershell-direct"
     }
 
+    fn supports(&self, provider: &str, guest_os: crate::core::image::GuestOs) -> bool {
+        provider == "hyperv" && guest_os == crate::core::image::GuestOs::Windows
+    }
+
     fn probe_ready(
         &self,
         authority: &GuestActionAuthority<'_>,

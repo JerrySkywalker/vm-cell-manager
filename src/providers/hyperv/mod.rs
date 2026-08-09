@@ -240,7 +240,11 @@ mod tests {
             name: record.ownership.provider_object_name.clone(),
             configuration_path: record.ownership.configuration_path.clone(),
             overlay_path: record.ownership.overlay_path.clone(),
+            parent_path: record.image.path.clone(),
             memory_mib: 4096,
+            cpu_count: record.spec.cpu_count,
+            accelerator: None,
+            allow_tcg: false,
         };
         let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
 
@@ -267,7 +271,11 @@ mod tests {
             name: record.ownership.provider_object_name.clone(),
             configuration_path: PathBuf::from(r"C:\foreign"),
             overlay_path: record.ownership.overlay_path.clone(),
+            parent_path: record.image.path.clone(),
             memory_mib: 4096,
+            cpu_count: record.spec.cpu_count,
+            accelerator: None,
+            allow_tcg: false,
         };
         let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
 

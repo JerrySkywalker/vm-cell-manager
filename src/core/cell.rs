@@ -77,6 +77,10 @@ pub struct CellSpec {
     pub cpu_count: u16,
     pub memory_mib: u64,
     pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub accelerator: Option<String>,
+    #[serde(default)]
+    pub allow_tcg: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

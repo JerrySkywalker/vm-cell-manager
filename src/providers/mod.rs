@@ -29,9 +29,24 @@ pub struct ProviderMutationAuthority<'a> {
     phase: CellPhase,
     cpu_count: u16,
     memory_mib: u64,
+    accelerator: Option<&'a str>,
+    allow_tcg: bool,
     _installation: &'a InstallationAuthority,
     _runtime: &'a CellRuntimeGuard,
     _mutation: &'a MutationGuard,
+}
+
+pub(crate) struct QemuDefinition<'a> {
+    pub provider_id: &'a str,
+    pub provider_name: &'a str,
+    pub provider_marker: &'a str,
+    pub configuration_path: &'a std::path::Path,
+    pub overlay_path: &'a std::path::Path,
+    pub parent_path: &'a std::path::Path,
+    pub accelerator: &'a str,
+    pub cpu_count: u16,
+    pub memory_mib: u64,
+    pub require_marker: bool,
 }
 
 impl<'a> ProviderMutationAuthority<'a> {
@@ -56,6 +71,8 @@ impl<'a> ProviderMutationAuthority<'a> {
             phase: record.phase,
             cpu_count: record.spec.cpu_count,
             memory_mib: record.spec.memory_mib,
+            accelerator: record.spec.accelerator.as_deref(),
+            allow_tcg: record.spec.allow_tcg,
             _installation: installation,
             _runtime: runtime,
             _mutation: mutation,
@@ -63,7 +80,7 @@ impl<'a> ProviderMutationAuthority<'a> {
     }
 
     fn validate_common(&self) -> Result<(), ProviderError> {
-        if self.provider_name != "hyperv"
+        if self.provider_name.is_empty()
             || self.install_id != self._installation.record().install_id
             || self.cell_id != self._runtime.cell_id()
             || !provider_paths_equal(self.configuration_path, self._runtime.configuration_path())
@@ -100,7 +117,11 @@ impl<'a> ProviderMutationAuthority<'a> {
         if request.name != format!("vmcell-{}", self.cell_id)
             || !provider_paths_equal(&request.configuration_path, self.configuration_path)
             || !provider_paths_equal(&request.overlay_path, self.overlay_path)
+            || !provider_paths_equal(&request.parent_path, self.parent_image_path)
             || request.memory_mib != self.memory_mib
+            || request.cpu_count != self.cpu_count
+            || request.accelerator.as_deref() != self.accelerator
+            || request.allow_tcg != self.allow_tcg
         {
             return Err(ProviderError::Authority(
                 "VM create request does not match the authorized CellId".to_owned(),
@@ -175,6 +196,38 @@ impl<'a> ProviderMutationAuthority<'a> {
         {
             return Err(ProviderError::Authority(
                 "VM configure request does not match the authorized cell specification".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_qemu_definition(
+        &self,
+        definition: &QemuDefinition<'_>,
+    ) -> Result<(), ProviderError> {
+        self.validate_common()?;
+        let accelerator_matches = match self.accelerator {
+            Some(value) if value != "auto" => value == definition.accelerator,
+            _ => {
+                matches!(definition.accelerator, "whpx" | "kvm" | "hvf")
+                    || (definition.accelerator == "tcg" && self.allow_tcg)
+            }
+        };
+        let marker_matches = definition.provider_marker == self.provider_marker
+            || (!definition.require_marker && definition.provider_marker.is_empty());
+        if self.provider_name != "qemu"
+            || self.provider_id != Some(definition.provider_id)
+            || definition.provider_name != format!("vmcell-{}", self.cell_id)
+            || !marker_matches
+            || !provider_paths_equal(definition.configuration_path, self.configuration_path)
+            || !provider_paths_equal(definition.overlay_path, self.overlay_path)
+            || !provider_paths_equal(definition.parent_path, self.parent_image_path)
+            || definition.cpu_count != self.cpu_count
+            || definition.memory_mib != self.memory_mib
+            || !accelerator_matches
+        {
+            return Err(ProviderError::Authority(
+                "QEMU definition does not match the engine-issued provider authority".to_owned(),
             ));
         }
         Ok(())
@@ -278,25 +331,34 @@ pub trait LocalVmProvider: Send + Sync {
 }
 
 fn provider_paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
-    let normalize = |path: &std::path::Path| {
-        let mut value = path.to_string_lossy().replace('/', "\\");
-        if value
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
-        {
-            value = format!(r"\\{}", &value[8..]);
-        } else if value
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
-        {
-            value = value[4..].to_owned();
-        }
-        while value.len() > 3 && value.ends_with('\\') {
-            value.pop();
-        }
-        value
-    };
-    normalize(left).eq_ignore_ascii_case(&normalize(right))
+    #[cfg(target_os = "windows")]
+    {
+        let normalize = |path: &std::path::Path| {
+            let mut value = path.to_string_lossy().replace('/', "\\");
+            if value
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+            {
+                value = format!(r"\\{}", &value[8..]);
+            } else if value
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
+            {
+                value = value[4..].to_owned();
+            }
+            while value.len() > 3 && value.ends_with('\\') {
+                value.pop();
+            }
+            value
+        };
+        normalize(left).eq_ignore_ascii_case(&normalize(right))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let canonical =
+            |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        canonical(left) == canonical(right)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,7 +390,11 @@ pub struct CreateVmRequest {
     pub name: String,
     pub configuration_path: PathBuf,
     pub overlay_path: PathBuf,
+    pub parent_path: PathBuf,
     pub memory_mib: u64,
+    pub cpu_count: u16,
+    pub accelerator: Option<String>,
+    pub allow_tcg: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,7 +507,7 @@ pub enum ProviderError {
 pub fn builtin_provider_probes() -> Vec<ProviderProbe> {
     let providers: Vec<Box<dyn LocalVmProvider>> = vec![
         Box::new(hyperv::HyperVProvider::system()),
-        Box::new(qemu::QemuProvider),
+        Box::new(qemu::QemuProvider::probe_only()),
     ];
 
     providers
@@ -452,6 +518,21 @@ pub fn builtin_provider_probes() -> Vec<ProviderProbe> {
 
 #[cfg(test)]
 pub(crate) fn test_mutation_fixture() -> (
+    tempfile::TempDir,
+    crate::state::StateStore,
+    crate::state::InstallationAuthority,
+    crate::state::CellRuntimeGuard,
+    crate::core::cell::CellRecord,
+) {
+    test_mutation_fixture_for("hyperv", "vhdx", crate::core::image::GuestOs::Windows)
+}
+
+#[cfg(test)]
+pub(crate) fn test_mutation_fixture_for(
+    provider: &'static str,
+    disk_format: &'static str,
+    guest_os: crate::core::image::GuestOs,
+) -> (
     tempfile::TempDir,
     crate::state::StateStore,
     crate::state::InstallationAuthority,
@@ -470,32 +551,38 @@ pub(crate) fn test_mutation_fixture() -> (
     let installation = state.installation().unwrap();
     let installation_authority = state.acquire_installation_authority().unwrap();
     let cell_id = CellId::new();
-    let runtime = state.prepare_cell_runtime(cell_id).unwrap();
+    let configuration_path = state.cell_configuration_path_for(cell_id, provider);
+    let overlay_path = state.cell_overlay_path_for(cell_id, disk_format);
+    let runtime = state
+        .prepare_cell_runtime_for(cell_id, configuration_path.clone(), overlay_path.clone())
+        .unwrap();
     let image_id = ImageId::parse("test-image").unwrap();
     let ownership = CellOwnership::new(
         installation.install_id,
         cell_id,
         Uuid::new_v4(),
-        state.cell_configuration_path(cell_id),
-        state.cell_overlay_path(cell_id),
+        configuration_path,
+        overlay_path,
     );
     let record = crate::core::cell::CellRecord {
         schema_version: CELL_SCHEMA_VERSION,
         id: cell_id,
-        provider: "hyperv".to_owned(),
+        provider: provider.to_owned(),
         spec: CellSpec {
             image: image_id.clone(),
-            provider: Some("hyperv".to_owned()),
+            provider: Some(provider.to_owned()),
             cpu_count: 2,
             memory_mib: 4096,
             ttl_seconds: None,
+            accelerator: (provider == "qemu").then(|| "tcg".to_owned()),
+            allow_tcg: provider == "qemu",
         },
         image: ImageBinding {
             image_id,
-            guest_os: Some(crate::core::image::GuestOs::Windows),
-            provider: "hyperv".to_owned(),
-            disk_format: "vhdx".to_owned(),
-            path: directory.path().join("base.vhdx"),
+            guest_os: Some(guest_os),
+            provider: provider.to_owned(),
+            disk_format: disk_format.to_owned(),
+            path: directory.path().join(format!("base.{disk_format}")),
             sha256: "test".to_owned(),
             file_size: 1,
         },

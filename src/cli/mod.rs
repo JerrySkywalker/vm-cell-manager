@@ -49,7 +49,7 @@ pub enum Command {
         command: ImageCommand,
     },
 
-    /// Create one stopped, networkless Hyper-V cell.
+    /// Create one stopped, networkless Hyper-V or QEMU cell.
     Create {
         #[arg(long)]
         image: ImageId,
@@ -62,6 +62,15 @@ pub enum Command {
 
         #[arg(long)]
         ttl_seconds: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
+        provider: CliProvider,
+
+        #[arg(long, value_enum)]
+        accelerator: Option<CliAccelerator>,
+
+        #[arg(long)]
+        allow_tcg: bool,
     },
 
     /// List locally recorded cells.
@@ -82,7 +91,7 @@ pub enum Command {
     /// Reconcile local manifests with provider-observed state without mutation.
     Reconcile { cell_id: Option<CellId> },
 
-    /// Execute a process in an exact-owned running Windows guest.
+    /// Execute a process through the exact-owned cell's supported guest transport.
     Exec {
         cell_id: CellId,
 
@@ -167,10 +176,17 @@ pub enum Command {
 #[derive(Debug, Clone, Args)]
 pub struct CredentialArgs {
     #[arg(long)]
-    pub username: String,
+    pub username: Option<String>,
 
-    #[arg(long, required = true)]
+    #[arg(long)]
     pub password_stdin: bool,
+
+    #[arg(long, hide = true, value_parser = reject_password_argv)]
+    _password: Option<String>,
+}
+
+fn reject_password_argv(_value: &str) -> Result<String, &'static str> {
+    Err("guest passwords are forbidden on argv; use --password-stdin")
 }
 
 #[derive(Debug, Subcommand)]
@@ -231,7 +247,7 @@ impl From<CliOverwritePolicy> for OverwritePolicy {
 
 #[derive(Debug, Subcommand)]
 pub enum ImageCommand {
-    /// Register an immutable Hyper-V VHDX base.
+    /// Register an immutable provider-compatible VHDX or QCOW2 base.
     Add {
         #[arg(long)]
         id: ImageId,
@@ -244,6 +260,9 @@ pub enum ImageCommand {
 
         #[arg(long, value_enum, default_value_t = CliArchitecture::X86_64)]
         guest_arch: CliArchitecture,
+
+        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
+        provider: CliProvider,
     },
 
     /// List registered images.
@@ -278,6 +297,44 @@ impl From<CliGuestOs> for GuestOs {
 pub enum CliArchitecture {
     X86_64,
     Aarch64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliProvider {
+    Hyperv,
+    Qemu,
+}
+
+impl CliProvider {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hyperv => "hyperv",
+            Self::Qemu => "qemu",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliAccelerator {
+    Auto,
+    Whpx,
+    Kvm,
+    Hvf,
+    Tcg,
+}
+
+impl CliAccelerator {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Whpx => "whpx",
+            Self::Kvm => "kvm",
+            Self::Hvf => "hvf",
+            Self::Tcg => "tcg",
+        }
+    }
 }
 
 impl From<CliArchitecture> for Architecture {
@@ -448,6 +505,16 @@ mod tests {
             ])
             .is_ok()
         );
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "exec",
+                &cell_id.to_string(),
+                "--",
+                "/usr/bin/true",
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["vmcell", "gc"]).is_ok());
         let operation_id = GuestOperationId::new();
         assert!(
@@ -459,5 +526,53 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn parses_qemu_image_create_and_explicit_tcg_policy() {
+        let image = Cli::try_parse_from([
+            "vmcell",
+            "image",
+            "add",
+            "--id",
+            "linux-qemu",
+            "--path",
+            "base.qcow2",
+            "--guest-os",
+            "linux",
+            "--provider",
+            "qemu",
+        ])
+        .unwrap();
+        assert!(matches!(
+            image.command,
+            Command::Image {
+                command: ImageCommand::Add {
+                    provider: CliProvider::Qemu,
+                    ..
+                }
+            }
+        ));
+        let create = Cli::try_parse_from([
+            "vmcell",
+            "create",
+            "--image",
+            "linux-qemu",
+            "--provider",
+            "qemu",
+            "--accelerator",
+            "tcg",
+            "--allow-tcg",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.command,
+            Command::Create {
+                provider: CliProvider::Qemu,
+                accelerator: Some(CliAccelerator::Tcg),
+                allow_tcg: true,
+                ..
+            }
+        ));
     }
 }

@@ -468,12 +468,23 @@ impl StateStore {
 
     #[must_use]
     pub fn cell_overlay_path(&self, cell_id: CellId) -> PathBuf {
-        self.cell_runtime_root(cell_id).join("cell.vhdx")
+        self.cell_overlay_path_for(cell_id, "vhdx")
     }
 
     #[must_use]
     pub fn cell_configuration_path(&self, cell_id: CellId) -> PathBuf {
-        self.cell_runtime_root(cell_id).join("hyperv")
+        self.cell_configuration_path_for(cell_id, "hyperv")
+    }
+
+    #[must_use]
+    pub fn cell_overlay_path_for(&self, cell_id: CellId, disk_format: &str) -> PathBuf {
+        self.cell_runtime_root(cell_id)
+            .join(format!("cell.{disk_format}"))
+    }
+
+    #[must_use]
+    pub fn cell_configuration_path_for(&self, cell_id: CellId, provider: &str) -> PathBuf {
+        self.cell_runtime_root(cell_id).join(provider)
     }
 
     #[cfg(test)]
@@ -482,9 +493,23 @@ impl StateStore {
         Ok(guard.cell_root.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_cell_runtime(
         &self,
         cell_id: CellId,
+    ) -> Result<CellRuntimeGuard, StateError> {
+        self.prepare_cell_runtime_for(
+            cell_id,
+            self.cell_configuration_path(cell_id),
+            self.cell_overlay_path(cell_id),
+        )
+    }
+
+    pub(crate) fn prepare_cell_runtime_for(
+        &self,
+        cell_id: CellId,
+        configuration_path: PathBuf,
+        overlay_path: PathBuf,
     ) -> Result<CellRuntimeGuard, StateError> {
         ensure_directory(&self.root)?;
         let state_handle = open_ordinary_directory(&self.root)?;
@@ -492,6 +517,11 @@ impl StateStore {
         create_direct_child_directory(&runtime_root)?;
         let runtime_handle = open_ordinary_directory(&runtime_root)?;
         let cell_root = self.cell_runtime_root(cell_id);
+        if configuration_path.parent() != Some(cell_root.as_path())
+            || overlay_path.parent() != Some(cell_root.as_path())
+        {
+            return Err(StateError::UnsafeRuntimePath(cell_root));
+        }
         create_direct_child_directory(&cell_root)?;
         let cell_handle = open_ordinary_directory(&cell_root)?;
         validate_runtime_chain(&self.root, &cell_root)?;
@@ -500,8 +530,8 @@ impl StateStore {
             cell_id,
             state_root: self.root.clone(),
             runtime_root,
-            configuration_path: self.cell_configuration_path(cell_id),
-            overlay_path: self.cell_overlay_path(cell_id),
+            configuration_path,
+            overlay_path,
             cell_root,
             _state_handle: state_handle,
             _runtime_handle: runtime_handle,
@@ -509,11 +539,30 @@ impl StateStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn pin_cell_runtime(&self, cell_id: CellId) -> Result<CellRuntimeGuard, StateError> {
+        self.pin_cell_runtime_for(
+            cell_id,
+            self.cell_configuration_path(cell_id),
+            self.cell_overlay_path(cell_id),
+        )
+    }
+
+    pub(crate) fn pin_cell_runtime_for(
+        &self,
+        cell_id: CellId,
+        configuration_path: PathBuf,
+        overlay_path: PathBuf,
+    ) -> Result<CellRuntimeGuard, StateError> {
         let state_handle = open_ordinary_directory(&self.root)?;
         let runtime_root = self.root.join("runtime");
         let runtime_handle = open_ordinary_directory(&runtime_root)?;
         let cell_root = self.cell_runtime_root(cell_id);
+        if configuration_path.parent() != Some(cell_root.as_path())
+            || overlay_path.parent() != Some(cell_root.as_path())
+        {
+            return Err(StateError::UnsafeRuntimePath(cell_root));
+        }
         let cell_handle = open_ordinary_directory(&cell_root)?;
         validate_runtime_chain(&self.root, &cell_root)?;
         ensure_no_reparse_tree(&cell_root)?;
@@ -521,8 +570,8 @@ impl StateStore {
             cell_id,
             state_root: self.root.clone(),
             runtime_root,
-            configuration_path: self.cell_configuration_path(cell_id),
-            overlay_path: self.cell_overlay_path(cell_id),
+            configuration_path,
+            overlay_path,
             cell_root,
             _state_handle: state_handle,
             _runtime_handle: runtime_handle,
@@ -1232,6 +1281,8 @@ mod tests {
                 cpu_count: 2,
                 memory_mib: 4096,
                 ttl_seconds: None,
+                accelerator: None,
+                allow_tcg: false,
             },
             image: ImageBinding::from_variant(image_id, GuestOs::Windows, &variant),
             ownership: CellOwnership::new(
@@ -1335,6 +1386,8 @@ mod tests {
                 cpu_count: 2,
                 memory_mib: 4096,
                 ttl_seconds: None,
+                accelerator: None,
+                allow_tcg: false,
             },
             image: ImageBinding::from_variant(image_id, image.guest_os, &image.variants[0]),
             ownership,
@@ -1956,6 +2009,8 @@ mod tests {
                 cpu_count: 2,
                 memory_mib: 4096,
                 ttl_seconds: None,
+                accelerator: None,
+                allow_tcg: false,
             },
             image: ImageBinding {
                 image_id,

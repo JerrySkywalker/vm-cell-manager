@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::core::cell::{CellId, CellRecord};
 use crate::core::guest::GuestOperationId;
+use crate::core::image::GuestOs;
 use crate::providers::{ProviderPowerState, ProviderVm};
 use crate::state::{CellRuntimeGuard, InstallationAuthority, MutationGuard};
 
@@ -55,6 +56,14 @@ impl GuestCredentials {
 
     pub(crate) fn password(&self) -> &str {
         self.password.as_str()
+    }
+
+    #[must_use]
+    pub fn not_required() -> Self {
+        Self {
+            username: String::new(),
+            password: Zeroizing::new(String::new()),
+        }
     }
 }
 
@@ -104,6 +113,11 @@ impl GuestPath {
     #[must_use]
     pub fn file_name(&self) -> &str {
         self.0.rsplit('\\').next().unwrap_or(self.0.as_str())
+    }
+
+    #[must_use]
+    pub fn as_posix(&self) -> String {
+        self.0.replace('\\', "/")
     }
 }
 
@@ -283,7 +297,7 @@ impl<'a> GuestActionAuthority<'a> {
     pub(crate) fn validate(&self, expected: &ProviderVm) -> Result<(), GuestIoError> {
         if self.install_id != self._installation.record().install_id
             || self.cell_id != self._runtime.cell_id()
-            || self.provider != "hyperv"
+            || !matches!(self.provider, "hyperv" | "qemu")
             || expected.id != self.provider_id
             || expected.name != self.provider_name
             || expected.ownership_marker != self.provider_marker
@@ -303,6 +317,21 @@ impl<'a> GuestActionAuthority<'a> {
     #[must_use]
     pub(crate) fn cell_id(&self) -> CellId {
         self.cell_id
+    }
+
+    #[must_use]
+    pub(crate) fn provider(&self) -> &str {
+        self.provider
+    }
+
+    #[must_use]
+    pub(crate) fn provider_id(&self) -> &str {
+        self.provider_id
+    }
+
+    #[must_use]
+    pub(crate) fn configuration_path(&self) -> &Path {
+        self.configuration_path
     }
 }
 
@@ -330,6 +359,10 @@ fn path_identity_equal(left: &Path, right: &Path) -> bool {
 
 pub trait GuestTransport: Send + Sync {
     fn name(&self) -> &'static str;
+
+    fn supports(&self, _provider: &str, _guest_os: GuestOs) -> bool {
+        false
+    }
 
     fn probe_ready(
         &self,
