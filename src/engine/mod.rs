@@ -124,6 +124,20 @@ pub enum RunCleanupDisposition {
     Failed,
 }
 
+impl RunCleanupDisposition {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NothingCreated => "nothing_created",
+            Self::Destroyed => "destroyed",
+            Self::RetainedByRequest => "retained_by_request",
+            Self::RetainedOnFailure => "retained_on_failure",
+            Self::RefusedAmbiguous => "refused_ambiguous",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStage {
@@ -135,6 +149,22 @@ pub enum RunStage {
     GuestExecution,
     Cleanup,
     Interrupted,
+}
+
+impl RunStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestValidation => "request_validation",
+            Self::ImageValidation => "image_validation",
+            Self::CellCreation => "cell_creation",
+            Self::ProviderStart => "provider_start",
+            Self::GuestReadiness => "guest_readiness",
+            Self::GuestExecution => "guest_execution",
+            Self::Cleanup => "cleanup",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -14,7 +14,7 @@ use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, EngineError, GuestCopyInRequest,
     GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest, RunCellError, RunCellReport,
-    RunCellRequest, RunCleanupPolicy,
+    RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -70,8 +70,13 @@ fn emit_run_error(
         );
         let cleanup_error = report.cleanup_error_code.as_deref().unwrap_or("none");
         eprintln!(
-            "vmcell: {}: {message}; run stage={:?} cell={} operation={} cleanup={:?} cleanup_error={}",
-            classification.code, report.stage, cell, operation, report.cleanup, cleanup_error
+            "vmcell: {}: {message}; run stage={} cell={} operation={} cleanup={} cleanup_error={}",
+            classification.code,
+            report.stage.as_str(),
+            cell,
+            operation,
+            report.cleanup.as_str(),
+            cleanup_error
         );
     }
     ExitCode::from(classification.exit_code.as_u8())
@@ -300,32 +305,39 @@ fn run_m2<P: LocalVmProvider>(
             mut command,
         } => {
             let program = command.remove(0);
-            let report = run_cell_guest(
-                engine,
-                credential,
-                RunCellRequest {
-                    spec: CellSpec {
-                        image,
-                        provider: Some(engine.provider_name().to_owned()),
-                        cpu_count,
-                        memory_mib,
-                        ttl_seconds,
-                        accelerator: accelerator.map(|value| value.as_str().to_owned()),
-                        allow_tcg,
-                    },
-                    command: GuestCommand {
-                        program,
-                        args: command,
-                        timeout: Duration::from_secs(action_timeout_seconds),
-                        max_output_bytes,
-                    },
-                    readiness: readiness(readiness_timeout_seconds),
-                    cleanup: RunCleanupPolicy {
-                        keep,
-                        keep_on_failure,
-                    },
+            let request = RunCellRequest {
+                spec: CellSpec {
+                    image,
+                    provider: Some(engine.provider_name().to_owned()),
+                    cpu_count,
+                    memory_mib,
+                    ttl_seconds,
+                    accelerator: accelerator.map(|value| value.as_str().to_owned()),
+                    allow_tcg,
                 },
-            )?;
+                command: GuestCommand {
+                    program,
+                    args: command,
+                    timeout: Duration::from_secs(action_timeout_seconds),
+                    max_output_bytes,
+                },
+                readiness: readiness(readiness_timeout_seconds),
+                cleanup: RunCleanupPolicy {
+                    keep,
+                    keep_on_failure,
+                },
+            };
+            let report = if json {
+                let mut observer = |_event: &RunProgressEvent| RunControl::Continue;
+                run_cell_guest(engine, credential, request, &mut observer)?
+            } else {
+                let mut observer = HumanRunObserver::new(std::io::stderr());
+                let result = run_cell_guest(engine, credential, request, &mut observer);
+                let output_result = observer.finish().map(|_| ());
+                let report = result?;
+                output_result?;
+                report
+            };
             if json {
                 emit(&report, true, || {})?;
             } else {
@@ -598,11 +610,22 @@ fn run_cell_guest<P: LocalVmProvider>(
     engine: &CellEngine<P>,
     credential: CredentialArgs,
     request: RunCellRequest,
+    observer: &mut impl RunObserver,
 ) -> Result<RunCellReport, Box<dyn Error>> {
     let credentials = read_credentials(engine.provider_name(), credential)?;
     Ok(match engine.provider_name() {
-        "hyperv" => engine.run_cell(&PowerShellDirectTransport::system(), &credentials, request)?,
-        "qemu" => engine.run_cell(&QemuGuestAgentTransport::system(), &credentials, request)?,
+        "hyperv" => engine.run_cell_observed(
+            &PowerShellDirectTransport::system(),
+            &credentials,
+            request,
+            observer,
+        )?,
+        "qemu" => engine.run_cell_observed(
+            &QemuGuestAgentTransport::system(),
+            &credentials,
+            request,
+            observer,
+        )?,
         value => {
             return Err(
                 EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
@@ -626,11 +649,90 @@ fn write_human_run_result(
 ) -> std::io::Result<()> {
     stdout.write_all(report.result.stdout.as_bytes())?;
     stderr.write_all(report.result.stderr.as_bytes())?;
+    if !report.result.stderr.is_empty() && !report.result.stderr.ends_with('\n') {
+        stderr.write_all(b"\n")?;
+    }
     writeln!(
         stderr,
-        "vmcell: run cell {}: exit={} cleanup={:?}",
-        report.cell_id, report.result.exit_code, report.cleanup
+        "vmcell: run cell {}: exit={} cleanup={}",
+        report.cell_id,
+        report.result.exit_code,
+        report.cleanup.as_str()
     )
+}
+
+struct HumanRunObserver<W: Write> {
+    writer: W,
+    error: Option<std::io::Error>,
+}
+
+impl<W: Write> HumanRunObserver<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            error: None,
+        }
+    }
+
+    fn line(&mut self, arguments: std::fmt::Arguments<'_>) {
+        if self.error.is_none() {
+            if let Err(error) = writeln!(self.writer, "vmcell: {arguments}") {
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn finish(self) -> std::io::Result<W> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.writer),
+        }
+    }
+}
+
+impl<W: Write> RunObserver for HumanRunObserver<W> {
+    fn observe(&mut self, event: &RunProgressEvent) -> RunControl {
+        match event {
+            RunProgressEvent::ImageVerified { image } => {
+                self.line(format_args!("image verified: {image}"));
+            }
+            RunProgressEvent::CellCreated { cell_id } => {
+                self.line(format_args!("cell created: {cell_id}"));
+            }
+            RunProgressEvent::ProviderStarted { cell_id } => {
+                self.line(format_args!("provider started: {cell_id}"));
+            }
+            RunProgressEvent::GuestReady { cell_id } => {
+                self.line(format_args!("guest ready: {cell_id}"));
+            }
+            RunProgressEvent::CommandCompleted { cell_id, exit_code } => {
+                self.line(format_args!(
+                    "command completed: cell={cell_id} exit={exit_code}"
+                ));
+            }
+            RunProgressEvent::CleanupStarted { cell_id } => {
+                self.line(format_args!("cleanup started: {cell_id}"));
+            }
+            RunProgressEvent::CellDestroyed { cell_id } => {
+                self.line(format_args!("cell destroyed: {cell_id}"));
+            }
+            RunProgressEvent::CellRetained {
+                cell_id,
+                disposition,
+            } => {
+                self.line(format_args!(
+                    "cell retained: cell={cell_id} cleanup={}",
+                    disposition.as_str()
+                ));
+            }
+            RunProgressEvent::CleanupRefused { cell_id } => {
+                self.line(format_args!(
+                    "cleanup refused: cell={cell_id} reason=ambiguous_state"
+                ));
+            }
+        }
+        RunControl::Continue
+    }
 }
 
 fn copy_in_guest<P: LocalVmProvider>(
@@ -783,10 +885,10 @@ mod tests {
             result: vm_cell_manager::guest::GuestCommandResult {
                 exit_code: 23,
                 stdout: "guest stdout\n".to_owned(),
-                stderr: "guest stderr\n".to_owned(),
+                stderr: "guest stderr".to_owned(),
                 encoding: "utf-8".to_owned(),
                 stdout_bytes: 13,
-                stderr_bytes: 13,
+                stderr_bytes: 12,
                 truncated: false,
             },
             cleanup: vm_cell_manager::engine::RunCleanupDisposition::Destroyed,
@@ -798,8 +900,50 @@ mod tests {
 
         assert_eq!(stdout, b"guest stdout\n");
         let stderr = String::from_utf8(stderr).unwrap();
-        assert!(stderr.starts_with("guest stderr\n"));
+        assert!(stderr.starts_with("guest stderr\nvmcell:"));
         assert!(stderr.contains("exit=23"));
-        assert!(stderr.contains("cleanup=Destroyed"));
+        assert!(stderr.contains("cleanup=destroyed"));
+    }
+
+    #[test]
+    fn human_run_observer_reports_safe_lifecycle_progress() {
+        let image = "windows-dev".parse().unwrap();
+        let cell_id = vm_cell_manager::core::cell::CellId::new();
+        let mut observer = HumanRunObserver::new(Vec::new());
+        for event in [
+            RunProgressEvent::ImageVerified { image },
+            RunProgressEvent::CellCreated { cell_id },
+            RunProgressEvent::ProviderStarted { cell_id },
+            RunProgressEvent::GuestReady { cell_id },
+            RunProgressEvent::CommandCompleted {
+                cell_id,
+                exit_code: 0,
+            },
+            RunProgressEvent::CleanupStarted { cell_id },
+            RunProgressEvent::CellDestroyed { cell_id },
+            RunProgressEvent::CellRetained {
+                cell_id,
+                disposition: vm_cell_manager::engine::RunCleanupDisposition::RetainedByRequest,
+            },
+            RunProgressEvent::CleanupRefused { cell_id },
+        ] {
+            assert_eq!(observer.observe(&event), RunControl::Continue);
+        }
+        let output = String::from_utf8(observer.finish().unwrap()).unwrap();
+
+        assert!(output.contains("vmcell: image verified: windows-dev"));
+        assert!(output.contains(&format!("vmcell: cell created: {cell_id}")));
+        assert!(output.contains(&format!("vmcell: provider started: {cell_id}")));
+        assert!(output.contains(&format!("vmcell: guest ready: {cell_id}")));
+        assert!(output.contains(&format!("vmcell: command completed: cell={cell_id} exit=0")));
+        assert!(output.contains(&format!("vmcell: cleanup started: {cell_id}")));
+        assert!(output.contains(&format!("vmcell: cell destroyed: {cell_id}")));
+        assert!(output.contains(&format!(
+            "vmcell: cell retained: cell={cell_id} cleanup=retained_by_request"
+        )));
+        assert!(output.contains(&format!(
+            "vmcell: cleanup refused: cell={cell_id} reason=ambiguous_state"
+        )));
+        assert!(!output.contains("credential-sentinel"));
     }
 }

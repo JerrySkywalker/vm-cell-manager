@@ -139,6 +139,7 @@ vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
 vmcell image list
 vmcell image inspect IMAGE
 vmcell create --image IMAGE --provider PROVIDER --cpu-count 2 --memory-mib 4096 [--accelerator POLICY] [--allow-tcg] [--ttl-seconds N]
+vmcell run --image IMAGE --provider PROVIDER [--cpu 2] [--memory 4096] [--ttl N] [--keep | --keep-on-failure] -- PROGRAM [ARG...]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -166,6 +167,12 @@ state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses
 PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM, WHPX, and
 HVF acceptance remain separate host gates.
+
+Human `vmcell run` writes concise lifecycle and cleanup progress to stderr,
+forwards bounded guest stdout/stderr to their matching streams, and returns the
+guest exit code after a completed command. `--json` suppresses progress and
+emits the versioned run report; failure envelopes include safe recovery
+identifiers and cleanup disposition but never guest stream contents.
 
 ## Safety and ownership
 

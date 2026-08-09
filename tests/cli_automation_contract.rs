@@ -141,9 +141,9 @@ fn run_failures_preserve_stage_cell_and_cleanup_in_json_and_human_modes() {
     );
 
     let human_stderr = String::from_utf8(human.stderr).unwrap();
-    assert!(human_stderr.contains("run stage=RequestValidation"));
+    assert!(human_stderr.contains("run stage=request_validation"));
     assert!(human_stderr.contains("cell=none"));
     assert!(human_stderr.contains("operation=none"));
-    assert!(human_stderr.contains("cleanup=NothingCreated"));
+    assert!(human_stderr.contains("cleanup=nothing_created"));
     assert!(human_stderr.contains("cleanup_error=none"));
 }
