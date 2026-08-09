@@ -84,8 +84,9 @@ pub enum StateError {
 
 pub struct MutationGuard {
     file: File,
-    _state_root: File,
-    _state_directories: Vec<File>,
+    lock_path: PathBuf,
+    state_root: (PathBuf, File),
+    state_directories: Vec<(PathBuf, File)>,
     process_key: PathBuf,
 }
 
@@ -147,6 +148,17 @@ impl Drop for MutationGuard {
     }
 }
 
+impl MutationGuard {
+    pub(crate) fn validate_filesystem_identity(&self) -> Result<(), StateError> {
+        validate_open_path_identity(&self.lock_path, &self.file)?;
+        validate_open_path_identity(&self.state_root.0, &self.state_root.1)?;
+        for (path, file) in &self.state_directories {
+            validate_open_path_identity(path, file)?;
+        }
+        Ok(())
+    }
+}
+
 impl StateStore {
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
@@ -186,7 +198,7 @@ impl StateStore {
         ] {
             let directory = self.root.join(name);
             create_direct_child_directory(&directory)?;
-            state_directories.push(open_ordinary_directory(&directory)?);
+            state_directories.push((directory.clone(), open_ordinary_directory(&directory)?));
         }
         let lock_dir = self.root.join("locks");
         let process_key = self
@@ -203,13 +215,14 @@ impl StateStore {
         }
 
         let lock_path = lock_dir.join("mutation.lock");
-        let file = match OpenOptions::new()
+        let mut lock_options = OpenOptions::new();
+        lock_options
             .create(true)
             .read(true)
             .write(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
+            .truncate(false);
+        configure_private_created_file(&mut lock_options);
+        let file = match lock_options.open(&lock_path) {
             Ok(file) => file,
             Err(source) => {
                 release_process_mutation_root(&process_key);
@@ -226,10 +239,17 @@ impl StateStore {
             }
         }
 
+        if let Err(error) = validate_open_path_identity(&lock_path, &file) {
+            let _ = FileExt::unlock(&file);
+            release_process_mutation_root(&process_key);
+            return Err(error);
+        }
+
         Ok(MutationGuard {
             file,
-            _state_root: state_root_handle,
-            _state_directories: state_directories,
+            lock_path,
+            state_root: (self.root.clone(), state_root_handle),
+            state_directories,
             process_key,
         })
     }
@@ -739,6 +759,12 @@ fn open_state_file(path: &Path, pin_identity: bool) -> Result<File, StateError> 
     ensure_existing_ancestors_are_ordinary(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -764,7 +790,9 @@ fn open_state_file(path: &Path, pin_identity: bool) -> Result<File, StateError> 
     if file_metadata_is_reparse(&file).map_err(|source| io_error(path, source))? {
         return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
     }
+    ensure_private_open_file(path, &file)?;
     ensure_existing_ancestors_are_ordinary(path)?;
+    validate_open_path_identity(path, &file)?;
     Ok(file)
 }
 
@@ -798,6 +826,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateEr
     let result = (|| {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
+        configure_private_created_file(&mut options);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -856,6 +885,7 @@ fn write_bytes_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     let result = (|| {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
+        configure_private_created_file(&mut options);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -898,12 +928,32 @@ fn abort_at_test_checkpoint(checkpoint: &str) {
 
 fn ensure_directory(path: &Path) -> Result<(), StateError> {
     ensure_existing_ancestors_are_ordinary(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .map_err(|source| io_error(path, source))?;
+    }
+    #[cfg(not(unix))]
     fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
-    ensure_existing_ancestors_are_ordinary(path)
+    ensure_existing_ancestors_are_ordinary(path)?;
+    ensure_private_directory(path)
 }
 
 fn create_direct_child_directory(path: &Path) -> Result<(), StateError> {
-    match fs::create_dir(path) {
+    #[cfg(unix)]
+    let result = {
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new().mode(0o700).create(path)
+    };
+    #[cfg(not(unix))]
+    let result = fs::create_dir(path);
+    match result {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             if is_reparse_point(path)?
@@ -917,13 +967,20 @@ fn create_direct_child_directory(path: &Path) -> Result<(), StateError> {
             }
         }
         Err(source) => Err(io_error(path, source)),
-    }
+    }?;
+    ensure_private_directory(path)
 }
 
 fn open_ordinary_directory(path: &Path) -> Result<File, StateError> {
     ensure_existing_ancestors_are_ordinary(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -946,8 +1003,75 @@ fn open_ordinary_directory(path: &Path) -> Result<File, StateError> {
     {
         return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
     }
+    ensure_private_directory(path)?;
     ensure_existing_ancestors_are_ordinary(path)?;
+    validate_open_path_identity(path, &file)?;
     Ok(file)
+}
+
+fn configure_private_created_file(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(path: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_directory(_path: &Path) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_open_file(path: &Path, file: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_open_file(_path: &Path, _file: &File) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_open_path_identity(path: &Path, file: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let open = file.metadata().map_err(|source| io_error(path, source))?;
+    let current = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if open.dev() != current.dev()
+        || open.ino() != current.ino()
+        || current.file_type().is_symlink()
+    {
+        return Err(StateError::UnsafeRuntimePath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_open_path_identity(path: &Path, _file: &File) -> Result<(), StateError> {
+    ensure_existing_ancestors_are_ordinary(path)
 }
 
 #[cfg(windows)]
@@ -1260,6 +1384,37 @@ mod tests {
     };
     use crate::core::image::{Architecture, GuestOs, ImageBinding, ImageVariant};
     use crate::core::ownership::CellOwnership;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_state_root_and_records_are_private_and_identity_pinned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let guard = store.acquire_mutation_lock().unwrap();
+        store.installation().unwrap();
+        assert_eq!(
+            fs::metadata(store.root()).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert_eq!(
+            fs::metadata(store.root().join("installation.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert!(guard.validate_filesystem_identity().is_ok());
+        drop(guard);
+
+        fs::set_permissions(store.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            store.acquire_mutation_lock(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+    }
 
     fn test_cell_record(store: &StateStore, cell_id: CellId) -> CellRecord {
         let image_id = ImageId::parse("crash-base").unwrap();

@@ -23,6 +23,11 @@ cargo test --locked --workspace --all-features --doc
 
 Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
 
+On a native Linux development host, `tools/check-linux.sh` runs the locked
+repository-local portability suite. It does not install Rust, QEMU, KVM
+components, packages, or change `/dev/kvm` permissions. WSL2 output is useful
+development evidence but is never recorded as real Linux host acceptance.
+
 ## Provider safety rule
 
 M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands carrying an engine-issued installation/runtime authority and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.
@@ -39,6 +44,8 @@ M0 probes remain read-only. M1 Hyper-V mutation is reachable only through owners
 - Windows-native lifecycle work belongs under `src/providers/hyperv`.
 - Provider-neutral mutation ordering and ownership proof belong under `src/engine`.
 - Portable QEMU lifecycle work belongs under `src/providers/qemu`; KVM/HVF/WHPX are accelerators, not separate top-level providers.
+- Unix state is private-owner state: directories `0700`, files `0600`, and
+  authority-bearing opens use no-follow/inode checks.
 - PowerShell Direct, QGA, and SSH belong under `src/guest`.
 - Application-specific tooling does not belong in provider or guest-transport modules.
 

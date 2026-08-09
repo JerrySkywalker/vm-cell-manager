@@ -89,6 +89,12 @@ process trees, permissions, locking, symlink containment, and QEMU/KVM
 capability behavior. macOS abstractions remain non-breaking, while real HVF
 acceptance is deferred.
 
+Status: repository-local portability implementation is active on the stacked
+M4 branch. Unix private-state and no-follow identity gates, KVM device
+usability filtering, canonical executable discovery, and portable validation
+workflow are implemented; native Linux/KVM acceptance remains environment
+gated.
+
 WSL or nested environments may be used for development experiments but are not substitutes for final host acceptance.
 
 ## M5 — Automation contract hardening

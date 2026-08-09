@@ -562,7 +562,10 @@ mod tests {
             writes: Vec::new(),
         };
         assert!(matches!(
-            JsonLineProtocol::new(stream).receive(Instant::now() + Duration::from_secs(1)),
+            // This fixture intentionally consumes a full 1 MiB byte-by-byte;
+            // leave enough wall-clock budget for a saturated debug test run so
+            // the assertion exercises the size limit rather than the deadline.
+            JsonLineProtocol::new(stream).receive(Instant::now() + Duration::from_secs(30)),
             Err(ProviderError::InvalidResponse(_))
         ));
     }
@@ -627,5 +630,37 @@ mod tests {
             QmpClient::negotiate(drip, Duration::from_millis(5)),
             Err(ProviderError::Command(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_qmp_socket_round_trip_is_deadline_bound() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qmp.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"{\"QMP\":{}}\n").unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            stream.write_all(b"{\"return\":{},\"id\":1}\n").unwrap();
+            request.clear();
+            reader.read_line(&mut request).unwrap();
+            stream
+                .write_all(b"{\"return\":{\"status\":\"running\"},\"id\":2}\n")
+                .unwrap();
+        });
+        let stream =
+            connect_endpoint(&ControlEndpoint::Unix(path), Duration::from_secs(1)).unwrap();
+        let mut client = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            client.execute("query-status", None).unwrap()["status"],
+            "running"
+        );
+        server.join().unwrap();
     }
 }
