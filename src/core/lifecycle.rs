@@ -12,7 +12,6 @@ pub fn validate_transition(from: CellState, to: CellState) -> Result<(), Lifecyc
     let valid = matches!(
         (from, to),
         (CellState::Creating, CellState::Stopped)
-            | (CellState::Creating, CellState::Running)
             | (CellState::Creating, CellState::Failed)
             | (CellState::Stopped, CellState::Running)
             | (CellState::Stopped, CellState::Destroying)
@@ -36,9 +35,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disposable_lifecycle_accepts_create_run_destroy() {
+    fn disposable_lifecycle_accepts_create_stop_run_destroy() {
         assert_eq!(
-            validate_transition(CellState::Creating, CellState::Running),
+            validate_transition(CellState::Creating, CellState::Stopped),
+            Ok(())
+        );
+        assert_eq!(
+            validate_transition(CellState::Stopped, CellState::Running),
             Ok(())
         );
         assert_eq!(

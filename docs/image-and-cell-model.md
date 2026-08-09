@@ -27,6 +27,8 @@ A logical image may have one or more provider variants. Provider artifacts do no
 
 Once an image variant is registered as a base, normal cell operations must treat it as immutable. The implementation should record enough identity information to detect accidental replacement or mutation before deriving a new cell.
 
+M1 records the canonical ordinary-file path, SHA-256, file size, VHDX format/type, and registration time. Before creating a cell it reopens the base read-only, rejects reparse points, revalidates the Hyper-V metadata and digest, and holds the parent against replacement or write while the differencing disk is created.
+
 The first practical implementation should prefer simple strong checks over clever reconciliation.
 
 ## Disposable overlay
@@ -67,11 +69,11 @@ state
 paths owned by the cell
 ```
 
-Provider object names should include or be strongly associated with the CellId so recovery can reconcile manifests with the hypervisor.
+Provider object names include the CellId, but names are not ownership authority. M1 additionally records the Hyper-V VM id and a marker bound to the installation id, CellId, and create-operation id.
 
 ## Ownership rule
 
-A provider-visible VM is not automatically a VM Cell Manager resource.
+A provider-visible VM is not automatically a VM Cell Manager resource. Start, stop, and destroy require matching local state plus provider identity; a name-only match is explicitly unproven.
 
 Destructive mutation requires positive ownership evidence. Normal commands should not adopt or delete foreign VMs merely because their name resembles a `vmcell` object.
 

@@ -84,3 +84,39 @@ fn probe_qemu() -> ProviderProbe {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::providers::{
+        ProviderError, ProviderMutationAuthority, ProviderPowerState, ProviderVm,
+    };
+
+    #[test]
+    fn m1_qemu_mutation_is_explicitly_unsupported() {
+        let (_directory, _state, installation, runtime, record) =
+            crate::providers::test_mutation_fixture();
+        let expected = ProviderVm {
+            id: "not-a-qemu-object".to_owned(),
+            name: "not-a-qemu-object".to_owned(),
+            power_state: ProviderPowerState::Off,
+            ownership_marker: String::new(),
+            configuration_path: PathBuf::new(),
+            attached_disks: Vec::new(),
+            network_adapter_count: 0,
+            cpu_count: 1,
+            memory_mib: 512,
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime);
+        let error = QemuProvider.start_vm(&authority, &expected).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::Unsupported {
+                provider: "qemu",
+                operation: "start_vm"
+            }
+        ));
+    }
+}

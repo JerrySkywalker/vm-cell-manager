@@ -12,15 +12,32 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-Because provider integration depends on host virtualization capabilities, generic CI validates portable Rust code while dedicated provider acceptance will later run on hosts that explicitly expose Hyper-V, KVM, HVF, or WHPX.
+The declared compiler floor is proved separately with an isolated Rust 1.85.0 toolchain and the locked graph:
 
-## Bootstrap safety rule
+```bash
+cargo metadata --locked --offline --all-features --format-version 1
+cargo check --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-features --doc
+```
 
-M0 provider code is read-only. A change that creates, starts, stops, destroys, enables, reconfigures, or otherwise mutates host virtualization state belongs to a later milestone and should not be disguised as a probe or discovery change.
+Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
+
+## Provider safety rule
+
+M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands carrying an engine-issued installation/runtime authority and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.
+
+## M1 validation tiers
+
+1. Unit and contract tests use a mocked provider/executor and temporary state roots.
+2. Windows safety tests use real subprocess aborts and cross-process filesystem contention to exercise manifest crash atomicity, duplicate-root locking, and state-directory replacement resistance without invoking Hyper-V.
+3. Core CI runs format, Clippy, and all non-destructive tests.
+4. Real Hyper-V acceptance is a separately authorized activity on a dedicated host with a disposable VHDX, an isolated state root, and pre/post foreign-VM and switch checks.
 
 ## Platform boundaries
 
 - Windows-native lifecycle work belongs under `src/providers/hyperv`.
+- Provider-neutral mutation ordering and ownership proof belong under `src/engine`.
 - Portable QEMU lifecycle work belongs under `src/providers/qemu`; KVM/HVF/WHPX are accelerators, not separate top-level providers.
 - PowerShell Direct, QGA, and SSH belong under `src/guest`.
 - Application-specific tooling does not belong in provider or guest-transport modules.

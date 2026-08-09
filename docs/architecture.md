@@ -45,18 +45,19 @@ The core selects or validates a local provider. It does not schedule across host
 └─────────────────────────────────────────┘
 ```
 
-The six implementation areas map to Rust modules rather than services:
+The implementation areas map to Rust modules rather than services:
 
 - `cli`: human-facing CLI and versioned JSON output;
 - `core`: provider-neutral cell/image/capability/lifecycle model;
+- `engine`: Rust-owned mutation ordering, ownership proof, and reconciliation;
 - `providers`: local hypervisor implementations;
 - `guest`: PowerShell Direct, QGA, SSH, and future guest transports;
 - `state`: local manifests, locks, ownership metadata, and logs;
-- the cell engine is composed from `core`, `providers`, and `state` rather than implemented as a daemon.
+- the cell engine composes `core`, `providers`, and `state` in-process rather than running as a daemon.
 
 ## Control flow
 
-A future create flow is expected to be:
+The M1 create flow is:
 
 ```text
 CLI request
@@ -65,28 +66,34 @@ CLI request
 validate CellSpec
    │
    ▼
-resolve local ProviderCapability
+acquire one local mutation lock
    │
    ▼
-resolve Image Variant
+resolve and re-verify immutable Image Variant
    │
    ▼
-create writable overlay
+write durable Creating ownership intent
    │
    ▼
-provider creates VM
+create exactly one writable overlay
    │
    ▼
-write ownership manifest
+provider creates the smallest VM object and returns its immutable id
    │
    ▼
-optional GuestTransport readiness
+record provider id durably
    │
    ▼
-Cell = ready/running
+claim by id, then configure networkless CPU state
+   │
+   ▼
+reconcile complete ownership
+   │
+   ▼
+Cell = stopped/ready
 ```
 
-Destroy is the reverse only for resources whose ownership is proven. Foreign VM discovery must never imply mutation authority.
+Durable intent precedes the first provider mutation. Destroy reverses the flow only after the local manifest, provider id, ownership marker, configuration path, disk attachment, and bounded VM configuration all agree. Foreign VM discovery or a name match never implies mutation authority.
 
 ## Why Provider and Guest I/O are separate
 
@@ -116,6 +123,14 @@ A cell mutation should require both:
 
 1. a local manifest proving `vmcell` ownership; and
 2. provider identity that still matches the manifest.
+
+M1 makes that rule concrete: the current persisted installation id, CellId, operation id, provider VM id, provider marker, configuration path, and single attached overlay are checked before start, stop, or destroy. Privileged provider verbs require an unforgeable engine-issued mutation authority, receive the already-proven provider snapshot, and revalidate it immediately before mutation while holding a cross-process provider mutex. Provider drift is reported without automatic adoption or repair.
+
+Persisted installation, image, cell, and ownership schemas are rejected when their versions are unsupported. A missing installation identity is never recreated by a lifecycle authorization path.
+
+On Windows, path identity treats ordinary drive and UNC paths as equivalent to their verbatim `\\?\` forms for provider reconciliation. This alias normalization is not used for containment: state and runtime creation/deletion separately reject reparse points throughout the existing ancestor chain, pin ordinary directory identities across provider use, and require the physical CellId directory to be a direct child of the physical runtime root. Persisted manifest filenames are also bound to their embedded IDs.
+
+The provider mutex coordinates `vmcell` processes; it cannot serialize unrelated Hyper-V tools. The Rust mutation guard also pins the state root and its `locks`, `images`, `cells`, and `runtime` children against replacement while an operation is active. Real-provider acceptance therefore requires an isolated host window with no concurrent external Hyper-V writer and exclusive, ACL-enforced control of the configured vmcell state root.
 
 The state store is not intended to become a distributed database. If multi-host scheduling is required, it belongs above this project.
 

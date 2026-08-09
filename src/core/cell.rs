@@ -1,8 +1,15 @@
+use std::fmt;
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
 
-use super::image::ImageId;
+use super::image::{ImageBinding, ImageId};
+use super::ownership::{CellOwnership, ProviderObjectIdentity};
+
+pub const CELL_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -21,6 +28,24 @@ impl Default for CellId {
     }
 }
 
+impl fmt::Display for CellId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for CellId {
+    type Err = CellIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self).map_err(CellIdError)
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("invalid cell id: {0}")]
+pub struct CellIdError(#[source] uuid::Error);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellState {
@@ -32,6 +57,19 @@ pub enum CellState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellPhase {
+    IntentRecorded,
+    OverlayCreated,
+    ProviderObjectCreated,
+    ProviderObjectClaimed,
+    Ready,
+    Destroying,
+    DestroyingProvisioning,
+    Destroyed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellSpec {
     pub image: ImageId,
@@ -41,13 +79,19 @@ pub struct CellSpec {
     pub ttl_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellRecord {
     pub schema_version: u32,
     pub id: CellId,
     pub provider: String,
     pub spec: CellSpec,
+    pub image: ImageBinding,
+    pub ownership: CellOwnership,
+    pub provider_object: Option<ProviderObjectIdentity>,
     pub state: CellState,
+    pub phase: CellPhase,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
 }

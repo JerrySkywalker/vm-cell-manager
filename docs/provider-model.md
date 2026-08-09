@@ -19,6 +19,8 @@ Expected responsibilities:
 
 PowerShell Direct belongs to the guest transport layer, not the Hyper-V lifecycle provider.
 
+The M1 Hyper-V compatibility boundary invokes fixed, single-purpose Windows PowerShell scriptlets with JSON input/output. Rust owns validation, ordering, state transitions, failure handling, and reconciliation. PowerShell does not contain a second orchestration state machine and never enables Hyper-V, reboots the host, or creates/modifies virtual switches.
+
 ### QEMU
 
 Portable reference provider.
