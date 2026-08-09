@@ -550,6 +550,12 @@ fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
             false,
         ),
         EngineError::InvalidImage(_) => classification(
+            "vmcell.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        EngineError::ImageIntegrity(_) => classification(
             "vmcell.image.integrity",
             CliErrorCategory::Integrity,
             CliExitCode::Integrity,
@@ -843,9 +849,15 @@ mod tests {
                 true,
             ),
             (
-                Box::new(EngineError::InvalidImage("hash drift".to_owned())),
+                Box::new(EngineError::ImageIntegrity("hash drift".to_owned())),
                 "vmcell.image.integrity",
                 CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(EngineError::InvalidImage("missing image path".to_owned())),
+                "vmcell.invalid_input",
+                CliExitCode::InvalidInput,
                 false,
             ),
             (

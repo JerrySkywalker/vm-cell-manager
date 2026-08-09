@@ -70,8 +70,8 @@ pub(crate) fn connect_endpoint(
 ) -> Result<Box<dyn ReadWrite>, ProviderError> {
     let deadline = Instant::now() + timeout;
     loop {
-        let remaining = remaining_duration(deadline).map_err(|error| {
-            ProviderError::Command(format!("QEMU control endpoint unavailable: {error}"))
+        let remaining = remaining_duration(deadline).map_err(|_| {
+            ProviderError::Timeout("QEMU control endpoint connection timed out".to_owned())
         })?;
         let result: std::io::Result<Box<dyn ReadWrite>> = match endpoint {
             ControlEndpoint::Unix(path) => connect_unix(path, remaining),
@@ -83,10 +83,10 @@ pub(crate) fn connect_endpoint(
                 let _ = error;
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => {
-                return Err(ProviderError::Command(format!(
-                    "QEMU control endpoint unavailable: {error}"
-                )));
+            Err(_) => {
+                return Err(ProviderError::Timeout(
+                    "QEMU control endpoint connection timed out".to_owned(),
+                ));
             }
         }
     }
@@ -635,6 +635,15 @@ mod tests {
         };
         assert!(matches!(
             QmpClient::negotiate(drip, Duration::from_millis(5)),
+            Err(ProviderError::Timeout(_))
+        ));
+    }
+
+    #[test]
+    fn endpoint_deadline_is_a_typed_timeout() {
+        let endpoint = ControlEndpoint::Unix(PathBuf::from("never-connected.sock"));
+        assert!(matches!(
+            connect_endpoint(&endpoint, Duration::ZERO),
             Err(ProviderError::Timeout(_))
         ));
     }

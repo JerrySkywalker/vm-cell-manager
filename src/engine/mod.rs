@@ -212,6 +212,9 @@ pub enum EngineError {
     #[error("invalid image: {0}")]
     InvalidImage(String),
 
+    #[error("registered image integrity check failed: {0}")]
+    ImageIntegrity(String),
+
     #[error("image id is already registered with different identity: {0}")]
     ImageConflict(ImageId),
 
@@ -1095,28 +1098,29 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         variant: &ImageVariant,
     ) -> Result<ImmutableParentGuard, EngineError> {
-        let canonical = canonical_image_path(&variant.path)?;
+        let canonical = canonical_image_path(&variant.path).map_err(as_image_integrity)?;
         if !paths_equal(&canonical, &variant.path) {
-            return Err(EngineError::InvalidImage(
+            return Err(EngineError::ImageIntegrity(
                 "registered image path no longer resolves to the same file".to_owned(),
             ));
         }
-        let mut handle = open_immutable_parent(&canonical)?;
+        let mut handle = open_immutable_parent(&canonical).map_err(as_image_integrity)?;
         let file_size = handle
             .file
             .metadata()
-            .map_err(|error| EngineError::InvalidImage(error.to_string()))?
+            .map_err(|error| EngineError::ImageIntegrity(error.to_string()))?
             .len();
         if file_size != variant.file_size {
-            return Err(EngineError::InvalidImage(
+            return Err(EngineError::ImageIntegrity(
                 "registered image size changed".to_owned(),
             ));
         }
         let provider_info = self.provider.inspect_image(canonical.clone())?;
-        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle.file)?;
+        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)
+            .map_err(as_image_integrity)?;
+        let sha256 = sha256_file(&mut handle.file).map_err(as_image_integrity)?;
         if sha256 != variant.sha256 {
-            return Err(EngineError::InvalidImage(
+            return Err(EngineError::ImageIntegrity(
                 "registered image SHA-256 changed".to_owned(),
             ));
         }
@@ -1545,6 +1549,13 @@ impl<P: LocalVmProvider> CellEngine<P> {
         record.last_error = Some(error.to_string());
         self.state.save_cell(&record)?;
         Err(error)
+    }
+}
+
+fn as_image_integrity(error: EngineError) -> EngineError {
+    match error {
+        EngineError::InvalidImage(message) => EngineError::ImageIntegrity(message),
+        error => error,
     }
 }
 
@@ -3047,7 +3058,7 @@ mod tests {
 
         let error = engine.create_cell(spec(image_id)).unwrap_err();
 
-        assert!(matches!(error, EngineError::InvalidImage(_)));
+        assert!(matches!(error, EngineError::ImageIntegrity(_)));
         assert!(
             !engine
                 .provider

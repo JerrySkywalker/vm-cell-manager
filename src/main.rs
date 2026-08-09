@@ -530,7 +530,14 @@ fn read_credentials(
         .username
         .ok_or_else(|| CliInputError("PowerShell Direct requires --username".to_owned()))?;
     let mut password = Zeroizing::new(String::new());
-    std::io::stdin().take(4097).read_to_string(&mut password)?;
+    if let Err(error) = std::io::stdin().take(4097).read_to_string(&mut password) {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            return Err(
+                CliInputError("guest password stdin must be valid UTF-8".to_owned()).into(),
+            );
+        }
+        return Err(error.into());
+    }
     while password.ends_with(['\r', '\n']) {
         password.pop();
     }
