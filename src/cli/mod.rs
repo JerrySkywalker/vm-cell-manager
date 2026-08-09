@@ -8,7 +8,7 @@ use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
 use crate::core::cell::{CellId, CellIdError};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
-use crate::engine::EngineError;
+use crate::engine::{EngineError, RunCellError, RunCleanupDisposition, RunFailureReport, RunStage};
 use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
@@ -89,6 +89,51 @@ pub enum Command {
 
         #[arg(long)]
         allow_tcg: bool,
+    },
+
+    /// Create a disposable cell, run one guest command, and apply the cleanup policy.
+    Run {
+        #[arg(long)]
+        image: ImageId,
+
+        #[arg(long = "cpu", visible_alias = "cpu-count", default_value_t = 2)]
+        cpu_count: u16,
+
+        #[arg(long = "memory", visible_alias = "memory-mib", default_value_t = 4096)]
+        memory_mib: u64,
+
+        #[arg(long = "ttl", visible_alias = "ttl-seconds")]
+        ttl_seconds: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
+        provider: CliProvider,
+
+        #[arg(long, value_enum)]
+        accelerator: Option<CliAccelerator>,
+
+        #[arg(long)]
+        allow_tcg: bool,
+
+        #[arg(long, conflicts_with = "keep_on_failure")]
+        keep: bool,
+
+        #[arg(long)]
+        keep_on_failure: bool,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long = "action-timeout-seconds", default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        action_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
+        max_output_bytes: u64,
+
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 
     /// List locally recorded cells.
@@ -473,6 +518,80 @@ impl ErrorEnvelope {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RunErrorEnvelope {
+    pub schema_version: u32,
+    pub error: ErrorBody,
+    pub run: RunErrorReport,
+}
+
+impl RunErrorEnvelope {
+    #[must_use]
+    pub fn new(
+        classification: CliErrorClassification,
+        message: impl Into<String>,
+        run: &RunFailureReport,
+    ) -> Self {
+        Self {
+            schema_version: CLI_JSON_SCHEMA_VERSION,
+            error: ErrorBody {
+                code: classification.code.to_owned(),
+                category: classification.category,
+                message: message.into(),
+                retryable: classification.retryable,
+                exit_code: classification.exit_code.as_u8(),
+            },
+            run: RunErrorReport::from(run),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunErrorReport {
+    pub schema_version: u32,
+    pub cell_id: Option<CellId>,
+    pub operation_id: Option<GuestOperationId>,
+    pub stage: RunStage,
+    pub cleanup: RunCleanupDisposition,
+    pub error_code: String,
+    pub cleanup_error_code: Option<String>,
+    pub result: Option<RunErrorResult>,
+}
+
+impl From<&RunFailureReport> for RunErrorReport {
+    fn from(report: &RunFailureReport) -> Self {
+        Self {
+            schema_version: report.schema_version,
+            cell_id: report.cell_id,
+            operation_id: report.operation_id,
+            stage: report.stage,
+            cleanup: report.cleanup,
+            error_code: report.error_code.clone(),
+            cleanup_error_code: report.cleanup_error_code.clone(),
+            result: report.result.as_ref().map(RunErrorResult::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunErrorResult {
+    pub exit_code: i32,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub truncated: bool,
+}
+
+impl From<&crate::guest::GuestCommandResult> for RunErrorResult {
+    fn from(result: &crate::guest::GuestCommandResult) -> Self {
+        Self {
+            exit_code: result.exit_code,
+            stdout_bytes: result.stdout_bytes,
+            stderr_bytes: result.stderr_bytes,
+            truncated: result.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub code: String,
     pub category: CliErrorCategory,
@@ -568,6 +687,9 @@ const fn classification(
 
 #[must_use]
 pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassification {
+    if let Some(error) = error.downcast_ref::<RunCellError>() {
+        return classify_engine_error(error.engine_error());
+    }
     if let Some(error) = error.downcast_ref::<EngineError>() {
         return classify_engine_error(error);
     }
@@ -980,6 +1102,44 @@ mod tests {
     }
 
     #[test]
+    fn run_error_envelope_omits_guest_stream_contents() {
+        let report = RunFailureReport {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            cell_id: Some(CellId::new()),
+            operation_id: Some(GuestOperationId::new()),
+            stage: RunStage::Cleanup,
+            cleanup: RunCleanupDisposition::Failed,
+            error_code: "vmcell.provider.failed".to_owned(),
+            cleanup_error_code: None,
+            result: Some(crate::guest::GuestCommandResult {
+                exit_code: 23,
+                stdout: "stdout-secret-sentinel".to_owned(),
+                stderr: "stderr-secret-sentinel".to_owned(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: 22,
+                stderr_bytes: 22,
+                truncated: false,
+            }),
+        };
+        let classification = classify_cli_error(&ProviderError::Command("redacted".to_owned()));
+        let value = serde_json::to_value(RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            &report,
+        ))
+        .unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert!(!serialized.contains("stdout-secret-sentinel"));
+        assert!(!serialized.contains("stderr-secret-sentinel"));
+        assert!(value["run"]["result"].get("stdout").is_none());
+        assert!(value["run"]["result"].get("stderr").is_none());
+        assert_eq!(value["run"]["result"]["exit_code"], 23);
+        assert_eq!(value["run"]["result"]["stdout_bytes"], 22);
+        assert_eq!(value["run"]["result"]["stderr_bytes"], 22);
+    }
+
+    #[test]
     fn deterministic_error_taxonomy_covers_state_provider_guest_and_engine() {
         let cases: Vec<(Box<dyn Error>, &str, CliExitCode, bool)> = vec![
             (
@@ -1186,6 +1346,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_human_run_surface_and_rejects_conflicting_retention() {
+        let cli = Cli::try_parse_from([
+            "vmcell",
+            "run",
+            "--image",
+            "windows-dev",
+            "--cpu",
+            "4",
+            "--memory",
+            "8192",
+            "--ttl",
+            "3600",
+            "--keep-on-failure",
+            "--username",
+            "Administrator",
+            "--password-stdin",
+            "--",
+            "cmd.exe",
+            "/c",
+            "echo ok",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                cpu_count: 4,
+                memory_mib: 8192,
+                ttl_seconds: Some(3600),
+                keep_on_failure: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "run",
+                "--image",
+                "windows-dev",
+                "--keep",
+                "--keep-on-failure",
+                "--",
+                "cmd.exe",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -8,12 +8,13 @@ use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliInputError, CliProvider, Command, CredentialArgs, DoctorReport,
     ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
-    classify_cli_error, public_error_message,
+    RunErrorEnvelope, classify_cli_error, public_error_message,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, EngineError, GuestCopyInRequest,
-    GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest,
+    GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest, RunCellError, RunCellReport,
+    RunCellRequest, RunCleanupPolicy,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -32,12 +33,48 @@ fn main() -> ExitCode {
     };
     let json = cli.json;
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let classification = classify_cli_error(error.as_ref());
-            emit_classified_error(classification, json)
-        }
+        Ok(exit_code) => exit_code,
+        Err(error) => emit_error(error.as_ref(), json),
     }
+}
+
+fn emit_error(error: &(dyn Error + 'static), json: bool) -> ExitCode {
+    let classification = classify_cli_error(error);
+    if let Some(run_error) = error.downcast_ref::<RunCellError>() {
+        return emit_run_error(classification, run_error, json);
+    }
+    emit_classified_error(classification, json)
+}
+
+fn emit_run_error(
+    classification: vm_cell_manager::cli::CliErrorClassification,
+    error: &RunCellError,
+    json: bool,
+) -> ExitCode {
+    let message = public_error_message(classification);
+    if json {
+        let envelope = RunErrorEnvelope::new(classification, message, error.report());
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&envelope)
+                .unwrap_or_else(|_| "{\"schema_version\":1,\"error\":{\"code\":\"vmcell.internal\",\"category\":\"internal\",\"message\":\"error serialization failed\",\"retryable\":false,\"exit_code\":10}}".to_owned())
+        );
+    } else {
+        let report = error.report();
+        let cell = report
+            .cell_id
+            .map_or_else(|| "none".to_owned(), |cell_id| cell_id.to_string());
+        let operation = report.operation_id.map_or_else(
+            || "none".to_owned(),
+            |operation_id| operation_id.to_string(),
+        );
+        let cleanup_error = report.cleanup_error_code.as_deref().unwrap_or("none");
+        eprintln!(
+            "vmcell: {}: {message}; run stage={:?} cell={} operation={} cleanup={:?} cleanup_error={}",
+            classification.code, report.stage, cell, operation, report.cleanup, cleanup_error
+        );
+    }
+    ExitCode::from(classification.exit_code.as_u8())
 }
 
 fn json_requested_by_argv() -> bool {
@@ -83,7 +120,7 @@ fn emit_classified_error(
     ExitCode::from(classification.exit_code.as_u8())
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     let state_root = cli.state_root.clone();
     let lock_timeout = Duration::from_millis(cli.lock_timeout_ms);
     match cli.command {
@@ -168,34 +205,32 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let root = state_root.unwrap_or_else(StateStore::default_root);
             let state = StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout);
             let provider = provider_for_command(&command, &state)?;
-            match provider.as_str() {
+            return match provider.as_str() {
                 "hyperv" => run_m2(
                     command,
                     cli.json,
                     &CellEngine::new(state, HyperVProvider::system()),
-                )?,
+                ),
                 "qemu" => run_m2(
                     command,
                     cli.json,
                     &CellEngine::new(state, QemuProvider::system(root)),
-                )?,
-                value => {
-                    return Err(EngineError::Integrity(format!(
-                        "unsupported persisted provider: {value}"
-                    ))
-                    .into());
-                }
-            }
+                ),
+                value => Err(EngineError::Integrity(format!(
+                    "unsupported persisted provider: {value}"
+                ))
+                .into()),
+            };
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_m2<P: LocalVmProvider>(
     command: Command,
     json: bool,
     engine: &CellEngine<P>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<ExitCode, Box<dyn Error>> {
     match command {
         Command::Image { command } => match command {
             ImageCommand::Add {
@@ -247,6 +282,58 @@ fn run_m2<P: LocalVmProvider>(
             emit(&cell, json, || {
                 println!("created cell {} ({:?})", cell.id, cell.state)
             })?;
+        }
+        Command::Run {
+            image,
+            cpu_count,
+            memory_mib,
+            ttl_seconds,
+            provider: _,
+            accelerator,
+            allow_tcg,
+            keep,
+            keep_on_failure,
+            credential,
+            readiness_timeout_seconds,
+            action_timeout_seconds,
+            max_output_bytes,
+            mut command,
+        } => {
+            let program = command.remove(0);
+            let report = run_cell_guest(
+                engine,
+                credential,
+                RunCellRequest {
+                    spec: CellSpec {
+                        image,
+                        provider: Some(engine.provider_name().to_owned()),
+                        cpu_count,
+                        memory_mib,
+                        ttl_seconds,
+                        accelerator: accelerator.map(|value| value.as_str().to_owned()),
+                        allow_tcg,
+                    },
+                    command: GuestCommand {
+                        program,
+                        args: command,
+                        timeout: Duration::from_secs(action_timeout_seconds),
+                        max_output_bytes,
+                    },
+                    readiness: readiness(readiness_timeout_seconds),
+                    cleanup: RunCleanupPolicy {
+                        keep,
+                        keep_on_failure,
+                    },
+                },
+            )?;
+            if json {
+                emit(&report, true, || {})?;
+            } else {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                write_human_run_result(&report, &mut stdout.lock(), &mut stderr.lock())?;
+            }
+            return Ok(guest_exit_status(report.result.exit_code));
         }
         Command::List => {
             let response = ListEnvelope::new(engine.list_cells()?);
@@ -449,7 +536,7 @@ fn run_m2<P: LocalVmProvider>(
             unreachable!("handled before engine creation")
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn provider_for_command(command: &Command, state: &StateStore) -> Result<String, Box<dyn Error>> {
@@ -457,7 +544,8 @@ fn provider_for_command(command: &Command, state: &StateStore) -> Result<String,
         Command::Image {
             command: ImageCommand::Add { provider, .. },
         }
-        | Command::Create { provider, .. } => provider.as_str().to_owned(),
+        | Command::Create { provider, .. }
+        | Command::Run { provider, .. } => provider.as_str().to_owned(),
         Command::Inspect { cell_id }
         | Command::Start { cell_id }
         | Command::Stop { cell_id }
@@ -504,6 +592,45 @@ fn exec_guest<P: LocalVmProvider>(
             );
         }
     })
+}
+
+fn run_cell_guest<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: RunCellRequest,
+) -> Result<RunCellReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)?;
+    Ok(match engine.provider_name() {
+        "hyperv" => engine.run_cell(&PowerShellDirectTransport::system(), &credentials, request)?,
+        "qemu" => engine.run_cell(&QemuGuestAgentTransport::system(), &credentials, request)?,
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
+    })
+}
+
+fn guest_exit_status(exit_code: i32) -> ExitCode {
+    if exit_code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(u8::try_from(exit_code).unwrap_or(1))
+    }
+}
+
+fn write_human_run_result(
+    report: &RunCellReport,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::io::Result<()> {
+    stdout.write_all(report.result.stdout.as_bytes())?;
+    stderr.write_all(report.result.stderr.as_bytes())?;
+    writeln!(
+        stderr,
+        "vmcell: run cell {}: exit={} cleanup={:?}",
+        report.cell_id, report.result.exit_code, report.cleanup
+    )
 }
 
 fn copy_in_guest<P: LocalVmProvider>(
@@ -632,4 +759,47 @@ fn emit<T: Serialize>(
         human();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_guest_exit_status_is_propagated_when_representable() {
+        assert_eq!(guest_exit_status(0), ExitCode::SUCCESS);
+        assert_eq!(guest_exit_status(23), ExitCode::from(23));
+        assert_eq!(guest_exit_status(-1), ExitCode::from(1));
+        assert_eq!(guest_exit_status(256), ExitCode::from(1));
+    }
+
+    #[test]
+    fn human_run_result_forwards_bounded_guest_streams_and_separates_status() {
+        let report = RunCellReport {
+            schema_version: 1,
+            cell_id: vm_cell_manager::core::cell::CellId::new(),
+            operation_id: vm_cell_manager::core::guest::GuestOperationId::new(),
+            outcome: vm_cell_manager::engine::RunOutcome::GuestNonZero,
+            result: vm_cell_manager::guest::GuestCommandResult {
+                exit_code: 23,
+                stdout: "guest stdout\n".to_owned(),
+                stderr: "guest stderr\n".to_owned(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: 13,
+                stderr_bytes: 13,
+                truncated: false,
+            },
+            cleanup: vm_cell_manager::engine::RunCleanupDisposition::Destroyed,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_human_run_result(&report, &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(stdout, b"guest stdout\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.starts_with("guest stderr\n"));
+        assert!(stderr.contains("exit=23"));
+        assert!(stderr.contains("cleanup=Destroyed"));
+    }
 }
