@@ -9,6 +9,9 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - Deterministic portable Windows ZIP/checksum packaging with schema-versioned
   build provenance, install/remove instructions, repeat-build verification,
   and a manual trusted-runner artifact workflow.
+- A release-gated, copyable Windows Human MVP quick start aligned with CLI help:
+  portable install, doctor, prepared-VHDX validation/registration, one bounded
+  `vmcell run`, and explicit cleanup verification.
 
 ### Added
 - Stable M5 JSON schema-version constants and a provider-neutral automation

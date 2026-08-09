@@ -26,7 +26,8 @@ pub struct CliInputError(pub String);
 #[command(
     name = "vmcell",
     version,
-    about = "Local disposable VM execution cells"
+    about = "Local disposable VM execution cells",
+    after_help = "Windows Human MVP examples (real execution remains release-gated):\n  vmcell doctor\n  vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell image add --id windows-dev --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell run --image windows-dev --username Administrator --password-stdin -- cmd.exe /d /c ver\n\nSee docs/quickstart-windows.md. Never place a guest password on argv."
 )]
 pub struct Cli {
     /// Emit versioned machine-readable JSON.
@@ -1006,6 +1007,7 @@ mod tests {
     use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
     use crate::core::capability::ProviderCapabilities;
     use crate::providers::ProviderProbeStatus;
+    use clap::CommandFactory;
 
     #[test]
     fn doctor_contract_is_versioned_and_machine_readable() {
@@ -1624,5 +1626,18 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["vmcell", "image", "validate"]).is_err());
+    }
+
+    #[test]
+    fn root_help_carries_the_release_gated_windows_workflow_without_secret_argv() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Windows Human MVP examples"));
+        assert!(help.contains("vmcell doctor"));
+        assert!(help.contains("vmcell image validate --path BASE.vhdx"));
+        assert!(help.contains("vmcell run --image windows-dev"));
+        assert!(help.contains("--password-stdin"));
+        assert!(help.contains("real execution remains release-gated"));
+        assert!(!help.contains("--password secret"));
     }
 }
