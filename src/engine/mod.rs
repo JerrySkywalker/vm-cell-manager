@@ -212,11 +212,20 @@ pub enum EngineError {
     #[error("invalid image: {0}")]
     InvalidImage(String),
 
+    #[error("registered image integrity check failed: {0}")]
+    ImageIntegrity(String),
+
     #[error("image id is already registered with different identity: {0}")]
     ImageConflict(ImageId),
 
     #[error("invalid cell request: {0}")]
     InvalidCellRequest(String),
+
+    #[error("cell lifecycle conflicts with the requested operation: {0}")]
+    LifecycleConflict(String),
+
+    #[error("persisted cell integrity check failed: {0}")]
+    Integrity(String),
 
     #[error("ownership is not proven: {0}")]
     OwnershipNotProven(String),
@@ -814,12 +823,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             }
             GuestOperationPhase::ArtifactCommitted => {
                 let artifact_id = operation.artifact_id.ok_or_else(|| {
-                    EngineError::InvalidCellRequest(
+                    EngineError::Integrity(
                         "artifact-committed operation is missing its artifact id".to_owned(),
                     )
                 })?;
                 if artifact_id != operation.id {
-                    return Err(EngineError::InvalidCellRequest(
+                    return Err(EngineError::Integrity(
                         "artifact id does not match its operation id".to_owned(),
                     ));
                 }
@@ -1089,28 +1098,29 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         variant: &ImageVariant,
     ) -> Result<ImmutableParentGuard, EngineError> {
-        let canonical = canonical_image_path(&variant.path)?;
+        let canonical = canonical_image_path(&variant.path).map_err(as_image_integrity)?;
         if !paths_equal(&canonical, &variant.path) {
-            return Err(EngineError::InvalidImage(
+            return Err(EngineError::ImageIntegrity(
                 "registered image path no longer resolves to the same file".to_owned(),
             ));
         }
-        let mut handle = open_immutable_parent(&canonical)?;
+        let mut handle = open_immutable_parent(&canonical).map_err(as_image_integrity)?;
         let file_size = handle
             .file
             .metadata()
-            .map_err(|error| EngineError::InvalidImage(error.to_string()))?
+            .map_err(|error| EngineError::ImageIntegrity(error.to_string()))?
             .len();
         if file_size != variant.file_size {
-            return Err(EngineError::InvalidImage(
+            return Err(EngineError::ImageIntegrity(
                 "registered image size changed".to_owned(),
             ));
         }
         let provider_info = self.provider.inspect_image(canonical.clone())?;
-        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle.file)?;
+        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)
+            .map_err(as_image_integrity)?;
+        let sha256 = sha256_file(&mut handle.file).map_err(as_image_integrity)?;
         if sha256 != variant.sha256 {
-            return Err(EngineError::InvalidImage(
+            return Err(EngineError::ImageIntegrity(
                 "registered image SHA-256 changed".to_owned(),
             ));
         }
@@ -1460,12 +1470,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "run a guest operation on", &[CellState::Running])?;
         if record.phase != CellPhase::Ready {
-            return Err(EngineError::InvalidCellRequest(
+            return Err(EngineError::LifecycleConflict(
                 "guest operations require a ready cell".to_owned(),
             ));
         }
         let guest_os = record.image.guest_os.ok_or_else(|| {
-            EngineError::InvalidCellRequest(
+            EngineError::Integrity(
                 "guest operations require a cell with a persisted guest OS".to_owned(),
             )
         })?;
@@ -1539,6 +1549,13 @@ impl<P: LocalVmProvider> CellEngine<P> {
         record.last_error = Some(error.to_string());
         self.state.save_cell(&record)?;
         Err(error)
+    }
+}
+
+fn as_image_integrity(error: EngineError) -> EngineError {
+    match error {
+        EngineError::InvalidImage(message) => EngineError::ImageIntegrity(message),
+        error => error,
     }
 }
 
@@ -1815,7 +1832,7 @@ fn require_lifecycle_state(
     if allowed.contains(&record.state) {
         Ok(())
     } else {
-        Err(EngineError::InvalidCellRequest(format!(
+        Err(EngineError::LifecycleConflict(format!(
             "cannot {operation} cell in {:?} state",
             record.state
         )))
@@ -2149,9 +2166,9 @@ fn provider_variant<'a>(
         .filter(|variant| variant.provider == provider);
     let variant = variants
         .next()
-        .ok_or_else(|| EngineError::InvalidImage(format!("image has no {provider} variant")))?;
+        .ok_or_else(|| EngineError::ImageIntegrity(format!("image has no {provider} variant")))?;
     if variants.next().is_some() {
-        return Err(EngineError::InvalidImage(format!(
+        return Err(EngineError::ImageIntegrity(format!(
             "image has more than one {provider} variant"
         )));
     }
@@ -2872,6 +2889,35 @@ mod tests {
     }
 
     #[test]
+    fn persisted_provider_variant_cardinality_is_image_integrity() {
+        let mut image = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: "variant-integrity".parse().unwrap(),
+            guest_os: GuestOs::Linux,
+            guest_arch: Architecture::X86_64,
+            variants: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        assert!(matches!(
+            provider_variant(&image, "qemu"),
+            Err(EngineError::ImageIntegrity(_))
+        ));
+
+        let variant = ImageVariant {
+            provider: "qemu".to_owned(),
+            disk_format: "qcow2".to_owned(),
+            path: PathBuf::from("base.qcow2"),
+            sha256: "00".repeat(32),
+            file_size: 4096,
+        };
+        image.variants = vec![variant.clone(), variant];
+        assert!(matches!(
+            provider_variant(&image, "qemu"),
+            Err(EngineError::ImageIntegrity(_))
+        ));
+    }
+
+    #[test]
     fn create_finishes_stopped_with_one_networkless_overlay() {
         let (_directory, engine, image_id) = fixture();
         let cell = engine.create_cell(spec(image_id)).unwrap();
@@ -3041,7 +3087,7 @@ mod tests {
 
         let error = engine.create_cell(spec(image_id)).unwrap_err();
 
-        assert!(matches!(error, EngineError::InvalidImage(_)));
+        assert!(matches!(error, EngineError::ImageIntegrity(_)));
         assert!(
             !engine
                 .provider

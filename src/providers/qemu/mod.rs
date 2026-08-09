@@ -643,7 +643,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        Err(ProviderError::Command(
+        Err(ProviderError::Timeout(
             "QEMU did not terminate within the bounded stop window".to_owned(),
         ))
     }
@@ -1053,7 +1053,7 @@ fn remaining_provider_duration(deadline: std::time::Instant) -> Result<Duration,
     deadline
         .checked_duration_since(std::time::Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| ProviderError::Command("QEMU operation exceeded its deadline".to_owned()))
+        .ok_or_else(|| ProviderError::Timeout("QEMU operation exceeded its deadline".to_owned()))
 }
 
 #[cfg(unix)]
@@ -1161,13 +1161,16 @@ fn redacted_command_failure() -> String {
 }
 
 fn process_error_to_provider(error: ProcessError) -> ProviderError {
-    let message = match error {
-        ProcessError::Spawn => "QEMU command could not be spawned",
-        ProcessError::Io => "QEMU command I/O failed",
-        ProcessError::Timeout => "QEMU command timed out",
-        ProcessError::OutputLimit => "QEMU command output exceeded the limit",
-    };
-    ProviderError::Command(message.to_owned())
+    match error {
+        ProcessError::Spawn => {
+            ProviderError::Command("QEMU command could not be spawned".to_owned())
+        }
+        ProcessError::Io => ProviderError::Command("QEMU command I/O failed".to_owned()),
+        ProcessError::Timeout => ProviderError::Timeout("QEMU command timed out".to_owned()),
+        ProcessError::OutputLimit => {
+            ProviderError::OutputLimit("QEMU command output exceeded the limit".to_owned())
+        }
+    }
 }
 
 fn system_binary_name() -> OsString {

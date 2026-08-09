@@ -172,7 +172,7 @@ fn wait_for_bounded_provider_child(
             let _ = stdin_writer.join();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(ProviderError::Command(
+            return Err(ProviderError::Timeout(
                 "PowerShell provider command timed out".to_owned(),
             ));
         }
@@ -203,7 +203,7 @@ fn read_provider_pipe(mut pipe: impl Read) -> Result<Vec<u8>, ProviderError> {
             break;
         }
         if bytes.len().saturating_add(read) > PROVIDER_OUTPUT_LIMIT {
-            return Err(ProviderError::Command(
+            return Err(ProviderError::OutputLimit(
                 "PowerShell provider output exceeded the limit".to_owned(),
             ));
         }

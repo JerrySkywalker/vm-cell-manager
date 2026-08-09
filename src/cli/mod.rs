@@ -1,17 +1,25 @@
+use std::error::Error;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use crate::core::cell::CellId;
-use crate::core::guest::GuestOperationId;
-use crate::core::image::{Architecture, GuestOs, ImageId};
+use crate::core::cell::{CellId, CellIdError};
+use crate::core::guest::{GuestOperationId, GuestOperationIdError};
+use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
+use crate::engine::EngineError;
 use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_READINESS_TIMEOUT_SECONDS, GuestPath, OverwritePolicy,
+    DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
 };
-use crate::providers::{ProviderProbe, builtin_provider_probes};
-use crate::state::StateStore;
+use crate::providers::{ProviderError, ProviderProbe, builtin_provider_probes};
+use crate::state::{StateError, StateStore};
+
+pub const CLI_JSON_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid CLI input: {0}")]
+pub struct CliInputError(pub String);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -359,7 +367,7 @@ impl DoctorReport {
     #[must_use]
     pub fn collect(state_root: Option<PathBuf>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: CLI_JSON_SCHEMA_VERSION,
             host_os: std::env::consts::OS,
             host_arch: std::env::consts::ARCH,
             state_root: state_root.unwrap_or_else(StateStore::default_root),
@@ -369,15 +377,378 @@ impl DoctorReport {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ErrorEnvelope<'a> {
+pub struct ErrorEnvelope {
     pub schema_version: u32,
-    pub error: ErrorBody<'a>,
+    pub error: ErrorBody,
+}
+
+impl ErrorEnvelope {
+    #[must_use]
+    pub fn new(classification: CliErrorClassification, message: impl Into<String>) -> Self {
+        Self {
+            schema_version: CLI_JSON_SCHEMA_VERSION,
+            error: ErrorBody {
+                code: classification.code.to_owned(),
+                category: classification.category,
+                message: message.into(),
+                retryable: classification.retryable,
+                exit_code: classification.exit_code.as_u8(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
-pub struct ErrorBody<'a> {
-    pub category: &'static str,
-    pub message: &'a str,
+pub struct ErrorBody {
+    pub code: String,
+    pub category: CliErrorCategory,
+    pub message: String,
+    pub retryable: bool,
+    pub exit_code: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliErrorCategory {
+    InvalidInput,
+    NotFound,
+    Conflict,
+    Unavailable,
+    Unsupported,
+    Ownership,
+    Contention,
+    Timeout,
+    Integrity,
+    RecoveryRequired,
+    ResourceLimit,
+    Authentication,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CliExitCode {
+    Success = 0,
+    InvalidInput = 2,
+    NotFound = 3,
+    Conflict = 4,
+    Unavailable = 5,
+    Ownership = 6,
+    Contention = 7,
+    Timeout = 8,
+    Integrity = 9,
+    Internal = 10,
+    RecoveryRequired = 11,
+    ResourceLimit = 12,
+    Authentication = 13,
+    Unsupported = 14,
+}
+
+impl CliExitCode {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliErrorClassification {
+    pub code: &'static str,
+    pub category: CliErrorCategory,
+    pub exit_code: CliExitCode,
+    pub retryable: bool,
+}
+
+const fn classification(
+    code: &'static str,
+    category: CliErrorCategory,
+    exit_code: CliExitCode,
+    retryable: bool,
+) -> CliErrorClassification {
+    CliErrorClassification {
+        code,
+        category,
+        exit_code,
+        retryable,
+    }
+}
+
+#[must_use]
+pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassification {
+    if let Some(error) = error.downcast_ref::<EngineError>() {
+        return classify_engine_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<StateError>() {
+        return classify_state_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<ProviderError>() {
+        return classify_provider_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<GuestIoError>() {
+        return classify_guest_error(error);
+    }
+    if error.downcast_ref::<CliInputError>().is_some() {
+        return classification(
+            "vmcell.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        );
+    }
+    if error.downcast_ref::<CellIdError>().is_some()
+        || error.downcast_ref::<ImageIdError>().is_some()
+        || error.downcast_ref::<GuestOperationIdError>().is_some()
+    {
+        return classification(
+            "vmcell.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        );
+    }
+    classification(
+        "vmcell.internal",
+        CliErrorCategory::Internal,
+        CliExitCode::Internal,
+        false,
+    )
+}
+
+fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
+    match error {
+        EngineError::State(error) => classify_state_error(error),
+        EngineError::Provider(error) => classify_provider_error(error),
+        EngineError::Guest(error) => classify_guest_error(error),
+        EngineError::UnsupportedProvider(_) => classification(
+            "vmcell.provider.unsupported",
+            CliErrorCategory::Unsupported,
+            CliExitCode::Unsupported,
+            false,
+        ),
+        EngineError::ProviderUnavailable(_) => classification(
+            "vmcell.provider.unavailable",
+            CliErrorCategory::Unavailable,
+            CliExitCode::Unavailable,
+            true,
+        ),
+        EngineError::InvalidCellRequest(_) => classification(
+            "vmcell.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        EngineError::LifecycleConflict(_) => classification(
+            "vmcell.lifecycle.conflict",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+        EngineError::Integrity(_) => classification(
+            "vmcell.state.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        EngineError::InvalidImage(_) => classification(
+            "vmcell.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        EngineError::ImageIntegrity(_) => classification(
+            "vmcell.image.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        EngineError::ImageConflict(_) => classification(
+            "vmcell.image.conflict",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+        EngineError::OwnershipNotProven(_) => classification(
+            "vmcell.ownership.not_proven",
+            CliErrorCategory::Ownership,
+            CliExitCode::Ownership,
+            false,
+        ),
+        EngineError::ProviderDrift(_) => classification(
+            "vmcell.ownership.drift",
+            CliErrorCategory::Ownership,
+            CliExitCode::Ownership,
+            false,
+        ),
+        EngineError::UnexpectedPowerState(_) => classification(
+            "vmcell.lifecycle.conflict",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+    }
+}
+
+fn classify_state_error(error: &StateError) -> CliErrorClassification {
+    match error {
+        StateError::NotFound(_) => classification(
+            "vmcell.state.not_found",
+            CliErrorCategory::NotFound,
+            CliExitCode::NotFound,
+            false,
+        ),
+        StateError::AlreadyExists(_) => classification(
+            "vmcell.state.conflict",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+        StateError::MutationBusy => classification(
+            "vmcell.state.contention",
+            CliErrorCategory::Contention,
+            CliExitCode::Contention,
+            true,
+        ),
+        StateError::UnsafeRuntimePath(_)
+        | StateError::IdentityMismatch { .. }
+        | StateError::UnsupportedSchema { .. }
+        | StateError::ArtifactIntegrity { .. }
+        | StateError::GuestOperationIntegrity { .. } => classification(
+            "vmcell.state.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        StateError::Json { .. } => classification(
+            "vmcell.state.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        StateError::Io { .. } => classification(
+            "vmcell.state.io",
+            CliErrorCategory::Internal,
+            CliExitCode::Internal,
+            false,
+        ),
+    }
+}
+
+fn classify_provider_error(error: &ProviderError) -> CliErrorClassification {
+    match error {
+        ProviderError::Unsupported { .. } => classification(
+            "vmcell.provider.unsupported",
+            CliErrorCategory::Unsupported,
+            CliExitCode::Unsupported,
+            false,
+        ),
+        ProviderError::Command(_) => classification(
+            "vmcell.provider.command_failed",
+            CliErrorCategory::Unavailable,
+            CliExitCode::Unavailable,
+            false,
+        ),
+        ProviderError::Timeout(_) => classification(
+            "vmcell.provider.timeout",
+            CliErrorCategory::Timeout,
+            CliExitCode::Timeout,
+            false,
+        ),
+        ProviderError::OutputLimit(_) => classification(
+            "vmcell.provider.output_limit",
+            CliErrorCategory::ResourceLimit,
+            CliExitCode::ResourceLimit,
+            false,
+        ),
+        ProviderError::InvalidResponse(_) => classification(
+            "vmcell.provider.invalid_response",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        ProviderError::NotFound(_) => classification(
+            "vmcell.provider.not_found",
+            CliErrorCategory::NotFound,
+            CliExitCode::NotFound,
+            false,
+        ),
+        ProviderError::Collision(_) => classification(
+            "vmcell.provider.conflict",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+        ProviderError::OwnershipChanged(_) | ProviderError::Authority(_) => classification(
+            "vmcell.ownership.changed",
+            CliErrorCategory::Ownership,
+            CliExitCode::Ownership,
+            false,
+        ),
+    }
+}
+
+fn classify_guest_error(error: &GuestIoError) -> CliErrorClassification {
+    match error {
+        GuestIoError::NotImplemented(_) => classification(
+            "vmcell.guest.unsupported",
+            CliErrorCategory::Unsupported,
+            CliExitCode::Unsupported,
+            false,
+        ),
+        GuestIoError::InvalidRequest(_) | GuestIoError::PathViolation => classification(
+            "vmcell.guest.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        GuestIoError::OwnershipChanged => classification(
+            "vmcell.ownership.changed",
+            CliErrorCategory::Ownership,
+            CliExitCode::Ownership,
+            false,
+        ),
+        GuestIoError::GuestNotReady => classification(
+            "vmcell.guest.not_ready",
+            CliErrorCategory::Unavailable,
+            CliExitCode::Unavailable,
+            true,
+        ),
+        GuestIoError::AuthenticationFailed => classification(
+            "vmcell.guest.authentication",
+            CliErrorCategory::Authentication,
+            CliExitCode::Authentication,
+            false,
+        ),
+        GuestIoError::SessionFailed | GuestIoError::Transport => classification(
+            "vmcell.guest.transport",
+            CliErrorCategory::Unavailable,
+            CliExitCode::Unavailable,
+            false,
+        ),
+        GuestIoError::Timeout => classification(
+            "vmcell.guest.timeout",
+            CliErrorCategory::Timeout,
+            CliExitCode::Timeout,
+            false,
+        ),
+        GuestIoError::OutputLimit => classification(
+            "vmcell.guest.output_limit",
+            CliErrorCategory::ResourceLimit,
+            CliExitCode::ResourceLimit,
+            false,
+        ),
+        GuestIoError::InvalidResponse => classification(
+            "vmcell.guest.invalid_response",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        GuestIoError::PartialCopy => classification(
+            "vmcell.guest.recovery_required",
+            CliErrorCategory::RecoveryRequired,
+            CliExitCode::RecoveryRequired,
+            false,
+        ),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -390,7 +761,7 @@ impl<T> ListEnvelope<T> {
     #[must_use]
     pub fn new(items: Vec<T>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: CLI_JSON_SCHEMA_VERSION,
             items,
         }
     }
@@ -399,6 +770,157 @@ impl<T> ListEnvelope<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_v1_envelopes_remain_compatibly_shaped() {
+        let list = serde_json::to_value(ListEnvelope::<String>::new(Vec::new())).unwrap();
+        assert_eq!(
+            list,
+            serde_json::json!({
+                "schema_version": 1,
+                "items": []
+            })
+        );
+
+        let classification = classify_cli_error(&StateError::MutationBusy);
+        let error = serde_json::to_value(ErrorEnvelope::new(
+            classification,
+            "another vmcell mutation is active",
+        ))
+        .unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "schema_version": 1,
+                "error": {
+                    "code": "vmcell.state.contention",
+                    "category": "contention",
+                    "message": "another vmcell mutation is active",
+                    "retryable": true,
+                    "exit_code": 7
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn deterministic_error_taxonomy_covers_state_provider_guest_and_engine() {
+        let cases: Vec<(Box<dyn Error>, &str, CliExitCode, bool)> = vec![
+            (
+                Box::new(StateError::NotFound(PathBuf::from("missing"))),
+                "vmcell.state.not_found",
+                CliExitCode::NotFound,
+                false,
+            ),
+            (
+                Box::new(StateError::MutationBusy),
+                "vmcell.state.contention",
+                CliExitCode::Contention,
+                true,
+            ),
+            (
+                Box::new(ProviderError::OwnershipChanged("drift".to_owned())),
+                "vmcell.ownership.changed",
+                CliExitCode::Ownership,
+                false,
+            ),
+            (
+                Box::new(ProviderError::Timeout("deadline".to_owned())),
+                "vmcell.provider.timeout",
+                CliExitCode::Timeout,
+                false,
+            ),
+            (
+                Box::new(ProviderError::OutputLimit("bounded output".to_owned())),
+                "vmcell.provider.output_limit",
+                CliExitCode::ResourceLimit,
+                false,
+            ),
+            (
+                Box::new(GuestIoError::Timeout),
+                "vmcell.guest.timeout",
+                CliExitCode::Timeout,
+                false,
+            ),
+            (
+                Box::new(EngineError::ProviderUnavailable("offline".to_owned())),
+                "vmcell.provider.unavailable",
+                CliExitCode::Unavailable,
+                true,
+            ),
+            (
+                Box::new(EngineError::ImageIntegrity("hash drift".to_owned())),
+                "vmcell.image.integrity",
+                CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(EngineError::InvalidImage("missing image path".to_owned())),
+                "vmcell.invalid_input",
+                CliExitCode::InvalidInput,
+                false,
+            ),
+            (
+                Box::new(EngineError::LifecycleConflict("not ready".to_owned())),
+                "vmcell.lifecycle.conflict",
+                CliExitCode::Conflict,
+                false,
+            ),
+            (
+                Box::new(EngineError::Integrity("manifest drift".to_owned())),
+                "vmcell.state.integrity",
+                CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(CliInputError("missing credential flag".to_owned())),
+                "vmcell.invalid_input",
+                CliExitCode::InvalidInput,
+                false,
+            ),
+            (
+                Box::new(StateError::Json {
+                    path: PathBuf::from("cells/cell.json"),
+                    source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                }),
+                "vmcell.state.integrity",
+                CliExitCode::Integrity,
+                false,
+            ),
+        ];
+
+        for (error, code, exit_code, retryable) in cases {
+            let actual = classify_cli_error(error.as_ref());
+            assert_eq!(actual.code, code);
+            assert_eq!(actual.exit_code, exit_code);
+            assert_eq!(actual.retryable, retryable);
+        }
+    }
+
+    #[test]
+    fn automation_exit_codes_are_stable_and_nonzero_for_errors() {
+        let values = [
+            CliExitCode::InvalidInput,
+            CliExitCode::NotFound,
+            CliExitCode::Conflict,
+            CliExitCode::Unavailable,
+            CliExitCode::Ownership,
+            CliExitCode::Contention,
+            CliExitCode::Timeout,
+            CliExitCode::Integrity,
+            CliExitCode::Internal,
+            CliExitCode::RecoveryRequired,
+            CliExitCode::ResourceLimit,
+            CliExitCode::Authentication,
+            CliExitCode::Unsupported,
+        ];
+        let numeric = values.map(CliExitCode::as_u8);
+        for (index, value) in numeric.iter().enumerate() {
+            assert_ne!(*value, 0);
+            assert!(!numeric[..index].contains(value));
+        }
+        assert_eq!(CliExitCode::Success.as_u8(), 0);
+    }
 
     #[test]
     fn parses_m1_create_surface() {
