@@ -54,6 +54,80 @@ pub struct RegisterImageRequest {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidateImageRequest {
+    pub guest_os: GuestOs,
+    pub guest_arch: Architecture,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageValidationStatus {
+    Usable,
+    Unusable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageValidationIssue {
+    UnsupportedExtension,
+    PathUnavailableOrUnsafe,
+    ContentReadFailed,
+    ProviderPathMismatch,
+    ProviderFormatMismatch,
+    BackingParentPresent,
+    DifferencingBase,
+    ProviderSizeMismatch,
+    RegisteredPathDrift,
+    RegisteredFormatDrift,
+    RegisteredSizeDrift,
+    RegisteredHashDrift,
+    RegisteredVariantMissing,
+}
+
+impl ImageValidationIssue {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "unsupported_extension",
+            Self::PathUnavailableOrUnsafe => "path_unavailable_or_unsafe",
+            Self::ContentReadFailed => "content_read_failed",
+            Self::ProviderPathMismatch => "provider_path_mismatch",
+            Self::ProviderFormatMismatch => "provider_format_mismatch",
+            Self::BackingParentPresent => "backing_parent_present",
+            Self::DifferencingBase => "differencing_base",
+            Self::ProviderSizeMismatch => "provider_size_mismatch",
+            Self::RegisteredPathDrift => "registered_path_drift",
+            Self::RegisteredFormatDrift => "registered_format_drift",
+            Self::RegisteredSizeDrift => "registered_size_drift",
+            Self::RegisteredHashDrift => "registered_hash_drift",
+            Self::RegisteredVariantMissing => "registered_variant_missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageValidationReport {
+    pub schema_version: u32,
+    pub image_id: Option<ImageId>,
+    pub registered: bool,
+    pub provider: String,
+    pub guest_os: GuestOs,
+    pub guest_arch: Architecture,
+    pub path: PathBuf,
+    pub expected_format: String,
+    pub observed_format: Option<String>,
+    pub disk_type: Option<String>,
+    pub parent_path: Option<PathBuf>,
+    pub file_size: Option<u64>,
+    pub virtual_size: Option<u64>,
+    pub sha256: Option<String>,
+    pub registered_sha256: Option<String>,
+    pub status: ImageValidationStatus,
+    pub issues: Vec<ImageValidationIssue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationReport {
     pub schema_version: u32,
@@ -163,6 +237,16 @@ impl RunStage {
             Self::GuestExecution => "guest_execution",
             Self::Cleanup => "cleanup",
             Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl ImageValidationStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Usable => "usable",
+            Self::Unusable => "unusable",
         }
     }
 }
@@ -541,23 +625,37 @@ impl<P: LocalVmProvider> CellEngine<P> {
     ) -> Result<ImageRecord, EngineError> {
         self.require_provider_available()?;
         let _mutation = self.state.acquire_mutation_lock()?;
-        let canonical = canonical_image_path(&request.path)?;
-        let mut handle = open_immutable_parent(&canonical)?;
-        let file_size = handle
-            .file
-            .metadata()
-            .map_err(|error| EngineError::InvalidImage(error.to_string()))?
-            .len();
-        let provider_info = self.provider.inspect_image(canonical.clone())?;
-        validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)?;
-        let sha256 = sha256_file(&mut handle.file)?;
+        let validation = self.validate_image_path(
+            None,
+            request.guest_os,
+            request.guest_arch,
+            request.path,
+            None,
+        )?;
+        if validation.status != ImageValidationStatus::Usable {
+            let issues = validation
+                .issues
+                .iter()
+                .map(|issue| issue.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(EngineError::InvalidImage(format!(
+                "image validation failed: {issues}"
+            )));
+        }
 
         let variant = ImageVariant {
             provider: self.provider.name().to_owned(),
-            disk_format: provider_info.disk_format,
-            path: canonical,
-            sha256,
-            file_size,
+            disk_format: validation.observed_format.ok_or_else(|| {
+                EngineError::InvalidImage("image format was not proven".to_owned())
+            })?,
+            path: validation.path,
+            sha256: validation
+                .sha256
+                .ok_or_else(|| EngineError::InvalidImage("image hash was not proven".to_owned()))?,
+            file_size: validation
+                .file_size
+                .ok_or_else(|| EngineError::InvalidImage("image size was not proven".to_owned()))?,
         };
         let record = ImageRecord {
             schema_version: IMAGE_SCHEMA_VERSION,
@@ -585,6 +683,197 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     pub fn inspect_image(&self, image_id: &ImageId) -> Result<ImageRecord, EngineError> {
         Ok(self.state.load_image(image_id)?)
+    }
+
+    pub fn validate_image(
+        &self,
+        request: ValidateImageRequest,
+    ) -> Result<ImageValidationReport, EngineError> {
+        self.require_provider_available()?;
+        self.validate_image_path(
+            None,
+            request.guest_os,
+            request.guest_arch,
+            request.path,
+            None,
+        )
+    }
+
+    pub fn validate_registered_image(
+        &self,
+        image_id: &ImageId,
+    ) -> Result<ImageValidationReport, EngineError> {
+        self.require_provider_available()?;
+        let record = self.state.load_image(image_id)?;
+        let variants = record
+            .variants
+            .iter()
+            .filter(|variant| variant.provider == self.provider.name())
+            .collect::<Vec<_>>();
+        if variants.len() != 1 {
+            return Ok(ImageValidationReport {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                image_id: Some(record.id),
+                registered: true,
+                provider: self.provider.name().to_owned(),
+                guest_os: record.guest_os,
+                guest_arch: record.guest_arch,
+                path: variants
+                    .first()
+                    .map_or_else(PathBuf::new, |variant| variant.path.clone()),
+                expected_format: provider_image_format(self.provider.name())?.to_owned(),
+                observed_format: None,
+                disk_type: None,
+                parent_path: None,
+                file_size: None,
+                virtual_size: None,
+                sha256: None,
+                registered_sha256: variants.first().map(|variant| variant.sha256.clone()),
+                status: ImageValidationStatus::Unusable,
+                issues: vec![ImageValidationIssue::RegisteredVariantMissing],
+            });
+        }
+        let variant = variants[0];
+        self.validate_image_path(
+            Some(record.id),
+            record.guest_os,
+            record.guest_arch,
+            variant.path.clone(),
+            Some(variant),
+        )
+    }
+
+    fn validate_image_path(
+        &self,
+        image_id: Option<ImageId>,
+        guest_os: GuestOs,
+        guest_arch: Architecture,
+        path: PathBuf,
+        registered_variant: Option<&ImageVariant>,
+    ) -> Result<ImageValidationReport, EngineError> {
+        let expected_format = provider_image_format(self.provider.name())?;
+        let mut report = ImageValidationReport {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            image_id,
+            registered: registered_variant.is_some(),
+            provider: self.provider.name().to_owned(),
+            guest_os,
+            guest_arch,
+            path: path.clone(),
+            expected_format: expected_format.to_owned(),
+            observed_format: None,
+            disk_type: None,
+            parent_path: None,
+            file_size: None,
+            virtual_size: None,
+            sha256: None,
+            registered_sha256: registered_variant.map(|variant| variant.sha256.clone()),
+            status: ImageValidationStatus::Unusable,
+            issues: Vec::new(),
+        };
+        if !path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(expected_format))
+        {
+            report
+                .issues
+                .push(ImageValidationIssue::UnsupportedExtension);
+            return Ok(report);
+        }
+        let canonical = match canonical_image_path(&path) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                report
+                    .issues
+                    .push(ImageValidationIssue::PathUnavailableOrUnsafe);
+                return Ok(report);
+            }
+        };
+        report.path = canonical.clone();
+        let mut handle = match open_immutable_parent(&canonical) {
+            Ok(handle) => handle,
+            Err(_) => {
+                report
+                    .issues
+                    .push(ImageValidationIssue::PathUnavailableOrUnsafe);
+                return Ok(report);
+            }
+        };
+        let file_size = match handle.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                report.issues.push(ImageValidationIssue::ContentReadFailed);
+                return Ok(report);
+            }
+        };
+        let provider_info = self.provider.inspect_image(canonical.clone())?;
+        report.observed_format = Some(provider_info.disk_format.clone());
+        report.disk_type = Some(provider_info.disk_type.clone());
+        report.parent_path = provider_info.parent_path.clone();
+        report.file_size = Some(file_size);
+        report.virtual_size = Some(provider_info.virtual_size);
+        if !paths_equal(&canonical, &provider_info.path) {
+            report
+                .issues
+                .push(ImageValidationIssue::ProviderPathMismatch);
+        }
+        if !provider_info
+            .disk_format
+            .eq_ignore_ascii_case(expected_format)
+        {
+            report
+                .issues
+                .push(ImageValidationIssue::ProviderFormatMismatch);
+        }
+        if provider_info.parent_path.is_some() {
+            report
+                .issues
+                .push(ImageValidationIssue::BackingParentPresent);
+        }
+        if provider_info.disk_type.eq_ignore_ascii_case("differencing")
+            || provider_info.disk_type.eq_ignore_ascii_case("overlay")
+        {
+            report.issues.push(ImageValidationIssue::DifferencingBase);
+        }
+        if provider_info.file_size != file_size {
+            report
+                .issues
+                .push(ImageValidationIssue::ProviderSizeMismatch);
+        }
+        match sha256_file(&mut handle.file) {
+            Ok(sha256) => report.sha256 = Some(sha256),
+            Err(_) => report.issues.push(ImageValidationIssue::ContentReadFailed),
+        }
+        if let Some(variant) = registered_variant {
+            if !paths_equal(&canonical, &variant.path) {
+                report
+                    .issues
+                    .push(ImageValidationIssue::RegisteredPathDrift);
+            }
+            if !provider_info
+                .disk_format
+                .eq_ignore_ascii_case(&variant.disk_format)
+            {
+                report
+                    .issues
+                    .push(ImageValidationIssue::RegisteredFormatDrift);
+            }
+            if file_size != variant.file_size {
+                report
+                    .issues
+                    .push(ImageValidationIssue::RegisteredSizeDrift);
+            }
+            if report.sha256.as_deref() != Some(variant.sha256.as_str()) {
+                report
+                    .issues
+                    .push(ImageValidationIssue::RegisteredHashDrift);
+            }
+        }
+        if report.issues.is_empty() {
+            report.status = ImageValidationStatus::Usable;
+        }
+        Ok(report)
     }
 
     pub fn list_cells(&self) -> Result<Vec<CellRecord>, EngineError> {
@@ -2752,11 +3041,7 @@ fn validate_base_image(
     file_size: u64,
     info: &ProviderImageInfo,
 ) -> Result<(), EngineError> {
-    let expected_format = match provider {
-        "hyperv" => "vhdx",
-        "qemu" => "qcow2",
-        _ => return Err(EngineError::UnsupportedProvider(provider.to_owned())),
-    };
+    let expected_format = provider_image_format(provider)?;
     if !paths_equal(expected_path, &info.path) {
         return Err(EngineError::InvalidImage(
             "provider reported a different base image path".to_owned(),
@@ -2778,6 +3063,14 @@ fn validate_base_image(
         ));
     }
     Ok(())
+}
+
+fn provider_image_format(provider: &str) -> Result<&'static str, EngineError> {
+    match provider {
+        "hyperv" => Ok("vhdx"),
+        "qemu" => Ok("qcow2"),
+        _ => Err(EngineError::UnsupportedProvider(provider.to_owned())),
+    }
 }
 
 fn validate_overlay(record: &CellRecord, info: &ProviderImageInfo) -> Result<(), EngineError> {
@@ -3521,6 +3814,111 @@ mod tests {
             accelerator: Some("auto".to_owned()),
             allow_tcg: true,
         }
+    }
+
+    #[test]
+    fn image_validation_is_read_only_and_reports_provider_identity() {
+        let directory = tempdir().unwrap();
+        let base_path = directory.path().join("candidate.vhdx");
+        fs::write(&base_path, b"prepared immutable base").unwrap();
+        let provider = MockHyperV::new(base_path.clone());
+        let engine = CellEngine::new(StateStore::new(directory.path().join("state")), provider);
+
+        let report = engine
+            .validate_image(ValidateImageRequest {
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                path: base_path.canonicalize().unwrap(),
+            })
+            .unwrap();
+
+        assert_eq!(report.status, ImageValidationStatus::Usable);
+        assert!(!report.registered);
+        assert_eq!(report.provider, "hyperv");
+        assert_eq!(report.expected_format, "vhdx");
+        assert_eq!(report.observed_format.as_deref(), Some("vhdx"));
+        assert!(report.parent_path.is_none());
+        assert_eq!(report.sha256.as_deref().map(str::len), Some(64));
+        assert!(engine.list_images().unwrap().is_empty());
+    }
+
+    #[test]
+    fn image_validation_reports_unsupported_extension_and_backing_parent() {
+        let directory = tempdir().unwrap();
+        let wrong_extension = directory.path().join("candidate.qcow2");
+        fs::write(&wrong_extension, b"not a hyperv base").unwrap();
+        let provider = MockHyperV::new(wrong_extension.clone());
+        let engine = CellEngine::new(StateStore::new(directory.path().join("state")), provider);
+        let extension = engine
+            .validate_image(ValidateImageRequest {
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                path: wrong_extension,
+            })
+            .unwrap();
+        assert_eq!(extension.status, ImageValidationStatus::Unusable);
+        assert_eq!(
+            extension.issues,
+            vec![ImageValidationIssue::UnsupportedExtension]
+        );
+        assert!(
+            !engine
+                .provider
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .contains(&"inspect_image")
+        );
+
+        let base_path = directory.path().join("child.vhdx");
+        fs::write(&base_path, b"differencing child").unwrap();
+        let mut provider = MockHyperV::new(base_path.clone());
+        provider.base_disk_type = "differencing";
+        let engine = CellEngine::new(StateStore::new(directory.path().join("state2")), provider);
+        let backing = engine
+            .validate_image(ValidateImageRequest {
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                path: base_path,
+            })
+            .unwrap();
+        assert_eq!(backing.status, ImageValidationStatus::Unusable);
+        assert!(
+            backing
+                .issues
+                .contains(&ImageValidationIssue::DifferencingBase)
+        );
+    }
+
+    #[test]
+    fn registered_image_validation_reports_content_drift() {
+        let (directory, engine, image_id) = fixture();
+        fs::write(
+            directory.path().join("base.vhdx"),
+            b"changed base content and size",
+        )
+        .unwrap();
+
+        let report = engine.validate_registered_image(&image_id).unwrap();
+
+        assert_eq!(report.status, ImageValidationStatus::Unusable);
+        assert_eq!(report.image_id.as_ref(), Some(&image_id));
+        assert!(
+            report
+                .issues
+                .contains(&ImageValidationIssue::ProviderSizeMismatch)
+        );
+        assert!(
+            report
+                .issues
+                .contains(&ImageValidationIssue::RegisteredSizeDrift)
+        );
+        assert!(
+            report
+                .issues
+                .contains(&ImageValidationIssue::RegisteredHashDrift)
+        );
     }
 
     #[test]

@@ -29,6 +29,15 @@ Once an image variant is registered as a base, normal cell operations must treat
 
 M1 records the canonical ordinary-file path, SHA-256, file size, VHDX format/type, and registration time. Before creating a cell it reopens the base read-only, rejects reparse points, revalidates the Hyper-V metadata and digest, and holds the parent against replacement or write while the differencing disk is created.
 
+Prepared images can be checked before registration with
+`vmcell image validate --path ... --guest-os ... --provider ...`. The command is read-only and reports
+the selected provider and guest identity, expected and observed disk format,
+base/backing status, sizes, canonical path, and SHA-256. `image validate --id`
+and human `image inspect` re-run the same proof against the registered record so
+replacement or content drift is visible before cell creation. Registration
+consumes this same validation policy; vmcell does not build, mount, or edit the
+image.
+
 The first practical implementation should prefer simple strong checks over clever reconciliation.
 
 ## Disposable overlay

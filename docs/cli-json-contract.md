@@ -18,6 +18,8 @@ vmcell doctor
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows [--provider hyperv]
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
+vmcell image validate --path BASE.vhdx --guest-os windows [--provider hyperv]
+vmcell image validate --id IMAGE [--provider hyperv|qemu]
 vmcell image list
 vmcell image inspect IMAGE
 vmcell create --image IMAGE [--provider hyperv|qemu] [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
@@ -45,6 +47,16 @@ bounded to 30 seconds per state-lock acquisition, defaults to fail-fast, and
 never authorizes lock stealing. Commands that dispatch serially to multiple
 provider engines may consume one bounded interval per acquisition.
 Changing the state root does not authorize adoption of provider objects.
+
+`image validate` is read-only. Candidate-path mode returns a schema-versioned
+validation report without registering the image. Registered-image mode repeats
+the provider metadata and immutable-content proof and compares the canonical
+path, format, file size, and SHA-256 with the durable record. `status` is
+`usable` only when `issues` is empty; an unusable report is still emitted and
+the command exits with the integrity code `9`. Issue values are stable
+snake-case identifiers. Human `image inspect` performs the registered proof;
+JSON `image inspect` keeps the existing `ImageRecord` response unchanged, and
+automation can request the proof explicitly with `image validate --id`.
 
 PowerShell Direct guest commands require an exact-owned, running Windows cell.
 Its password is read as one bounded line from stdin; there is deliberately no
