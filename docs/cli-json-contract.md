@@ -1,6 +1,11 @@
 # CLI and JSON Contract
 
-M2 CLI output is pre-stable but explicitly versioned. `--json` is global and causes successful commands to write JSON to stdout. Errors are written to stderr and return exit code 1.
+CLI output is pre-alpha but explicitly versioned. `--json` is global and causes successful commands to write JSON to stdout. Errors are written to stderr and use the deterministic exit-code taxonomy below.
+
+Schema version 1 keeps existing field names, types, and meanings stable.
+Compatible releases may add fields. Removing fields, changing their types, or
+reusing their meaning requires a new schema version. Clients must ignore
+unknown additive fields.
 
 ## Commands
 
@@ -99,12 +104,34 @@ background timer.
 {
   "schema_version": 1,
   "error": {
-    "category": "operation_failed",
-    "message": "ownership is not proven: ownership marker mismatch"
+    "code": "vmcell.ownership.not_proven",
+    "category": "ownership",
+    "message": "ownership is not proven: ownership marker mismatch",
+    "retryable": false,
+    "exit_code": 6
   }
 }
 ```
 
-M5 may refine categories and schema stability, but it must preserve the
-fail-closed ownership semantics introduced in M1 and the non-secret,
-nonreplayable guest-operation semantics introduced in M2.
+`code`, `category`, and `exit_code` are compatibility fields. `message` is
+redacted diagnostic prose and must not be parsed. `retryable` means the same
+request may be attempted after its stated precondition changes; it never
+authorizes replay of a timeout, partial copy, unknown guest operation, or
+ownership failure.
+
+| Exit | Category | Meaning |
+| ---: | --- | --- |
+| 0 | success | Command completed successfully. |
+| 2 | invalid_input | CLI or request input is invalid. |
+| 3 | not_found | Required local/provider object is absent. |
+| 4 | conflict | Existing state or lifecycle state conflicts. |
+| 5 | unavailable | Provider or guest transport is unavailable. |
+| 6 | ownership | Ownership is absent, changed, or drifted. |
+| 7 | contention | Another local mutation owns the lock. |
+| 8 | timeout | Deadline expired; side effects may be unknown. |
+| 9 | integrity | Schema, identity, response, or artifact proof failed. |
+| 10 | internal | Unclassified internal or state I/O failure. |
+| 11 | recovery_required | Partial/unknown work requires reconciliation. |
+| 12 | resource_limit | A configured size/output bound was reached. |
+| 13 | authentication | Guest authentication failed. |
+| 14 | unsupported | Provider, transport, or operation is unsupported. |

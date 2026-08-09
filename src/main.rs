@@ -6,8 +6,8 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Serialize;
 use vm_cell_manager::cli::{
-    ArtifactCommand, Cli, CliProvider, Command, CredentialArgs, DoctorReport, ErrorBody,
-    ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
+    ArtifactCommand, Cli, CliProvider, Command, CredentialArgs, DoctorReport, ErrorEnvelope,
+    GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand, classify_cli_error,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
@@ -29,24 +29,19 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let classification = classify_cli_error(error.as_ref());
             if json {
                 let message = error.to_string();
-                let envelope = ErrorEnvelope {
-                    schema_version: 1,
-                    error: ErrorBody {
-                        category: "operation_failed",
-                        message: &message,
-                    },
-                };
+                let envelope = ErrorEnvelope::new(classification, message);
                 eprintln!(
                     "{}",
                     serde_json::to_string_pretty(&envelope)
-                        .unwrap_or_else(|_| "{\"schema_version\":1}".to_owned())
+                        .unwrap_or_else(|_| "{\"schema_version\":1,\"error\":{\"code\":\"vmcell.internal\",\"category\":\"internal\",\"message\":\"error serialization failed\",\"retryable\":false,\"exit_code\":10}}".to_owned())
                 );
             } else {
                 eprintln!("vmcell: {error}");
             }
-            ExitCode::FAILURE
+            ExitCode::from(classification.exit_code.as_u8())
         }
     }
 }
