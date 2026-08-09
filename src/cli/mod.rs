@@ -17,6 +17,10 @@ use crate::state::{StateError, StateStore};
 
 pub const CLI_JSON_SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, thiserror::Error)]
+#[error("invalid CLI input: {0}")]
+pub struct CliInputError(pub String);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "vmcell",
@@ -483,6 +487,14 @@ pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassificati
     if let Some(error) = error.downcast_ref::<GuestIoError>() {
         return classify_guest_error(error);
     }
+    if error.downcast_ref::<CliInputError>().is_some() {
+        return classification(
+            "vmcell.invalid_input",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        );
+    }
     if error.downcast_ref::<CellIdError>().is_some()
         || error.downcast_ref::<ImageIdError>().is_some()
         || error.downcast_ref::<GuestOperationIdError>().is_some()
@@ -523,6 +535,18 @@ fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
             "vmcell.invalid_input",
             CliErrorCategory::InvalidInput,
             CliExitCode::InvalidInput,
+            false,
+        ),
+        EngineError::LifecycleConflict(_) => classification(
+            "vmcell.lifecycle.conflict",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+        EngineError::Integrity(_) => classification(
+            "vmcell.state.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
             false,
         ),
         EngineError::InvalidImage(_) => classification(
@@ -822,6 +846,24 @@ mod tests {
                 Box::new(EngineError::InvalidImage("hash drift".to_owned())),
                 "vmcell.image.integrity",
                 CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(EngineError::LifecycleConflict("not ready".to_owned())),
+                "vmcell.lifecycle.conflict",
+                CliExitCode::Conflict,
+                false,
+            ),
+            (
+                Box::new(EngineError::Integrity("manifest drift".to_owned())),
+                "vmcell.state.integrity",
+                CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(CliInputError("missing credential flag".to_owned())),
+                "vmcell.invalid_input",
+                CliExitCode::InvalidInput,
                 false,
             ),
             (

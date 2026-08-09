@@ -6,13 +6,14 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Serialize;
 use vm_cell_manager::cli::{
-    ArtifactCommand, Cli, CliProvider, Command, CredentialArgs, DoctorReport, ErrorEnvelope,
-    GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand, classify_cli_error,
+    ArtifactCommand, Cli, CliInputError, CliProvider, Command, CredentialArgs, DoctorReport,
+    ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
+    classify_cli_error,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
-    ArtifactCollectRequest, CellEngine, GuestCopyInRequest, GuestCopyOutRequest, GuestExecRequest,
-    RegisterImageRequest,
+    ArtifactCollectRequest, CellEngine, EngineError, GuestCopyInRequest, GuestCopyOutRequest,
+    GuestExecRequest, RegisterImageRequest,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -131,7 +132,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     cli.json,
                     &CellEngine::new(state, QemuProvider::system(root)),
                 )?,
-                value => return Err(format!("unsupported persisted provider: {value}").into()),
+                value => {
+                    return Err(EngineError::Integrity(format!(
+                        "unsupported persisted provider: {value}"
+                    ))
+                    .into());
+                }
             }
         }
     }
@@ -423,7 +429,11 @@ fn exec_guest<P: LocalVmProvider>(
             engine.exec_guest(&PowerShellDirectTransport::system(), &credentials, request)?
         }
         "qemu" => engine.exec_guest(&QemuGuestAgentTransport::system(), &credentials, request)?,
-        _ => return Err("unsupported guest provider".into()),
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
     })
 }
 
@@ -440,7 +450,11 @@ fn copy_in_guest<P: LocalVmProvider>(
         "qemu" => {
             engine.copy_into_guest(&QemuGuestAgentTransport::system(), &credentials, request)?
         }
-        _ => return Err("unsupported guest provider".into()),
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
     })
 }
 
@@ -457,7 +471,11 @@ fn copy_out_guest<P: LocalVmProvider>(
         "qemu" => {
             engine.copy_out_of_guest(&QemuGuestAgentTransport::system(), &credentials, request)?
         }
-        _ => return Err("unsupported guest provider".into()),
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
     })
 }
 
@@ -474,7 +492,11 @@ fn collect_guest_artifacts<P: LocalVmProvider>(
         "qemu" => {
             engine.collect_artifacts(&QemuGuestAgentTransport::system(), &credentials, request)?
         }
-        _ => return Err("unsupported guest provider".into()),
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
     })
 }
 
@@ -491,23 +513,31 @@ fn read_credentials(
 ) -> Result<GuestCredentials, Box<dyn Error>> {
     if provider == "qemu" {
         if args.username.is_some() || args.password_stdin {
-            return Err("QGA is credentialless; do not pass username or password flags".into());
+            return Err(CliInputError(
+                "QGA is credentialless; do not pass username or password flags".to_owned(),
+            )
+            .into());
         }
         return Ok(GuestCredentials::not_required());
     }
     if !args.password_stdin {
-        return Err("guest password must be provided with --password-stdin".into());
+        return Err(CliInputError(
+            "guest password must be provided with --password-stdin".to_owned(),
+        )
+        .into());
     }
     let username = args
         .username
-        .ok_or("PowerShell Direct requires --username")?;
+        .ok_or_else(|| CliInputError("PowerShell Direct requires --username".to_owned()))?;
     let mut password = Zeroizing::new(String::new());
     std::io::stdin().take(4097).read_to_string(&mut password)?;
     while password.ends_with(['\r', '\n']) {
         password.pop();
     }
     if password.len() > 4096 || password.contains(['\r', '\n']) {
-        return Err("guest password stdin must contain one bounded line".into());
+        return Err(
+            CliInputError("guest password stdin must contain one bounded line".to_owned()).into(),
+        );
     }
     Ok(GuestCredentials::new(
         username,

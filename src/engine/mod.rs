@@ -218,6 +218,12 @@ pub enum EngineError {
     #[error("invalid cell request: {0}")]
     InvalidCellRequest(String),
 
+    #[error("cell lifecycle conflicts with the requested operation: {0}")]
+    LifecycleConflict(String),
+
+    #[error("persisted cell integrity check failed: {0}")]
+    Integrity(String),
+
     #[error("ownership is not proven: {0}")]
     OwnershipNotProven(String),
 
@@ -814,12 +820,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             }
             GuestOperationPhase::ArtifactCommitted => {
                 let artifact_id = operation.artifact_id.ok_or_else(|| {
-                    EngineError::InvalidCellRequest(
+                    EngineError::Integrity(
                         "artifact-committed operation is missing its artifact id".to_owned(),
                     )
                 })?;
                 if artifact_id != operation.id {
-                    return Err(EngineError::InvalidCellRequest(
+                    return Err(EngineError::Integrity(
                         "artifact id does not match its operation id".to_owned(),
                     ));
                 }
@@ -1460,12 +1466,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "run a guest operation on", &[CellState::Running])?;
         if record.phase != CellPhase::Ready {
-            return Err(EngineError::InvalidCellRequest(
+            return Err(EngineError::LifecycleConflict(
                 "guest operations require a ready cell".to_owned(),
             ));
         }
         let guest_os = record.image.guest_os.ok_or_else(|| {
-            EngineError::InvalidCellRequest(
+            EngineError::Integrity(
                 "guest operations require a cell with a persisted guest OS".to_owned(),
             )
         })?;
@@ -1815,7 +1821,7 @@ fn require_lifecycle_state(
     if allowed.contains(&record.state) {
         Ok(())
     } else {
-        Err(EngineError::InvalidCellRequest(format!(
+        Err(EngineError::LifecycleConflict(format!(
             "cannot {operation} cell in {:?} state",
             record.state
         )))
