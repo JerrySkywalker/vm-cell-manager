@@ -187,3 +187,17 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           cargo test --all-targets --all-features
+
+      - name: Portable Windows package contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --bin vmcell
+          $metadata = cargo metadata --locked --no-deps --format-version 1 |
+            ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object name -eq 'vm-cell-manager')
+          if ($package.Count -ne 1) { throw 'Cargo package metadata was ambiguous' }
+          $binary = Join-Path $env:CARGO_TARGET_DIR 'release\vmcell.exe'
+          & .\tools\test-windows-package.ps1 `
+            -BinaryPath $binary `
+            -Version $package[0].version

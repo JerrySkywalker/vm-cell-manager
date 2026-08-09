@@ -6,6 +6,10 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Deterministic portable Windows ZIP/checksum packaging with schema-versioned
+  build provenance, install/remove instructions, repeat-build verification,
+  and a manual trusted-runner artifact workflow.
+
 ### Added
 - Stable M5 JSON schema-version constants and a provider-neutral automation
   error envelope with deterministic codes, categories, retryability, and exit
