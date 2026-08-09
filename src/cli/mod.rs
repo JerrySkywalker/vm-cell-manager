@@ -8,7 +8,7 @@ use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
 use crate::core::cell::{CellId, CellIdError};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
-use crate::engine::EngineError;
+use crate::engine::{EngineError, RunCellError};
 use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
@@ -89,6 +89,51 @@ pub enum Command {
 
         #[arg(long)]
         allow_tcg: bool,
+    },
+
+    /// Create a disposable cell, run one guest command, and apply the cleanup policy.
+    Run {
+        #[arg(long)]
+        image: ImageId,
+
+        #[arg(long = "cpu", visible_alias = "cpu-count", default_value_t = 2)]
+        cpu_count: u16,
+
+        #[arg(long = "memory", visible_alias = "memory-mib", default_value_t = 4096)]
+        memory_mib: u64,
+
+        #[arg(long = "ttl", visible_alias = "ttl-seconds")]
+        ttl_seconds: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
+        provider: CliProvider,
+
+        #[arg(long, value_enum)]
+        accelerator: Option<CliAccelerator>,
+
+        #[arg(long)]
+        allow_tcg: bool,
+
+        #[arg(long, conflicts_with = "keep_on_failure")]
+        keep: bool,
+
+        #[arg(long)]
+        keep_on_failure: bool,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long = "action-timeout-seconds", default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        action_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
+        max_output_bytes: u64,
+
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 
     /// List locally recorded cells.
@@ -568,6 +613,9 @@ const fn classification(
 
 #[must_use]
 pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassification {
+    if let Some(error) = error.downcast_ref::<RunCellError>() {
+        return classify_engine_error(error.engine_error());
+    }
     if let Some(error) = error.downcast_ref::<EngineError>() {
         return classify_engine_error(error);
     }
@@ -1186,6 +1234,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_human_run_surface_and_rejects_conflicting_retention() {
+        let cli = Cli::try_parse_from([
+            "vmcell",
+            "run",
+            "--image",
+            "windows-dev",
+            "--cpu",
+            "4",
+            "--memory",
+            "8192",
+            "--ttl",
+            "3600",
+            "--keep-on-failure",
+            "--username",
+            "Administrator",
+            "--password-stdin",
+            "--",
+            "cmd.exe",
+            "/c",
+            "echo ok",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                cpu_count: 4,
+                memory_mib: 8192,
+                ttl_seconds: Some(3600),
+                keep_on_failure: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "run",
+                "--image",
+                "windows-dev",
+                "--keep",
+                "--keep-on-failure",
+                "--",
+                "cmd.exe",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
