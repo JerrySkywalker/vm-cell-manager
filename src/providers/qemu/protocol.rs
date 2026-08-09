@@ -355,7 +355,7 @@ impl<S: ReadWrite> JsonLineProtocol<S> {
             .set_operation_deadline(deadline)
             .and_then(|_| self.stream.write_all(&bytes))
             .and_then(|_| self.stream.flush())
-            .map_err(|error| ProviderError::Command(format!("QEMU protocol write failed: {error}")))
+            .map_err(|error| protocol_io_error("write", error))
     }
 
     pub(crate) fn receive(&mut self, deadline: Instant) -> Result<Value, ProviderError> {
@@ -364,12 +364,11 @@ impl<S: ReadWrite> JsonLineProtocol<S> {
         loop {
             self.stream
                 .set_operation_deadline(deadline)
-                .map_err(|error| {
-                    ProviderError::Command(format!("QEMU protocol read failed: {error}"))
-                })?;
-            let read = self.stream.read(&mut byte).map_err(|error| {
-                ProviderError::Command(format!("QEMU protocol read failed: {error}"))
-            })?;
+                .map_err(|error| protocol_io_error("read", error))?;
+            let read = self
+                .stream
+                .read(&mut byte)
+                .map_err(|error| protocol_io_error("read", error))?;
             if read == 0 {
                 return Err(ProviderError::InvalidResponse(
                     "QEMU protocol closed before a complete response".to_owned(),
@@ -383,12 +382,20 @@ impl<S: ReadWrite> JsonLineProtocol<S> {
                     .map_err(|error| ProviderError::InvalidResponse(error.to_string()));
             }
             if bytes.len() >= PROTOCOL_MESSAGE_LIMIT {
-                return Err(ProviderError::InvalidResponse(
+                return Err(ProviderError::OutputLimit(
                     "QEMU protocol response exceeded the message limit".to_owned(),
                 ));
             }
             bytes.push(byte[0]);
         }
+    }
+}
+
+fn protocol_io_error(operation: &str, error: std::io::Error) -> ProviderError {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        ProviderError::Timeout(format!("QEMU protocol {operation} timed out"))
+    } else {
+        ProviderError::Command(format!("QEMU protocol {operation} failed: {error}"))
     }
 }
 
@@ -421,7 +428,7 @@ impl<S: ReadWrite> QmpClient<S> {
         arguments: Option<Value>,
     ) -> Result<Value, ProviderError> {
         if Instant::now() >= self.deadline {
-            return Err(ProviderError::Command(
+            return Err(ProviderError::Timeout(
                 "QMP operation exceeded its deadline".to_owned(),
             ));
         }
@@ -435,7 +442,7 @@ impl<S: ReadWrite> QmpClient<S> {
         let mut event_count = 0_u16;
         loop {
             if Instant::now() >= self.deadline {
-                return Err(ProviderError::Command(
+                return Err(ProviderError::Timeout(
                     "QMP operation exceeded its deadline".to_owned(),
                 ));
             }
@@ -566,7 +573,7 @@ mod tests {
             // leave enough wall-clock budget for a saturated debug test run so
             // the assertion exercises the size limit rather than the deadline.
             JsonLineProtocol::new(stream).receive(Instant::now() + Duration::from_secs(30)),
-            Err(ProviderError::InvalidResponse(_))
+            Err(ProviderError::OutputLimit(_))
         ));
     }
 
@@ -617,7 +624,7 @@ mod tests {
         };
         assert!(matches!(
             QmpClient::negotiate(expired, Duration::ZERO),
-            Err(ProviderError::Command(_))
+            Err(ProviderError::Timeout(_))
         ));
 
         let drip = DripStream {
@@ -628,7 +635,7 @@ mod tests {
         };
         assert!(matches!(
             QmpClient::negotiate(drip, Duration::from_millis(5)),
-            Err(ProviderError::Command(_))
+            Err(ProviderError::Timeout(_))
         ));
     }
 

@@ -519,10 +519,16 @@ fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
             CliExitCode::Unavailable,
             true,
         ),
-        EngineError::InvalidImage(_) | EngineError::InvalidCellRequest(_) => classification(
+        EngineError::InvalidCellRequest(_) => classification(
             "vmcell.invalid_input",
             CliErrorCategory::InvalidInput,
             CliExitCode::InvalidInput,
+            false,
+        ),
+        EngineError::InvalidImage(_) => classification(
+            "vmcell.image.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
             false,
         ),
         EngineError::ImageConflict(_) => classification(
@@ -582,7 +588,13 @@ fn classify_state_error(error: &StateError) -> CliErrorClassification {
             CliExitCode::Integrity,
             false,
         ),
-        StateError::Io { .. } | StateError::Json { .. } => classification(
+        StateError::Json { .. } => classification(
+            "vmcell.state.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        StateError::Io { .. } => classification(
             "vmcell.state.io",
             CliErrorCategory::Internal,
             CliExitCode::Internal,
@@ -603,6 +615,18 @@ fn classify_provider_error(error: &ProviderError) -> CliErrorClassification {
             "vmcell.provider.command_failed",
             CliErrorCategory::Unavailable,
             CliExitCode::Unavailable,
+            false,
+        ),
+        ProviderError::Timeout(_) => classification(
+            "vmcell.provider.timeout",
+            CliErrorCategory::Timeout,
+            CliExitCode::Timeout,
+            false,
+        ),
+        ProviderError::OutputLimit(_) => classification(
+            "vmcell.provider.output_limit",
+            CliErrorCategory::ResourceLimit,
+            CliExitCode::ResourceLimit,
             false,
         ),
         ProviderError::InvalidResponse(_) => classification(
@@ -771,6 +795,18 @@ mod tests {
                 false,
             ),
             (
+                Box::new(ProviderError::Timeout("deadline".to_owned())),
+                "vmcell.provider.timeout",
+                CliExitCode::Timeout,
+                false,
+            ),
+            (
+                Box::new(ProviderError::OutputLimit("bounded output".to_owned())),
+                "vmcell.provider.output_limit",
+                CliExitCode::ResourceLimit,
+                false,
+            ),
+            (
                 Box::new(GuestIoError::Timeout),
                 "vmcell.guest.timeout",
                 CliExitCode::Timeout,
@@ -781,6 +817,21 @@ mod tests {
                 "vmcell.provider.unavailable",
                 CliExitCode::Unavailable,
                 true,
+            ),
+            (
+                Box::new(EngineError::InvalidImage("hash drift".to_owned())),
+                "vmcell.image.integrity",
+                CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(StateError::Json {
+                    path: PathBuf::from("cells/cell.json"),
+                    source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                }),
+                "vmcell.state.integrity",
+                CliExitCode::Integrity,
+                false,
             ),
         ];
 

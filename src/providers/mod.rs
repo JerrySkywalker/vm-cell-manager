@@ -490,6 +490,12 @@ pub enum ProviderError {
     #[error("provider command failed: {0}")]
     Command(String),
 
+    #[error("provider operation timed out: {0}")]
+    Timeout(String),
+
+    #[error("provider output exceeded its limit: {0}")]
+    OutputLimit(String),
+
     #[error("provider returned invalid data: {0}")]
     InvalidResponse(String),
 
