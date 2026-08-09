@@ -8,7 +8,7 @@ use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
 use crate::core::cell::{CellId, CellIdError};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
-use crate::engine::{EngineError, RunCellError};
+use crate::engine::{EngineError, RunCellError, RunFailureReport};
 use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
@@ -513,6 +513,34 @@ impl ErrorEnvelope {
                 retryable: classification.retryable,
                 exit_code: classification.exit_code.as_u8(),
             },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunErrorEnvelope<'a> {
+    pub schema_version: u32,
+    pub error: ErrorBody,
+    pub run: &'a RunFailureReport,
+}
+
+impl<'a> RunErrorEnvelope<'a> {
+    #[must_use]
+    pub fn new(
+        classification: CliErrorClassification,
+        message: impl Into<String>,
+        run: &'a RunFailureReport,
+    ) -> Self {
+        Self {
+            schema_version: CLI_JSON_SCHEMA_VERSION,
+            error: ErrorBody {
+                code: classification.code.to_owned(),
+                category: classification.category,
+                message: message.into(),
+                retryable: classification.retryable,
+                exit_code: classification.exit_code.as_u8(),
+            },
+            run,
         }
     }
 }

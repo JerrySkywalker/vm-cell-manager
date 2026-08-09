@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -8,13 +8,13 @@ use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliInputError, CliProvider, Command, CredentialArgs, DoctorReport,
     ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope, ProviderCommand,
-    classify_cli_error, public_error_message,
+    RunErrorEnvelope, classify_cli_error, public_error_message,
 };
 use vm_cell_manager::core::cell::CellSpec;
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, EngineError, GuestCopyInRequest,
-    GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest, RunCellReport, RunCellRequest,
-    RunCleanupPolicy,
+    GuestCopyOutRequest, GuestExecRequest, RegisterImageRequest, RunCellError, RunCellReport,
+    RunCellRequest, RunCleanupPolicy,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -34,11 +34,47 @@ fn main() -> ExitCode {
     let json = cli.json;
     match run(cli) {
         Ok(exit_code) => exit_code,
-        Err(error) => {
-            let classification = classify_cli_error(error.as_ref());
-            emit_classified_error(classification, json)
-        }
+        Err(error) => emit_error(error.as_ref(), json),
     }
+}
+
+fn emit_error(error: &(dyn Error + 'static), json: bool) -> ExitCode {
+    let classification = classify_cli_error(error);
+    if let Some(run_error) = error.downcast_ref::<RunCellError>() {
+        return emit_run_error(classification, run_error, json);
+    }
+    emit_classified_error(classification, json)
+}
+
+fn emit_run_error(
+    classification: vm_cell_manager::cli::CliErrorClassification,
+    error: &RunCellError,
+    json: bool,
+) -> ExitCode {
+    let message = public_error_message(classification);
+    if json {
+        let envelope = RunErrorEnvelope::new(classification, message, error.report());
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&envelope)
+                .unwrap_or_else(|_| "{\"schema_version\":1,\"error\":{\"code\":\"vmcell.internal\",\"category\":\"internal\",\"message\":\"error serialization failed\",\"retryable\":false,\"exit_code\":10}}".to_owned())
+        );
+    } else {
+        let report = error.report();
+        let cell = report
+            .cell_id
+            .map_or_else(|| "none".to_owned(), |cell_id| cell_id.to_string());
+        let operation = report.operation_id.map_or_else(
+            || "none".to_owned(),
+            |operation_id| operation_id.to_string(),
+        );
+        let cleanup_error = report.cleanup_error_code.as_deref().unwrap_or("none");
+        eprintln!(
+            "vmcell: {}: {message}; run stage={:?} cell={} operation={} cleanup={:?} cleanup_error={}",
+            classification.code, report.stage, cell, operation, report.cleanup, cleanup_error
+        );
+    }
+    ExitCode::from(classification.exit_code.as_u8())
 }
 
 fn json_requested_by_argv() -> bool {
@@ -290,12 +326,13 @@ fn run_m2<P: LocalVmProvider>(
                     },
                 },
             )?;
-            emit(&report, json, || {
-                println!(
-                    "run cell {}: exit={} cleanup={:?}",
-                    report.cell_id, report.result.exit_code, report.cleanup
-                )
-            })?;
+            if json {
+                emit(&report, true, || {})?;
+            } else {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                write_human_run_result(&report, &mut stdout.lock(), &mut stderr.lock())?;
+            }
             return Ok(guest_exit_status(report.result.exit_code));
         }
         Command::List => {
@@ -582,6 +619,20 @@ fn guest_exit_status(exit_code: i32) -> ExitCode {
     }
 }
 
+fn write_human_run_result(
+    report: &RunCellReport,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::io::Result<()> {
+    stdout.write_all(report.result.stdout.as_bytes())?;
+    stderr.write_all(report.result.stderr.as_bytes())?;
+    writeln!(
+        stderr,
+        "vmcell: run cell {}: exit={} cleanup={:?}",
+        report.cell_id, report.result.exit_code, report.cleanup
+    )
+}
+
 fn copy_in_guest<P: LocalVmProvider>(
     engine: &CellEngine<P>,
     credential: CredentialArgs,
@@ -720,5 +771,35 @@ mod tests {
         assert_eq!(guest_exit_status(23), ExitCode::from(23));
         assert_eq!(guest_exit_status(-1), ExitCode::from(1));
         assert_eq!(guest_exit_status(256), ExitCode::from(1));
+    }
+
+    #[test]
+    fn human_run_result_forwards_bounded_guest_streams_and_separates_status() {
+        let report = RunCellReport {
+            schema_version: 1,
+            cell_id: vm_cell_manager::core::cell::CellId::new(),
+            operation_id: vm_cell_manager::core::guest::GuestOperationId::new(),
+            outcome: vm_cell_manager::engine::RunOutcome::GuestNonZero,
+            result: vm_cell_manager::guest::GuestCommandResult {
+                exit_code: 23,
+                stdout: "guest stdout\n".to_owned(),
+                stderr: "guest stderr\n".to_owned(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: 13,
+                stderr_bytes: 13,
+                truncated: false,
+            },
+            cleanup: vm_cell_manager::engine::RunCleanupDisposition::Destroyed,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_human_run_result(&report, &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(stdout, b"guest stdout\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.starts_with("guest stderr\n"));
+        assert!(stderr.contains("exit=23"));
+        assert!(stderr.contains("cleanup=Destroyed"));
     }
 }

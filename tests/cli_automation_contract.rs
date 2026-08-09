@@ -23,6 +23,29 @@ fn run_vmcell(arguments: &[&str]) -> std::process::Output {
         .expect("vmcell CLI should start")
 }
 
+fn invalid_run(state_root: &std::path::Path, json: bool) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vmcell"));
+    if json {
+        command.arg("--json");
+    }
+    command
+        .arg("--state-root")
+        .arg(state_root)
+        .args([
+            "run",
+            "--image",
+            "windows-dev",
+            "--provider",
+            "qemu",
+            "--cpu",
+            "0",
+            "--",
+            "echo",
+        ])
+        .output()
+        .expect("vmcell CLI should start")
+}
+
 #[test]
 fn json_and_human_modes_share_the_same_stable_exit_classification() {
     let state = tempfile::tempdir().unwrap();
@@ -88,4 +111,39 @@ fn json_parse_failures_are_versioned_redacted_and_migrate_legacy_provider_list()
     ]);
     assert_eq!(guest_argument.status.code(), Some(2));
     assert!(serde_json::from_slice::<serde_json::Value>(&guest_argument.stderr).is_err());
+}
+
+#[test]
+fn run_failures_preserve_stage_cell_and_cleanup_in_json_and_human_modes() {
+    let state = tempfile::tempdir().unwrap();
+    let json = invalid_run(state.path(), true);
+    let human = invalid_run(state.path(), false);
+
+    assert_eq!(json.status.code(), Some(2));
+    assert_eq!(human.status.code(), Some(2));
+    assert!(json.stdout.is_empty());
+    assert!(human.stdout.is_empty());
+
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["error"]["code"], "vmcell.invalid_input");
+    assert_eq!(envelope["run"]["schema_version"], 1);
+    assert_eq!(envelope["run"]["cell_id"], serde_json::Value::Null);
+    assert_eq!(envelope["run"]["operation_id"], serde_json::Value::Null);
+    assert_eq!(envelope["run"]["stage"], "request_validation");
+    assert_eq!(envelope["run"]["cleanup"], "nothing_created");
+    assert_eq!(
+        envelope["run"]["cleanup_error_code"],
+        serde_json::Value::Null
+    );
+    assert!(
+        !String::from_utf8_lossy(&json.stderr).contains(state.path().to_string_lossy().as_ref())
+    );
+
+    let human_stderr = String::from_utf8(human.stderr).unwrap();
+    assert!(human_stderr.contains("run stage=RequestValidation"));
+    assert!(human_stderr.contains("cell=none"));
+    assert!(human_stderr.contains("operation=none"));
+    assert!(human_stderr.contains("cleanup=NothingCreated"));
+    assert!(human_stderr.contains("cleanup_error=none"));
 }

@@ -100,6 +100,12 @@ pub struct RunCellRequest {
     pub cleanup: RunCleanupPolicy,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GuestOperationPlan {
+    kind: GuestOperationKind,
+    readiness: ReadinessPolicy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -145,6 +151,7 @@ pub struct RunCellReport {
 pub struct RunFailureReport {
     pub schema_version: u32,
     pub cell_id: Option<CellId>,
+    pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
     pub cleanup: RunCleanupDisposition,
     pub error_code: String,
@@ -923,6 +930,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         if let Err(error) = request.command.validate().map_err(EngineError::from) {
             return Err(run_cell_error(
                 None,
+                None,
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -933,6 +941,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         if let Err(error) = validate_readiness_policy(request.readiness) {
             return Err(run_cell_error(
                 None,
+                None,
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -942,6 +951,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if let Err(error) = validate_cell_spec(&request.spec, self.provider.name()) {
             return Err(run_cell_error(
+                None,
                 None,
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
@@ -966,6 +976,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
                 return Err(run_cell_error(
                     Some(cell_id),
+                    None,
                     stage,
                     cleanup,
                     error,
@@ -988,6 +999,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
             return Err(run_cell_error(
                 Some(cell_id),
+                None,
                 RunStage::ProviderStart,
                 cleanup,
                 error,
@@ -1001,6 +1013,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
         let mut guest_was_ready = false;
         let mut interrupted_after_readiness = false;
+        let mut guest_operation_id = None;
         let execution = self.exec_guest_with_ready_callback(
             transport,
             credentials,
@@ -1021,6 +1034,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     Ok(())
                 }
             },
+            |operation_id| guest_operation_id = Some(operation_id),
         );
 
         let execution = match execution {
@@ -1038,6 +1052,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     self.cleanup_failed_run(cell_id, request.cleanup, !terminal, observer);
                 return Err(run_cell_error(
                     Some(cell_id),
+                    guest_operation_id,
                     stage,
                     cleanup,
                     error,
@@ -1073,7 +1088,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             disposition
         } else {
             let _ = observer.observe(&RunProgressEvent::CleanupStarted { cell_id });
-            match self.destroy_cell(cell_id) {
+            match self.destroy_cell_for_run(cell_id) {
                 Ok(_) => {
                     let _ = observer.observe(&RunProgressEvent::CellDestroyed { cell_id });
                     RunCleanupDisposition::Destroyed
@@ -1085,6 +1100,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     }
                     return Err(run_cell_error(
                         Some(cell_id),
+                        Some(execution.operation_id),
                         RunStage::Cleanup,
                         disposition,
                         error,
@@ -1118,6 +1134,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             self.cleanup_failed_run(cell_id, cleanup_policy, ambiguous, observer);
         run_cell_error(
             Some(cell_id),
+            None,
             RunStage::Interrupted,
             cleanup,
             error,
@@ -1164,7 +1181,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             return (RunCleanupDisposition::RefusedAmbiguous, None);
         }
         let _ = observer.observe(&RunProgressEvent::CleanupStarted { cell_id });
-        match self.destroy_cell(cell_id) {
+        match self.destroy_cell_for_run(cell_id) {
             Ok(_) => {
                 let _ = observer.observe(&RunProgressEvent::CellDestroyed { cell_id });
                 (RunCleanupDisposition::Destroyed, None)
@@ -1185,19 +1202,21 @@ impl<P: LocalVmProvider> CellEngine<P> {
         credentials: &GuestCredentials,
         request: GuestExecRequest,
     ) -> Result<GuestExecReport, EngineError> {
-        self.exec_guest_with_ready_callback(transport, credentials, request, || Ok(()))
+        self.exec_guest_with_ready_callback(transport, credentials, request, || Ok(()), |_| {})
     }
 
-    fn exec_guest_with_ready_callback<G, F>(
+    fn exec_guest_with_ready_callback<G, F, R>(
         &self,
         transport: &G,
         credentials: &GuestCredentials,
         request: GuestExecRequest,
         on_ready: F,
+        on_recorded: R,
     ) -> Result<GuestExecReport, EngineError>
     where
         G: GuestTransport,
         F: FnOnce() -> Result<(), EngineError>,
+        R: FnOnce(GuestOperationId),
     {
         request.command.validate()?;
         validate_readiness_policy(request.readiness)?;
@@ -1207,8 +1226,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             transport,
             credentials,
             cell_id,
-            GuestOperationKind::Exec,
-            request.readiness,
+            GuestOperationPlan {
+                kind: GuestOperationKind::Exec,
+                readiness: request.readiness,
+            },
+            on_recorded,
             |authority, expected, operation_id| {
                 on_ready()?;
                 let result = transport.exec(authority, expected, credentials, &command)?;
@@ -1251,8 +1273,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             transport,
             credentials,
             cell_id,
-            GuestOperationKind::CopyIn,
-            request.readiness,
+            GuestOperationPlan {
+                kind: GuestOperationKind::CopyIn,
+                readiness: request.readiness,
+            },
+            |_| {},
             |authority, expected, operation_id| {
                 transport.copy_in(
                     authority,
@@ -1564,6 +1589,22 @@ impl<P: LocalVmProvider> CellEngine<P> {
     pub fn destroy_cell(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
         self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
+        self.destroy_cell_locked(cell_id, &mutation)
+    }
+
+    fn destroy_cell_for_run(&self, cell_id: CellId) -> Result<OperationReport, EngineError> {
+        self.require_provider()?;
+        let mutation = self.state.acquire_mutation_lock()?;
+        if self
+            .state
+            .list_guest_operations()?
+            .iter()
+            .any(|operation| operation.cell_id == cell_id && !operation.phase.is_terminal())
+        {
+            return Err(EngineError::Integrity(
+                "automatic run cleanup is blocked by a nonterminal guest operation".to_owned(),
+            ));
+        }
         self.destroy_cell_locked(cell_id, &mutation)
     }
 
@@ -2050,8 +2091,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             transport,
             credentials,
             cell_id,
-            kind,
-            request.readiness,
+            GuestOperationPlan {
+                kind,
+                readiness: request.readiness,
+            },
+            |_| {},
             |authority, expected, operation_id| {
                 let artifact_guard = self.state.prepare_artifact_root(cell_id, operation_id)?;
                 let mut entries = Vec::with_capacity(sources.len());
@@ -2104,17 +2148,18 @@ impl<P: LocalVmProvider> CellEngine<P> {
         )
     }
 
-    fn run_guest_operation<G, T, F>(
+    fn run_guest_operation<G, T, R, F>(
         &self,
         transport: &G,
         credentials: &GuestCredentials,
         cell_id: CellId,
-        kind: GuestOperationKind,
-        readiness: ReadinessPolicy,
+        plan: GuestOperationPlan,
+        on_recorded: R,
         action: F,
     ) -> Result<T, EngineError>
     where
         G: GuestTransport,
+        R: FnOnce(GuestOperationId),
         F: FnOnce(
             &GuestActionAuthority<'_>,
             &ProviderVm,
@@ -2145,8 +2190,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
             return Err(EngineError::UnexpectedPowerState(expected.power_state));
         }
 
-        let mut operation = GuestOperationRecord::intent(cell_id, kind, Utc::now());
+        let mut operation = GuestOperationRecord::intent(cell_id, plan.kind, Utc::now());
         self.state.save_guest_operation(&operation)?;
+        on_recorded(operation.id);
         let execution = (|| {
             let installation = self.state.acquire_installation_authority()?;
             self.validate_local_ownership_against(&record, &installation)?;
@@ -2160,7 +2206,13 @@ impl<P: LocalVmProvider> CellEngine<P> {
             operation.phase = GuestOperationPhase::TransportActive;
             operation.updated_at = Utc::now();
             self.state.save_guest_operation(&operation)?;
-            wait_for_guest_ready(transport, &authority, &expected, credentials, readiness)?;
+            wait_for_guest_ready(
+                transport,
+                &authority,
+                &expected,
+                credentials,
+                plan.readiness,
+            )?;
             action(&authority, &expected, operation.id)
         })();
 
@@ -2233,6 +2285,7 @@ fn durable_error_code(error: &EngineError) -> &'static str {
 
 fn run_cell_error(
     cell_id: Option<CellId>,
+    operation_id: Option<GuestOperationId>,
     stage: RunStage,
     cleanup: RunCleanupDisposition,
     source: EngineError,
@@ -2243,6 +2296,7 @@ fn run_cell_error(
         report: Box::new(RunFailureReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             cell_id,
+            operation_id,
             stage,
             cleanup,
             error_code: durable_error_code(&source).to_owned(),
@@ -3916,13 +3970,10 @@ mod tests {
             engine.inspect_cell(cell_id).unwrap().cell.state,
             CellState::Running
         );
-        assert!(
-            engine
-                .list_guest_operations(Some(cell_id))
-                .unwrap()
-                .iter()
-                .any(|operation| !operation.phase.is_terminal())
-        );
+        let operation_id = error.report().operation_id.unwrap();
+        let operation = engine.inspect_guest_operation(operation_id).unwrap();
+        assert_eq!(operation.cell_id, cell_id);
+        assert!(!operation.phase.is_terminal());
     }
 
     #[test]
@@ -3970,6 +4021,48 @@ mod tests {
         assert_eq!(remove_error.report().stage, RunStage::Cleanup);
         assert_eq!(remove_error.report().cleanup, RunCleanupDisposition::Failed);
         assert!(remove_error.report().result.is_some());
+    }
+
+    #[test]
+    fn run_cleanup_refuses_a_concurrent_nonterminal_guest_operation() {
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        let mut injected_operation_id = None;
+        let mut observer = |event: &RunProgressEvent| {
+            if let RunProgressEvent::CommandCompleted { cell_id, .. } = event {
+                let mut operation =
+                    GuestOperationRecord::intent(*cell_id, GuestOperationKind::Exec, Utc::now());
+                operation.phase = GuestOperationPhase::TransportActive;
+                operation.updated_at = Utc::now();
+                injected_operation_id = Some(operation.id);
+                engine.state.save_guest_operation(&operation).unwrap();
+            }
+            RunControl::Continue
+        };
+
+        let error = engine
+            .run_cell_observed(&guest, &credentials, run_request(image_id), &mut observer)
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::Cleanup);
+        assert_eq!(
+            error.report().cleanup,
+            RunCleanupDisposition::RefusedAmbiguous
+        );
+        assert!(error.report().operation_id.is_some());
+        assert!(error.report().result.is_some());
+        assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 0);
+        let cell_id = error.report().cell_id.unwrap();
+        assert_eq!(
+            engine.inspect_cell(cell_id).unwrap().cell.state,
+            CellState::Running
+        );
+        assert!(
+            !engine
+                .inspect_guest_operation(injected_operation_id.unwrap())
+                .unwrap()
+                .phase
+                .is_terminal()
+        );
     }
 
     #[test]
