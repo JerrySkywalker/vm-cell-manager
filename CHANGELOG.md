@@ -12,7 +12,9 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - Subprocess crash-consistency, duplicate-root, cross-installation authority, tombstone stress, and cross-process state-containment coverage for the M1 real-acceptance boundary.
 - M2 engine-issued guest authority, bounded PowerShell Direct execution and copy contracts, non-secret durable operation records, hash-bound artifact storage, TTL creation, and explicit exact-owned garbage collection.
 - Mock, schema, credential-redaction, timeout/output, artifact-crash, concurrent-GC, and Windows reparse safety coverage for M2.
+- Provider-neutral lifecycle authority, bounded process execution, QMP/QGA protocol foundations, QCOW2 immutable-base/single-overlay ownership, explicit QEMU accelerator policy, and stacked QEMU CLI routing for M3.
+- Fake QMP/QGA, launch-digest, no-network, explicit-TCG, provider-authority, process-timeout, and provider-neutral lifecycle coverage for M3.
 
 ### Changed
 - Hardened M1 provider authority, physical runtime containment, persisted identity binding, partial-provisioning recovery, and tombstone reconciliation before real Hyper-V acceptance.
-- Narrowed advertised Hyper-V guest transports to the implemented PowerShell Direct path; QGA, SSH, and QEMU guest mutation remain unsupported stubs.
+- Narrowed advertised Hyper-V guest transports to PowerShell Direct and QEMU guest transport to implemented Linux QGA behavior; SSH remains unsupported.

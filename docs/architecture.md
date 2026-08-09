@@ -73,6 +73,26 @@ omit command arguments, output, raw transport errors, and authentication
 material. An unknown operation is evidence of possible guest side effects, not
 permission to replay it.
 
+The M3 QEMU path preserves the same two-authority shape:
+
+```text
+CellEngine + current installation + pinned runtime
+   -> provider-neutral mutation authority
+   -> versioned QEMU definition and process receipt
+   -> bounded QMP UUID/name proof
+   -> lifecycle verb
+
+CellEngine + exact-owned running QEMU snapshot
+   -> GuestActionAuthority
+   -> bounded credentialless QGA
+   -> Linux guest exec/copy beneath the CellId workspace
+```
+
+The definition binds the immutable QCOW2 parent, exactly one overlay,
+configuration and control endpoints, CPU/memory, explicit accelerator policy,
+and the hash of every launch argument. Process ids and socket names are
+recovery evidence, not standalone mutation authority.
+
 ## Control flow
 
 The M1 create flow is:

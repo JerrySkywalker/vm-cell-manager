@@ -68,7 +68,11 @@ Planned acceptance:
 - explicit hardware-accelerator discovery;
 - TCG/cross-architecture emulation only through explicit opt-in.
 
-## M4 — Linux and macOS host acceptance
+Status: repository-local implementation in progress on the stacked M3 branch.
+Real QEMU/WHPX, KVM, and HVF acceptance remain environment-gated and are not
+performed by the core/trusted Windows CI runner.
+
+## M4 — Linux portability foundation and host acceptance
 
 Goal: make the same QEMU provider portable rather than create separate KVM/HVF providers.
 
@@ -79,6 +83,11 @@ Planned acceptance:
 - host-specific packaging/path/state behavior;
 - architecture mismatch diagnostics;
 - documented guest support matrix.
+
+The stacked M4 foundation prioritizes Linux conditional compilation, Unix
+process trees, permissions, locking, symlink containment, and QEMU/KVM
+capability behavior. macOS abstractions remain non-breaking, while real HVF
+acceptance is deferred.
 
 WSL or nested environments may be used for development experiments but are not substitutes for final host acceptance.
 

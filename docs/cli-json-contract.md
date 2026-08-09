@@ -7,10 +7,12 @@ M2 CLI output is pre-stable but explicitly versioned. `--json` is global and cau
 ```text
 vmcell doctor
 vmcell provider list
-vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows
+vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows [--provider hyperv]
+vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
 vmcell image list
 vmcell image inspect IMAGE
-vmcell create --image IMAGE [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
+vmcell create --image IMAGE [--provider hyperv|qemu] [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
+              [--accelerator auto|whpx|kvm|hvf|tcg] [--allow-tcg]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -35,6 +37,12 @@ read as one bounded line from stdin; there is deliberately no password argument
 or environment-variable option. Guest paths are relative to vmcell's fixed
 workspace and reject traversal, absolute paths, alternate data streams, device
 names, and ambiguous trailing dot/space forms.
+
+For QEMU, the image and create provider must be explicit and compatible. TCG
+requires both `--accelerator tcg` and `--allow-tcg`; `auto` never silently
+falls back unless `--allow-tcg` is present. Linux QGA guest commands are
+credentialless, reject username/password flags, and use a POSIX CellId-scoped
+workspace. Windows QGA is not advertised by M3.
 
 ## Successful output
 

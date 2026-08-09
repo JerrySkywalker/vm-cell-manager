@@ -40,7 +40,20 @@ Expected responsibilities:
 - process ownership and cleanup;
 - local socket/process state required for the cell lifecycle.
 
-QGA belongs to the guest transport layer.
+The M3 implementation binds QEMU mutation to an engine-issued authority plus a
+versioned runtime definition: CellId-derived UUID/name, exact configuration,
+one overlay and immutable parent, CPU/memory, explicit accelerator policy,
+launch-argument digest, QMP/QGA endpoints, and a process instance receipt.
+QMP lifecycle proves UUID and name immediately before a verb. A pid, process
+name, socket path, or QEMU name alone is never mutation authority.
+
+QEMU is launched networkless (`-nic none`), paused, and without an interactive
+monitor, display, shell, or daemon mode. TCG requires durable explicit opt-in;
+failure to find the native accelerator is an error rather than an emulation
+fallback.
+
+QGA belongs to the guest transport layer. M3's QGA path is credentialless and
+Linux-workspace scoped; PowerShell Direct remains Hyper-V/Windows specific.
 
 ## Capability discovery
 
