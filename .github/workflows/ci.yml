@@ -182,6 +182,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\test-windows-whpx-preflight.ps1
 
+      - name: Linux validation workflow contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-linux-validation-workflow.ps1
+
       - name: Clippy
         shell: pwsh
         run: |

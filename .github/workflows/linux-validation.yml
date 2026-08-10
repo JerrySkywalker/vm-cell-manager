@@ -1,0 +1,123 @@
+name: Linux Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact trusted repository commit to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vmcell-linux-validation-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  linux-core:
+    name: Linux Core / GitHub-hosted
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.0
+      EXPECTED_RUSTC: rustc 1.85.0 (4d91de4e4 2025-02-17)
+      EXPECTED_CARGO_PREFIX: cargo 1.85.0
+
+    steps:
+      - name: Validate requested source identity
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'source_sha must be exactly 40 lowercase hexadecimal characters' >&2
+            exit 1
+          fi
+
+      - name: Checkout exact supplied SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Bind bounded Cargo target outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_target="$RUNNER_TEMP/vmcell-cargo-target"
+          mkdir -p "$cargo_target"
+          test "$(realpath "$cargo_target")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
+          printf 'CARGO_TARGET_DIR=%s\n' "$cargo_target" >> "$GITHUB_ENV"
+
+      - name: Prove native hosted baseline and exact source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$SOURCE_SHA"
+          test "${RUNNER_ENVIRONMENT:-}" = 'github-hosted'
+          test "${RUNNER_OS:-}" = 'Linux'
+          test "${RUNNER_ARCH:-}" = 'X64'
+          test "$(uname -s)" = 'Linux'
+          test "$(uname -m)" = 'x86_64'
+          . /etc/os-release
+          test "$ID" = 'ubuntu'
+          test "$VERSION_ID" = '24.04'
+          test "$CARGO_TARGET_DIR" = "$RUNNER_TEMP/vmcell-cargo-target"
+          test "$(realpath "$CARGO_TARGET_DIR")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf 'source_sha=%s\nrunner_environment=%s\nos=%s\narchitecture=%s\nbaseline=%s-%s\n' \
+            "$actual_sha" "$RUNNER_ENVIRONMENT" "$RUNNER_OS" "$RUNNER_ARCH" "$ID" "$VERSION_ID"
+          ldd_version="$(ldd --version 2>&1)"
+          printf '%s\n' "${ldd_version%%$'\n'*}"
+
+      - name: Install exact repository toolchain in the ephemeral job
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.85.0 \
+            --profile minimal \
+            --component rustfmt,clippy
+          test "$(rustc --version)" = "$EXPECTED_RUSTC"
+          case "$(cargo --version)" in
+            "$EXPECTED_CARGO_PREFIX"*) ;;
+            *) echo 'cargo version mismatch' >&2; exit 1 ;;
+          esac
+          rustfmt --version
+          cargo clippy --version
+
+      - name: Fetch locked Rust dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+
+      - name: Linux shell static safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          find tools -maxdepth 1 -type f -name '*.sh' -print0 |
+            sort -z |
+            xargs -0 -r -n1 sh -n
+
+      - name: Locked repository gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh ./tools/check-linux.sh
+
+      - name: Prove validation was repository-read-only
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test ! -e "$GITHUB_WORKSPACE/target"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"

@@ -42,7 +42,8 @@ $files = @($scriptRoots | ForEach-Object {
 })
 $files += @(
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\windows-whpx-preflight.ps1')),
-  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-whpx-preflight.ps1'))
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-whpx-preflight.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-linux-validation-workflow.ps1'))
 )
 if ($files.Count -eq 0) { throw 'no PowerShell provider or guest scripts were found' }
 

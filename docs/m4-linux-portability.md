@@ -26,6 +26,15 @@ Run `tools/check-linux.sh` with the declared Rust toolchain. Tests cover the
 provider-neutral engine, accelerator no-fallback behavior, QMP/QGA framing,
 Unix process groups, state identity, schema gates, and crash recovery.
 
+The manual `Linux Validation` workflow is the exact-SHA native-Linux CI lane.
+It uses the declared GitHub-hosted Ubuntu 24.04 x86_64 baseline and Rust 1.85.0,
+with read-only repository permissions and no virtualization lifecycle or host
+mutation. Repository tests may open `/dev/kvm` for the existing usability probe
+but issue no KVM ioctl and create no VM. The workflow is dispatch-only so public
+pull-request code is never run automatically. This lane proves native Linux
+compilation and repository contracts only; it cannot promote KVM/QGA support
+status.
+
 The Linux state contract is `0700` directories and `0600` files owned by the
 effective user. Symlinked final components are rejected with `O_NOFOLLOW`, and
 open directory/file device and inode identities are rechecked before authority
