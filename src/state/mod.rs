@@ -2311,7 +2311,10 @@ mod tests {
             .unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50));
-        assert!(elapsed < Duration::from_secs(1));
+        // The one-second lock deadline begins inside acquire_mutation_lock,
+        // after filesystem identity setup. A saturated runner can delay that
+        // setup and the releaser thread without weakening lock semantics.
+        assert!(elapsed < Duration::from_secs(5));
         drop(second);
         releaser.join().unwrap();
     }
