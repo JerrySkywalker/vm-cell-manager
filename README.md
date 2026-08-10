@@ -161,7 +161,8 @@ vmcell image inspect IMAGE
 vmcell image dependencies IMAGE
 vmcell image unregister IMAGE
 vmcell create --image IMAGE --provider PROVIDER --cpu-count 2 --memory-mib 4096 [--accelerator POLICY] [--allow-tcg] [--ttl-seconds N]
-vmcell run --image IMAGE --provider PROVIDER [--cpu 2] [--memory 4096] [--ttl N] [--keep | --keep-on-failure] -- PROGRAM [ARG...]
+vmcell run --image IMAGE [--provider PROVIDER] [--accelerator POLICY] [--allow-tcg] [--cpu 2] [--memory 4096] [--ttl N] [--keep | --keep-on-failure] -- PROGRAM [ARG...]
+vmcell --json run --image IMAGE [--provider PROVIDER] [--accelerator POLICY] [--allow-tcg] --plan-only
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -219,11 +220,14 @@ transport-active guest operations as uncertain, and reports only
 non-authorizing cleanup or manual-review guidance. Existing `list`, `inspect`,
 `reconcile`, `operation`, and `doctor` human output uses the same vocabulary.
 
-Human `vmcell run` writes concise lifecycle and cleanup progress to stderr,
-forwards bounded guest stdout/stderr to their matching streams, and returns the
-guest exit code after a completed command. `--json` suppresses progress and
-emits the versioned run report; failure envelopes include safe recovery
-identifiers and cleanup disposition but never guest stream contents.
+Human `vmcell run` first writes its provider-neutral descriptive execution plan
+to stderr, then writes concise lifecycle and cleanup progress, forwards bounded
+guest stdout/stderr to their matching streams, and returns the guest exit code
+after a completed command. `--json` suppresses progress and emits one versioned
+run report with the additive `plan` field; failure envelopes include the plan
+when resolution completed, safe recovery identifiers, and cleanup disposition,
+but never guest stream contents. `run --plan-only` exposes the same versioned
+plan without credentials or mutation. See [run selection](docs/run-selection.md).
 
 Before first use of a newer binary against an existing root, `vmcell state
 check` provides a read-only, provider-free durable compatibility preflight.

@@ -11,6 +11,7 @@ use crate::core::automation::{
 use crate::core::cell::{CellId, CellIdError, CellRecord};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError, GuestOperationRecord};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError, ImageRecord};
+use crate::core::run_selection::{RunExecutionPlan, RunSelectionError};
 use crate::engine::{
     CellInspection, EngineError, ImageValidationReport, RunCellError, RunCleanupDisposition,
     RunFailureReport, RunStage,
@@ -144,6 +145,13 @@ pub enum Command {
         #[arg(long)]
         allow_tcg: bool,
 
+        /// Resolve and print the read-only execution plan without running a guest command.
+        #[arg(
+            long,
+            conflicts_with_all = ["command", "username", "password_stdin", "keep", "keep_on_failure"]
+        )]
+        plan_only: bool,
+
         #[arg(long, conflicts_with = "keep_on_failure")]
         keep: bool,
 
@@ -162,7 +170,11 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
         max_output_bytes: u64,
 
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            required_unless_present = "plan_only",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
         command: Vec<String>,
     },
 
@@ -750,6 +762,7 @@ impl RunErrorEnvelope {
 #[derive(Debug, Serialize)]
 pub struct RunErrorReport {
     pub schema_version: u32,
+    pub plan: Option<RunExecutionPlan>,
     pub cell_id: Option<CellId>,
     pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
@@ -763,6 +776,7 @@ impl From<&RunFailureReport> for RunErrorReport {
     fn from(report: &RunFailureReport) -> Self {
         Self {
             schema_version: report.schema_version,
+            plan: report.plan.clone(),
             cell_id: report.cell_id,
             operation_id: report.operation_id,
             stage: report.stage,
@@ -904,6 +918,9 @@ pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassificati
     if let Some(error) = error.downcast_ref::<ProviderError>() {
         return classify_provider_error(error);
     }
+    if let Some(error) = error.downcast_ref::<RunSelectionError>() {
+        return classify_run_selection_error(error);
+    }
     if let Some(error) = error.downcast_ref::<GuestIoError>() {
         return classify_guest_error(error);
     }
@@ -935,6 +952,52 @@ pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassificati
         CliExitCode::Internal,
         false,
     )
+}
+
+fn classify_run_selection_error(error: &RunSelectionError) -> CliErrorClassification {
+    match error {
+        RunSelectionError::ProviderUnavailable | RunSelectionError::AcceleratorUnavailable => {
+            classification(
+                error.code(),
+                CliErrorCategory::Unavailable,
+                CliExitCode::Unavailable,
+                true,
+            )
+        }
+        RunSelectionError::Ambiguous => classification(
+            error.code(),
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
+        RunSelectionError::ContradictoryCapabilityEvidence | RunSelectionError::PlanDrift => {
+            classification(
+                error.code(),
+                CliErrorCategory::Integrity,
+                CliExitCode::Integrity,
+                false,
+            )
+        }
+        RunSelectionError::TcgRequiresExplicitOptIn
+        | RunSelectionError::ImpossibleProviderAccelerator => classification(
+            error.code(),
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        RunSelectionError::UnsupportedHost
+        | RunSelectionError::UnsupportedHostArchitecture
+        | RunSelectionError::IncompatibleImageVariant
+        | RunSelectionError::ArchitectureMismatch
+        | RunSelectionError::UnsupportedGuestTransport
+        | RunSelectionError::UndocumentedCombination
+        | RunSelectionError::UnsupportedCombination => classification(
+            error.code(),
+            CliErrorCategory::Unsupported,
+            CliExitCode::Unsupported,
+            false,
+        ),
+    }
 }
 
 fn classify_config_error(error: &ConfigError) -> CliErrorClassification {
@@ -973,6 +1036,7 @@ fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
     match error {
         EngineError::State(error) => classify_state_error(error),
         EngineError::Provider(error) => classify_provider_error(error),
+        EngineError::RunSelection(error) => classify_run_selection_error(error),
         EngineError::Guest(error) => classify_guest_error(error),
         EngineError::UnsupportedProvider(_) => classification(
             "vmcell.provider.unsupported",
@@ -1242,6 +1306,24 @@ mod tests {
     use crate::providers::ProviderProbeStatus;
     use clap::CommandFactory;
 
+    fn test_run_plan() -> RunExecutionPlan {
+        RunExecutionPlan {
+            schema_version: crate::core::run_selection::RUN_PLAN_SCHEMA_VERSION,
+            contract: crate::core::run_selection::RUN_PLAN_CONTRACT.to_owned(),
+            image: "test-image".parse().unwrap(),
+            host_os: crate::core::support::HostOs::Windows,
+            host_architecture: Architecture::X86_64,
+            guest_os: GuestOs::Windows,
+            guest_architecture: Architecture::X86_64,
+            provider: crate::core::support::ProviderId::Hyperv,
+            accelerator: crate::core::support::Accelerator::HyperV,
+            guest_transport: crate::core::support::GuestTransportId::PowerShellDirect,
+            support_status: crate::core::support::SupportStatus::Untested,
+            selection_source: crate::core::run_selection::RunSelectionSource::NativeDefault,
+            authorizing: false,
+        }
+    }
+
     #[test]
     fn doctor_contract_is_versioned_and_machine_readable() {
         let report = DoctorReport::from_probes(
@@ -1358,6 +1440,7 @@ mod tests {
     fn run_error_envelope_omits_guest_stream_contents() {
         let report = RunFailureReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
+            plan: Some(test_run_plan()),
             cell_id: Some(CellId::new()),
             operation_id: Some(GuestOperationId::new()),
             stage: RunStage::Cleanup,
@@ -1578,6 +1661,72 @@ mod tests {
     }
 
     #[test]
+    fn run_selection_failures_have_stable_provider_neutral_codes() {
+        let cases = [
+            (
+                RunSelectionError::Ambiguous,
+                "vmcell.run_plan.ambiguous",
+                CliExitCode::Conflict,
+                false,
+            ),
+            (
+                RunSelectionError::IncompatibleImageVariant,
+                "vmcell.run_plan.incompatible_image_variant",
+                CliExitCode::Unsupported,
+                false,
+            ),
+            (
+                RunSelectionError::ProviderUnavailable,
+                "vmcell.run_plan.provider_unavailable",
+                CliExitCode::Unavailable,
+                true,
+            ),
+            (
+                RunSelectionError::AcceleratorUnavailable,
+                "vmcell.run_plan.accelerator_unavailable",
+                CliExitCode::Unavailable,
+                true,
+            ),
+            (
+                RunSelectionError::ArchitectureMismatch,
+                "vmcell.run_plan.architecture_mismatch",
+                CliExitCode::Unsupported,
+                false,
+            ),
+            (
+                RunSelectionError::UnsupportedGuestTransport,
+                "vmcell.run_plan.guest_transport_unsupported",
+                CliExitCode::Unsupported,
+                false,
+            ),
+            (
+                RunSelectionError::ContradictoryCapabilityEvidence,
+                "vmcell.run_plan.capability_conflict",
+                CliExitCode::Integrity,
+                false,
+            ),
+            (
+                RunSelectionError::TcgRequiresExplicitOptIn,
+                "vmcell.run_plan.tcg_requires_explicit_opt_in",
+                CliExitCode::InvalidInput,
+                false,
+            ),
+            (
+                RunSelectionError::PlanDrift,
+                "vmcell.run_plan.drift",
+                CliExitCode::Integrity,
+                false,
+            ),
+        ];
+        for (error, code, exit_code, retryable) in cases {
+            let classification = classify_cli_error(&error);
+            assert_eq!(classification.code, code);
+            assert_eq!(classification.exit_code, exit_code);
+            assert_eq!(classification.retryable, retryable);
+        }
+    }
+
+    #[test]
     fn automation_exit_codes_are_stable_and_nonzero_for_errors() {
         let values = [
             CliExitCode::InvalidInput,
@@ -1702,6 +1851,37 @@ mod tests {
                 "--keep-on-failure",
                 "--",
                 "cmd.exe",
+            ])
+            .is_err()
+        );
+
+        let plan = Cli::try_parse_from([
+            "vmcell",
+            "--json",
+            "run",
+            "--image",
+            "linux-dev",
+            "--plan-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            plan.command,
+            Command::Run {
+                provider: None,
+                plan_only: true,
+                command,
+                ..
+            } if command.is_empty()
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "run",
+                "--image",
+                "linux-dev",
+                "--plan-only",
+                "--",
+                "echo",
             ])
             .is_err()
         );

@@ -466,6 +466,14 @@ Native Linux evidence is required; WSL2 is development evidence only. macOS/HVF 
 
 A normal user should generally choose an image/workload rather than a VMM. `vmcell run --image ...` should select an accepted local provider/accelerator path where unambiguous, while explicit overrides remain available. Hardware acceleration must never silently fall back to TCG/emulation.
 
+**Repository-local contract:** [run selection](run-selection.md) now resolves a
+versioned, non-authorizing plan from logical image variants, host/provider
+probes, exact accelerators, guest identity, transport capability, and the
+support matrix before mutation. CLI overrides outrank an explicitly present
+config preference, which outranks deterministic native resolution. TCG
+requires its two explicit CLI flags and is never a fallback. Real platform
+acceptance remains deferred.
+
 ### Real QEMU lifecycle acceptance
 
 Prove real QEMU process lifecycle, immutable QCOW2 base, exactly one overlay, QMP lifecycle/reconciliation, QGA guest readiness, command execution, file transfer, exact cleanup, and crash/failure classification.

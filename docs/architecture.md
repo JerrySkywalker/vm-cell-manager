@@ -55,6 +55,21 @@ The implementation areas map to Rust modules rather than services:
 - `state`: local manifests, locks, ownership metadata, and logs;
 - the cell engine composes `core`, `providers`, and `state` in-process rather than running as a daemon.
 
+Provider-neutral `run` adds a read-only planning seam before this lifecycle:
+
+```text
+logical image variants + host/provider probes + support matrix + CLI/config preference
+   -> versioned descriptive execution plan (authorizing=false)
+   -> fresh engine image/provider/capability revalidation
+   -> existing CellEngine lifecycle and authority issuance
+```
+
+The plan selects an exact provider, accelerator, and guest transport but grants
+no provider authority. A fresh provider probe and exact plan/spec/image binding
+must still pass before mutation; the normal immutable-image, ownership, and
+provider/guest authority checks remain unchanged. See
+[provider-neutral run selection](run-selection.md).
+
 M2 guest actions use a second, narrower authority flow:
 
 ```text

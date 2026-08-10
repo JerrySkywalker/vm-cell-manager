@@ -24,6 +24,10 @@ use crate::core::image::{
     Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
 };
 use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObjectIdentity};
+use crate::core::run_selection::{
+    HostPlatform, RunExecutionPlan, RunSelectionError, revalidate_run_execution_plan,
+};
+use crate::core::support::{Accelerator, ProviderId};
 use crate::guest::{
     GuestActionAuthority, GuestCommand, GuestCommandResult, GuestCopyInAction, GuestCopyOutAction,
     GuestCredentials, GuestIoError, GuestPath, GuestReadiness, GuestTransport, MAX_COPY_BYTES,
@@ -197,10 +201,40 @@ pub struct RunCleanupPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunCellRequest {
+    pub plan: RunExecutionPlan,
     pub spec: CellSpec,
     pub command: GuestCommand,
     pub readiness: ReadinessPolicy,
     pub cleanup: RunCleanupPolicy,
+}
+
+pub fn validate_run_resources(
+    cpu_count: u16,
+    memory_mib: u64,
+    ttl_seconds: Option<u64>,
+) -> Result<(), RunCellError> {
+    validate_cell_resources(cpu_count, memory_mib, ttl_seconds).map_err(|error| {
+        run_cell_error(
+            RunFailureContext::new(None, None, None),
+            RunStage::RequestValidation,
+            RunCleanupDisposition::NothingCreated,
+            error,
+            None,
+            None,
+        )
+    })
+}
+
+#[must_use]
+pub fn run_request_validation_error(plan: &RunExecutionPlan, source: EngineError) -> RunCellError {
+    run_cell_error(
+        RunFailureContext::new(Some(plan), None, None),
+        RunStage::RequestValidation,
+        RunCleanupDisposition::NothingCreated,
+        source,
+        None,
+        None,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,6 +317,8 @@ impl ImageValidationStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunCellReport {
     pub schema_version: u32,
+    #[serde(default)]
+    pub plan: Option<RunExecutionPlan>,
     pub cell_id: CellId,
     pub operation_id: GuestOperationId,
     pub outcome: RunOutcome,
@@ -293,6 +329,8 @@ pub struct RunCellReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFailureReport {
     pub schema_version: u32,
+    #[serde(default)]
+    pub plan: Option<RunExecutionPlan>,
     pub cell_id: Option<CellId>,
     pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
@@ -574,6 +612,9 @@ pub enum EngineError {
 
     #[error(transparent)]
     Provider(#[from] ProviderError),
+
+    #[error(transparent)]
+    RunSelection(#[from] RunSelectionError),
 
     #[error("unsupported local provider: {0}")]
     UnsupportedProvider(String),
@@ -1368,10 +1409,10 @@ impl<P: LocalVmProvider> CellEngine<P> {
         request: RunCellRequest,
         observer: &mut O,
     ) -> Result<RunCellReport, RunCellError> {
+        let plan = request.plan.clone();
         if let Err(error) = request.command.validate().map_err(EngineError::from) {
             return Err(run_cell_error(
-                None,
-                None,
+                RunFailureContext::new(Some(&plan), None, None),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1381,8 +1422,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if let Err(error) = validate_readiness_policy(request.readiness) {
             return Err(run_cell_error(
-                None,
-                None,
+                RunFailureContext::new(Some(&plan), None, None),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1392,8 +1432,17 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if let Err(error) = validate_cell_spec(&request.spec, self.provider.name()) {
             return Err(run_cell_error(
+                RunFailureContext::new(Some(&plan), None, None),
+                RunStage::RequestValidation,
+                RunCleanupDisposition::NothingCreated,
+                error,
                 None,
                 None,
+            ));
+        }
+        if let Err(error) = self.revalidate_run_request(transport, &request) {
+            return Err(run_cell_error(
+                RunFailureContext::new(Some(&plan), None, None),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1416,8 +1465,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let (cleanup, cleanup_error) =
                     self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
                 return Err(run_cell_error(
-                    Some(cell_id),
-                    None,
+                    RunFailureContext::new(Some(&plan), Some(cell_id), None),
                     stage,
                     cleanup,
                     error,
@@ -1432,15 +1480,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }) == RunControl::Cancel
             || observer.observe(&RunProgressEvent::CellCreated { cell_id }) == RunControl::Cancel
         {
-            return Err(self.interrupted_run(cell_id, request.cleanup, false, observer));
+            return Err(self.interrupted_run(&plan, cell_id, request.cleanup, false, observer));
         }
 
         if let Err(error) = self.start_cell(cell_id) {
             let (cleanup, cleanup_error) =
                 self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
             return Err(run_cell_error(
-                Some(cell_id),
-                None,
+                RunFailureContext::new(Some(&plan), Some(cell_id), None),
                 RunStage::ProviderStart,
                 cleanup,
                 error,
@@ -1449,7 +1496,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         if observer.observe(&RunProgressEvent::ProviderStarted { cell_id }) == RunControl::Cancel {
-            return Err(self.interrupted_run(cell_id, request.cleanup, false, observer));
+            return Err(self.interrupted_run(&plan, cell_id, request.cleanup, false, observer));
         }
 
         let mut guest_was_ready = false;
@@ -1492,8 +1539,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let (cleanup, cleanup_error) =
                     self.cleanup_failed_run(cell_id, request.cleanup, !terminal, observer);
                 return Err(run_cell_error(
-                    Some(cell_id),
-                    guest_operation_id,
+                    RunFailureContext::new(Some(&plan), Some(cell_id), guest_operation_id),
                     stage,
                     cleanup,
                     error,
@@ -1519,8 +1565,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             let (cleanup, cleanup_error) =
                 self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
             return Err(run_cell_error(
-                Some(cell_id),
-                Some(execution.operation_id),
+                RunFailureContext::new(Some(&plan), Some(cell_id), Some(execution.operation_id)),
                 RunStage::Interrupted,
                 cleanup,
                 error,
@@ -1556,8 +1601,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
                         let _ = observer.observe(&RunProgressEvent::CleanupRefused { cell_id });
                     }
                     return Err(run_cell_error(
-                        Some(cell_id),
-                        Some(execution.operation_id),
+                        RunFailureContext::new(
+                            Some(&plan),
+                            Some(cell_id),
+                            Some(execution.operation_id),
+                        ),
                         RunStage::Cleanup,
                         disposition,
                         error,
@@ -1570,6 +1618,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
         Ok(RunCellReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
+            plan: Some(plan),
             cell_id,
             operation_id: execution.operation_id,
             outcome,
@@ -1580,6 +1629,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     fn interrupted_run<O: RunObserver>(
         &self,
+        plan: &RunExecutionPlan,
         cell_id: CellId,
         cleanup_policy: RunCleanupPolicy,
         ambiguous: bool,
@@ -1590,8 +1640,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let (cleanup, cleanup_error) =
             self.cleanup_failed_run(cell_id, cleanup_policy, ambiguous, observer);
         run_cell_error(
-            Some(cell_id),
-            None,
+            RunFailureContext::new(Some(plan), Some(cell_id), None),
             RunStage::Interrupted,
             cleanup,
             error,
@@ -2262,6 +2311,39 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
     }
 
+    fn revalidate_run_request<G: GuestTransport>(
+        &self,
+        transport: &G,
+        request: &RunCellRequest,
+    ) -> Result<(), EngineError> {
+        let plan = &request.plan;
+        let expected_provider = plan.provider.as_str();
+        let spec_accelerator_matches = match plan.provider {
+            ProviderId::Hyperv => request.spec.accelerator.is_none() && !request.spec.allow_tcg,
+            ProviderId::Qemu => {
+                request.spec.accelerator.as_deref() == Some(plan.accelerator.as_str())
+                    && request.spec.allow_tcg == (plan.accelerator == Accelerator::Tcg)
+            }
+        };
+        if request.spec.image != plan.image
+            || request.spec.provider.as_deref() != Some(expected_provider)
+            || self.provider.name() != expected_provider
+            || !spec_accelerator_matches
+            || transport.name() != plan.guest_transport.as_str()
+            || !transport.supports(expected_provider, plan.guest_os)
+        {
+            return Err(RunSelectionError::PlanDrift.into());
+        }
+        let host = HostPlatform {
+            os: plan.host_os,
+            architecture: plan.host_architecture,
+        };
+        let image = self.state.load_image(&plan.image)?;
+        let probe = self.provider.probe();
+        revalidate_run_execution_plan(plan, host, &image, &probe)?;
+        Ok(())
+    }
+
     fn verify_registered_image(
         &self,
         variant: &ImageVariant,
@@ -2748,6 +2830,7 @@ fn durable_error_code(error: &EngineError) -> &'static str {
         EngineError::Provider(ProviderError::Timeout(_)) => "vmcell.provider.timeout",
         EngineError::Provider(ProviderError::OutputLimit(_)) => "vmcell.provider.output_limit",
         EngineError::Provider(_) => "vmcell.provider.failed",
+        EngineError::RunSelection(error) => error.code(),
         EngineError::UnsupportedProvider(_) => "vmcell.provider.unsupported",
         EngineError::ProviderUnavailable(_) => "vmcell.provider.unavailable",
         EngineError::InvalidImage(_) => "vmcell.image.invalid",
@@ -2766,9 +2849,29 @@ fn durable_error_code(error: &EngineError) -> &'static str {
     }
 }
 
-fn run_cell_error(
+#[derive(Clone, Copy)]
+struct RunFailureContext<'a> {
+    plan: Option<&'a RunExecutionPlan>,
     cell_id: Option<CellId>,
     operation_id: Option<GuestOperationId>,
+}
+
+impl<'a> RunFailureContext<'a> {
+    const fn new(
+        plan: Option<&'a RunExecutionPlan>,
+        cell_id: Option<CellId>,
+        operation_id: Option<GuestOperationId>,
+    ) -> Self {
+        Self {
+            plan,
+            cell_id,
+            operation_id,
+        }
+    }
+}
+
+fn run_cell_error(
+    context: RunFailureContext<'_>,
     stage: RunStage,
     cleanup: RunCleanupDisposition,
     source: EngineError,
@@ -2778,8 +2881,9 @@ fn run_cell_error(
     RunCellError {
         report: Box::new(RunFailureReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
-            cell_id,
-            operation_id,
+            plan: context.plan.cloned(),
+            cell_id: context.cell_id,
+            operation_id: context.operation_id,
             stage,
             cleanup,
             error_code: durable_error_code(&source).to_owned(),
@@ -3053,22 +3157,30 @@ fn validate_cell_spec(spec: &CellSpec, provider: &str) -> Result<(), EngineError
             ));
         }
     }
-    if spec.accelerator.as_deref() == Some("tcg") && !spec.allow_tcg {
+    if spec.allow_tcg != (spec.accelerator.as_deref() == Some("tcg")) {
         return Err(EngineError::InvalidCellRequest(
-            "TCG requires explicit allow_tcg".to_owned(),
+            "TCG requires exact accelerator=tcg and allow_tcg opt-in together".to_owned(),
         ));
     }
-    if !(1..=MAX_CPU_COUNT).contains(&spec.cpu_count) {
+    validate_cell_resources(spec.cpu_count, spec.memory_mib, spec.ttl_seconds)
+}
+
+fn validate_cell_resources(
+    cpu_count: u16,
+    memory_mib: u64,
+    ttl_seconds: Option<u64>,
+) -> Result<(), EngineError> {
+    if !(1..=MAX_CPU_COUNT).contains(&cpu_count) {
         return Err(EngineError::InvalidCellRequest(format!(
             "cpu_count must be between 1 and {MAX_CPU_COUNT}"
         )));
     }
-    if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&spec.memory_mib) {
+    if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib) {
         return Err(EngineError::InvalidCellRequest(format!(
             "memory_mib must be between {MIN_MEMORY_MIB} and {MAX_MEMORY_MIB}"
         )));
     }
-    if let Some(ttl_seconds) = spec.ttl_seconds {
+    if let Some(ttl_seconds) = ttl_seconds {
         if !(MIN_TTL_SECONDS..=MAX_TTL_SECONDS).contains(&ttl_seconds) {
             return Err(EngineError::InvalidCellRequest(format!(
                 "ttl_seconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"
@@ -3620,6 +3732,7 @@ mod tests {
     struct MockState {
         vm: Option<ProviderVm>,
         calls: Vec<&'static str>,
+        probe_unavailable: bool,
         remove_calls: usize,
         drift_before_mutation: bool,
         fail_claim: bool,
@@ -3700,6 +3813,10 @@ mod tests {
             self.state.lock().unwrap().drift_before_mutation = true;
         }
 
+        fn make_probe_unavailable(&self) {
+            self.state.lock().unwrap().probe_unavailable = true;
+        }
+
         #[cfg(windows)]
         fn rotate_installation_during_mutation(&self, path: PathBuf) {
             self.state.lock().unwrap().installation_rotation_path = Some(path);
@@ -3712,6 +3829,15 @@ mod tests {
         }
 
         fn probe(&self) -> ProviderProbe {
+            if self.state.lock().unwrap().probe_unavailable {
+                return ProviderProbe {
+                    name: self.provider_name,
+                    status: ProviderProbeStatus::Unavailable,
+                    available: false,
+                    detail: "mock provider became unavailable".to_owned(),
+                    capabilities: ProviderCapabilities::unavailable(),
+                };
+            }
             ProviderProbe {
                 name: self.provider_name,
                 status: ProviderProbeStatus::Ready,
@@ -3720,6 +3846,24 @@ mod tests {
                 capabilities: ProviderCapabilities {
                     full_system_vm: true,
                     cow_overlay: true,
+                    hardware_acceleration: self.provider_name == "hyperv",
+                    accelerators: if self.provider_name == "hyperv" {
+                        vec!["hyper-v".to_owned()]
+                    } else {
+                        vec!["tcg".to_owned()]
+                    },
+                    guest_os: vec![if self.provider_name == "hyperv" {
+                        "windows".to_owned()
+                    } else {
+                        "linux".to_owned()
+                    }],
+                    guest_arch: vec!["x86_64".to_owned()],
+                    guest_transports: vec![if self.provider_name == "hyperv" {
+                        "powershell-direct".to_owned()
+                    } else {
+                        "qga".to_owned()
+                    }],
+                    networkless_guest_exec: true,
                     ..ProviderCapabilities::unavailable()
                 },
             }
@@ -3975,7 +4119,7 @@ mod tests {
             cpu_count: 2,
             memory_mib: 2048,
             ttl_seconds: None,
-            accelerator: Some("auto".to_owned()),
+            accelerator: Some("tcg".to_owned()),
             allow_tcg: true,
         }
     }
@@ -4315,6 +4459,21 @@ mod tests {
 
     fn run_request(image: ImageId) -> RunCellRequest {
         RunCellRequest {
+            plan: RunExecutionPlan {
+                schema_version: crate::core::run_selection::RUN_PLAN_SCHEMA_VERSION,
+                contract: crate::core::run_selection::RUN_PLAN_CONTRACT.to_owned(),
+                image: image.clone(),
+                host_os: crate::core::support::HostOs::Windows,
+                host_architecture: Architecture::X86_64,
+                guest_os: GuestOs::Windows,
+                guest_architecture: Architecture::X86_64,
+                provider: ProviderId::Hyperv,
+                accelerator: Accelerator::HyperV,
+                guest_transport: crate::core::support::GuestTransportId::PowerShellDirect,
+                support_status: crate::core::support::SupportStatus::Untested,
+                selection_source: crate::core::run_selection::RunSelectionSource::NativeDefault,
+                authorizing: false,
+            },
             spec: spec(image),
             command: GuestCommand {
                 program: "cmd.exe".to_owned(),
@@ -4390,6 +4549,7 @@ mod tests {
     struct MockGuest {
         provider: Arc<Mutex<MockState>>,
         state: Arc<Mutex<MockGuestState>>,
+        name: &'static str,
     }
 
     impl MockGuest {
@@ -4397,6 +4557,7 @@ mod tests {
             Self {
                 provider,
                 state: Arc::new(Mutex::new(MockGuestState::default())),
+                name: "powershell-direct",
             }
         }
 
@@ -4421,7 +4582,7 @@ mod tests {
 
     impl GuestTransport for MockGuest {
         fn name(&self) -> &'static str {
-            "mock-guest"
+            self.name
         }
 
         fn supports(&self, _provider: &str, _guest_os: GuestOs) -> bool {
@@ -4621,6 +4782,67 @@ mod tests {
         assert!(!engine.destroy_cell(cell.id).unwrap().changed);
         assert!(!engine.state.cell_runtime_root(cell.id).exists());
         assert_eq!(engine.provider.state.lock().unwrap().remove_calls, 1);
+    }
+
+    #[test]
+    fn run_plan_provider_drift_is_rejected_before_any_mutation_or_tcg_fallback() {
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        let image = engine.state.load_image(&image_id).unwrap();
+        let initial_probe = engine.provider.probe();
+        let plan = crate::core::run_selection::resolve_run_execution_plan(
+            HostPlatform {
+                os: crate::core::support::HostOs::Windows,
+                architecture: Architecture::X86_64,
+            },
+            &image,
+            &[initial_probe],
+            crate::core::run_selection::RunSelectionIntent {
+                explicit_provider: Some(ProviderId::Hyperv),
+                config_provider_preference: None,
+                explicit_accelerator: None,
+                allow_tcg: false,
+            },
+        )
+        .unwrap();
+        let mut request = run_request(image_id);
+        request.plan = plan;
+        engine.provider.state.lock().unwrap().calls.clear();
+        engine.provider.make_probe_unavailable();
+
+        let error = engine.run_cell(&guest, &credentials, request).unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::RequestValidation);
+        assert_eq!(
+            error.report().error_code,
+            RunSelectionError::ProviderUnavailable.code()
+        );
+        assert_eq!(
+            error.report().cleanup,
+            RunCleanupDisposition::NothingCreated
+        );
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+        assert!(engine.state.list_cells().unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_transport_mismatch_is_rejected_before_any_mutation() {
+        let (_directory, engine, image_id, mut guest, credentials) = run_fixture();
+        guest.name = "qga";
+        engine.provider.state.lock().unwrap().calls.clear();
+
+        let error = engine
+            .run_cell(&guest, &credentials, run_request(image_id))
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::RequestValidation);
+        assert_eq!(
+            error.report().cleanup,
+            RunCleanupDisposition::NothingCreated
+        );
+        assert_eq!(error.report().error_code, "vmcell.run_plan.drift");
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+        assert!(engine.state.list_cells().unwrap().is_empty());
+        assert!(guest.state.lock().unwrap().calls.is_empty());
     }
 
     #[test]
