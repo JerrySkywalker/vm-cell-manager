@@ -107,6 +107,7 @@ def archive_contract(archive_path: Path, version: str, source: str, epoch: int, 
         "completions/_vmcell",
         "completions/vmcell.bash",
         "vmcell",
+        "vmcell-portable-layout.py",
     ]
     expected = [root, f"{root}/completions"] + [f"{root}/{name}" for name in relative_files]
     archive_bytes = archive_path.read_bytes()
@@ -124,7 +125,12 @@ def archive_contract(archive_path: Path, version: str, source: str, epoch: int, 
                 raise ContractError(f"archive ownership metadata was not normalized: {member.name}")
             if member.mtime != epoch:
                 raise ContractError(f"archive timestamp was not normalized: {member.name}")
-            expected_mode = 0o755 if index < 2 or member.name == f"{root}/vmcell" else 0o644
+            expected_mode = (
+                0o755
+                if index < 2
+                or member.name in {f"{root}/vmcell", f"{root}/vmcell-portable-layout.py"}
+                else 0o644
+            )
             if member.mode != expected_mode:
                 raise ContractError(f"archive mode was not normalized: {member.name}")
         contents: dict[str, bytes] = {}
@@ -234,29 +240,6 @@ def negative_archive_regressions(root: str, epoch: int) -> None:
         raise ContractError("unsafe archive regression was accepted")
 
 
-def install_layout_new(contents: dict[str, bytes], install_root: Path) -> None:
-    try:
-        install_root.mkdir(mode=0o700)
-        (install_root / "completions").mkdir(mode=0o755)
-    except FileExistsError as error:
-        raise ContractError("fresh installation root already exists") from error
-    for relative, content in sorted(contents.items()):
-        path = install_root / relative
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags, 0o700 if relative == "vmcell" else 0o600)
-        try:
-            view = memoryview(content)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise ContractError("installed file write did not progress")
-                view = view[written:]
-            os.fsync(descriptor)
-            os.fchmod(descriptor, 0o755 if relative == "vmcell" else 0o644)
-        finally:
-            os.close(descriptor)
-
-
 def validate_installed_layout(contents: dict[str, bytes], install_root: Path) -> None:
     expected_root = {Path(name).parts[0] for name in contents}
     expected_root.add("completions")
@@ -282,32 +265,48 @@ def validate_installed_layout(contents: dict[str, bytes], install_root: Path) ->
             raise ContractError(f"installed file identity drifted: {relative}")
         if path.read_bytes() != expected:
             raise ContractError(f"installed file content drifted: {relative}")
-        expected_mode = 0o755 if relative == "vmcell" else 0o644
+        expected_mode = 0o755 if relative in {"vmcell", "vmcell-portable-layout.py"} else 0o644
         if stat.S_IMODE(status.st_mode) != expected_mode:
             raise ContractError(f"installed file mode drifted: {relative}")
 
 
-def remove_layout_exact(contents: dict[str, bytes], install_root: Path) -> None:
-    validate_installed_layout(contents, install_root)
-    for relative in sorted(contents, reverse=True):
-        (install_root / relative).unlink()
-    (install_root / "completions").rmdir()
-    install_root.rmdir()
-
-
-def install_smoke(contents: dict[str, bytes], version: str, test_root: Path) -> None:
-    prefix_parent = test_root / "prefix-parent"
-    prefix_parent.mkdir(mode=0o700)
+def install_smoke(
+    archive: Path,
+    contents: dict[str, bytes],
+    version: str,
+    test_root: Path,
+) -> None:
+    home = test_root / "home"
+    home.mkdir(mode=0o700)
+    extraction = test_root / "extraction"
+    extraction.mkdir(mode=0o700)
+    extracted = run(["tar", "-xzf", str(archive), "-C", str(extraction)])
+    if extracted.returncode != 0:
+        raise ContractError("validated archive could not be extracted for install smoke")
+    layout = extraction / f"vmcell-v{version}-linux-x86_64"
+    installer = layout / "vmcell-portable-layout.py"
+    prefix_parent = home / ".local" / "lib" / "vmcell"
     install_root = prefix_parent / f"vmcell-v{version}-linux-x86_64"
+    environment = os.environ.copy()
+    environment.update({"HOME": str(home), "LC_ALL": "C", "LANG": "C", "TZ": "UTC"})
+    installed = run(
+        [sys.executable, str(installer), "install", "--parent", str(prefix_parent)],
+        environment=environment,
+    )
+    if installed.returncode != 0:
+        raise ContractError(
+            f"portable installer failed: {installed.stderr.decode('utf-8', errors='replace')}"
+        )
+    for component in (home / ".local", home / ".local" / "lib", prefix_parent):
+        status = os.lstat(component)
+        if not stat.S_ISDIR(status.st_mode) or stat.S_IMODE(status.st_mode) != 0o700:
+            raise ContractError("portable installer did not create a private parent chain")
     sentinel = prefix_parent / "owner-sentinel"
     sentinel.write_text("retain\n", encoding="utf-8")
-    install_layout_new(contents, install_root)
     validate_installed_layout(contents, install_root)
     binary_path = install_root / "vmcell"
     if stat.S_IMODE(binary_path.stat().st_mode) != 0o755:
         raise ContractError("installed binary mode was not executable")
-    deterministic_env = os.environ.copy()
-    deterministic_env.update({"LC_ALL": "C", "LANG": "C", "TZ": "UTC"})
     state_root = test_root / "read-only-state"
     commands = [
         ([str(binary_path), "--version"], f"vmcell {version}"),
@@ -316,40 +315,56 @@ def install_smoke(contents: dict[str, bytes], version: str, test_root: Path) -> 
         ([str(binary_path), "--json", "--state-root", str(state_root), "status"], '"schema_version"'),
     ]
     for command, marker in commands:
-        result = run(command, environment=deterministic_env)
+        result = run(command, environment=environment)
         if result.returncode != 0 or marker.encode("utf-8") not in result.stdout:
             raise ContractError(f"unprivileged install smoke failed: {command[-1]}")
     if state_root.exists():
         raise ContractError("read-only doctor/status smoke created the isolated state root")
 
-    collision_root = prefix_parent / "collision"
-    collision_root.mkdir(mode=0o700)
-    collision_sentinel = collision_root / "vmcell"
-    collision_sentinel.write_text("foreign\n", encoding="utf-8")
-    try:
-        install_layout_new(contents, collision_root)
-    except ContractError:
-        pass
-    else:
+    collision = run(
+        [sys.executable, str(installer), "install", "--parent", str(prefix_parent)],
+        environment=environment,
+    )
+    if collision.returncode == 0:
         raise ContractError("fresh installation overwrote an existing target")
-    if collision_sentinel.read_text(encoding="utf-8") != "foreign\n":
-        raise ContractError("fresh installation modified a foreign collision target")
+    validate_installed_layout(contents, install_root)
 
-    drift_root = prefix_parent / "drifted"
-    install_layout_new(contents, drift_root)
+    drift_parent = home / "drift-parent"
+    drift_parent.mkdir(mode=0o700)
+    drift_root = drift_parent / f"vmcell-v{version}-linux-x86_64"
+    drift_install = run(
+        [sys.executable, str(installer), "install", "--parent", str(drift_parent)],
+        environment=environment,
+    )
+    if drift_install.returncode != 0:
+        raise ContractError("portable installer could not create the drift regression layout")
     drifted_binary = drift_root / "vmcell"
     drifted_binary.write_text("foreign replacement\n", encoding="utf-8")
     os.chmod(drifted_binary, 0o755)
-    try:
-        remove_layout_exact(contents, drift_root)
-    except ContractError:
-        pass
-    else:
+    drift_remove = run(
+        [sys.executable, str(installer), "remove", "--parent", str(drift_parent)],
+        environment=environment,
+    )
+    if drift_remove.returncode == 0:
         raise ContractError("removal accepted a replaced installed binary")
     if drifted_binary.read_text(encoding="utf-8") != "foreign replacement\n":
         raise ContractError("failed removal deleted a foreign replacement")
 
-    remove_layout_exact(contents, install_root)
+    linked_parent = home / "linked-parent"
+    linked_parent.symlink_to(prefix_parent, target_is_directory=True)
+    linked = run(
+        [sys.executable, str(installer), "install", "--parent", str(linked_parent)],
+        environment=environment,
+    )
+    if linked.returncode == 0:
+        raise ContractError("portable installer accepted a symlink parent")
+
+    removed = run(
+        [sys.executable, str(installer), "remove", "--parent", str(prefix_parent)],
+        environment=environment,
+    )
+    if removed.returncode != 0 or install_root.exists():
+        raise ContractError("exact portable-package removal failed")
     if not sentinel.is_file() or sentinel.read_text(encoding="utf-8") != "retain\n":
         raise ContractError("package removal touched an unrelated owner file")
 
@@ -507,7 +522,7 @@ def main() -> int:
         result = run(common + ["--output-directory", str(insecure_output)], timeout=60)
         if result.returncode == 0 or insecure_output.exists():
             raise ContractError("package assembly accepted a group/world-writable output parent")
-        install_smoke(contents, version, test_root)
+        install_smoke(first_archive, contents, version, test_root)
 
     print(
         json.dumps(

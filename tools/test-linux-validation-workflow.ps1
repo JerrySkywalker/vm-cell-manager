@@ -8,6 +8,7 @@ $preflightTestPath = Join-Path $repositoryRoot 'tools\test-linux-kvm-preflight.s
 $packageGatePath = Join-Path $repositoryRoot 'tools\check-linux-package.sh'
 $packageScriptPath = Join-Path $repositoryRoot 'tools\package-linux.py'
 $packageTestPath = Join-Path $repositoryRoot 'tools\test-linux-package.py'
+$packageLayoutPath = Join-Path $repositoryRoot 'packaging\linux\vmcell-portable-layout.py'
 
 if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
   throw 'Linux validation workflow is missing'
@@ -21,7 +22,7 @@ if (-not (Test-Path -LiteralPath $preflightPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $preflightTestPath -PathType Leaf)) {
   throw 'Linux KVM preflight fixture test is missing'
 }
-foreach ($path in @($packageGatePath, $packageScriptPath, $packageTestPath)) {
+foreach ($path in @($packageGatePath, $packageScriptPath, $packageTestPath, $packageLayoutPath)) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     throw "Linux package validation surface is missing: $path"
   }
@@ -34,7 +35,8 @@ $preflightTest = [IO.File]::ReadAllText($preflightTestPath)
 $packageGate = [IO.File]::ReadAllText($packageGatePath)
 $packageScript = [IO.File]::ReadAllText($packageScriptPath)
 $packageTest = [IO.File]::ReadAllText($packageTestPath)
-$packageSurface = "$packageGate`n$packageScript`n$packageTest"
+$packageLayout = [IO.File]::ReadAllText($packageLayoutPath)
+$packageSurface = "$packageGate`n$packageScript`n$packageTest`n$packageLayout"
 
 function Assert-LinuxValidationContract {
   param(

@@ -2,7 +2,8 @@ VM Cell Manager portable GNU/Linux package
 ==========================================
 
 This archive contains the repository-local x86_64-unknown-linux-gnu candidate.
-Start with INSTALL.txt, then use `vmcell --help` and the project documentation:
+Start with INSTALL.txt and the packaged vmcell-portable-layout.py helper, then
+use `vmcell --help` and the project documentation:
 
   https://github.com/JerrySkywalker/vm-cell-manager/blob/dev/docs/linux-kvm-qga.md
 

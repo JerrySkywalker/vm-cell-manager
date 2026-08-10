@@ -228,6 +228,10 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
         "LICENSE.txt": ("LICENSE", "license"),
         "NOTICE.txt": ("NOTICE", "notice"),
         "INSTALL.txt": ("packaging/linux/INSTALL.txt", "install instructions"),
+        "vmcell-portable-layout.py": (
+            "packaging/linux/vmcell-portable-layout.py",
+            "portable layout installer",
+        ),
     }
     package_inputs: dict[str, bytes] = {}
     for package_name, (source_name, label) in source_inputs.items():
@@ -307,6 +311,7 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
         "completions/_vmcell",
         "completions/vmcell.bash",
         "vmcell",
+        "vmcell-portable-layout.py",
     ]
     archive_entries = [layout_root, f"{layout_root}/completions"] + [
         f"{layout_root}/{name}" for name in file_names
@@ -360,6 +365,7 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
         "completions/_vmcell": zsh_completion.encode("utf-8"),
         "completions/vmcell.bash": bash_completion.encode("utf-8"),
         "vmcell": binary_bytes,
+        "vmcell-portable-layout.py": package_inputs["vmcell-portable-layout.py"],
     }
     checksum_lines = [f"{sha256(payloads[name])}  {name}\n" for name in sorted(payloads)]
     payloads["PACKAGE-CONTENTS.sha256"] = "".join(checksum_lines).encode("ascii")
@@ -369,7 +375,7 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
         add_tar_directory(archive, layout_root, args.source_date_epoch)
         add_tar_directory(archive, f"{layout_root}/completions", args.source_date_epoch)
         for name in file_names:
-            mode = 0o755 if name == "vmcell" else 0o644
+            mode = 0o755 if name in {"vmcell", "vmcell-portable-layout.py"} else 0o644
             add_tar_file(
                 archive,
                 f"{layout_root}/{name}",

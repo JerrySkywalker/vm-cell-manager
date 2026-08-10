@@ -14,11 +14,13 @@ sha256sum --check --strict SHA256SUMS.txt
 ```
 
 Install the complete layout into a new versioned, private, user-owned
-directory. Fresh install is no-clobber: stop if the exact version directory
-already exists. Create each absent component of `$HOME/.local/lib/vmcell` one
-at a time with mode `0700`; every existing component must be an ordinary
-non-symlink directory owned by the effective user with mode `0700`. Stop on any
-mismatch.
+directory. Fresh install is atomic no-clobber: stop if the exact version
+directory already exists. The packaged layout helper creates absent parent
+components with mode `0700`, requires every existing component beneath an
+ordinary current-user-owned non-symlink `HOME` to be current-user-owned and
+not group/world writable, and requires the exact `vmcell` parent to be `0700`.
+It writes the fixed payload list with explicit `0644`/`0755` modes and verifies
+the retained manifest before publication. Stop on any mismatch.
 
 ```sh
 set -eu
@@ -30,10 +32,7 @@ install_parent="$HOME/.local/lib/vmcell"
 install_root="$install_parent/vmcell-v0.2.0-linux-x86_64"
 
 (cd "$layout" && sha256sum --check --strict PACKAGE-CONTENTS.sha256)
-test ! -e "$install_root" && test ! -L "$install_root"
-mkdir -m 0700 -- "$install_root"
-cp -R -- "$layout/." "$install_root/"
-(cd "$install_root" && sha256sum --check --strict PACKAGE-CONTENTS.sha256)
+python3 "$layout/vmcell-portable-layout.py" install --parent "$install_parent"
 
 "$install_root/vmcell" --version
 "$install_root/vmcell" --help
@@ -81,25 +80,16 @@ ordinary non-symlink file owned by that user, run `sha256sum --check --strict`,
 and reject any missing, additional, replaced, or mode-drifted entry. Stop
 without deleting anything on any mismatch.
 
-Only after those checks, remove the fixed package-owned file list and then the
-two now-empty directories:
+Run removal from the retained, checksum-verified extracted package layout, not
+from the installed copy. The same packaged helper compares exact names,
+ownership, modes, and contents to that retained source before it removes the
+fixed payload list and the two now-empty directories:
 
 ```sh
-rm -- \
-  "$install_root/BUILD-PROVENANCE.json" \
-  "$install_root/INSTALL.txt" \
-  "$install_root/LICENSE.txt" \
-  "$install_root/NOTICE.txt" \
-  "$install_root/PACKAGE-CONTENTS.sha256" \
-  "$install_root/PACKAGE-METADATA.json" \
-  "$install_root/README.txt" \
-  "$install_root/completions/_vmcell" \
-  "$install_root/completions/vmcell.bash" \
-  "$install_root/vmcell"
-rmdir -- "$install_root/completions" "$install_root"
+(cd "$layout" && sha256sum --check --strict PACKAGE-CONTENTS.sha256)
+python3 "$layout/vmcell-portable-layout.py" remove --parent "$install_parent"
 ```
 
 Do not delete vmcell state roots, registered base images, retained cells, or
 artifacts as part of program removal. Those require separate explicit cleanup
 decisions through the ownership and reconciliation model.
-

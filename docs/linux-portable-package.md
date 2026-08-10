@@ -23,6 +23,7 @@ vmcell-vX.Y.Z-linux-x86_64/
     _vmcell
     vmcell.bash
   vmcell
+  vmcell-portable-layout.py
 ```
 
 The sibling `SHA256SUMS.txt` binds the completed archive. The in-archive
@@ -62,7 +63,10 @@ the locked release binary, assembles the archive twice, compares both archives
 and checksum manifests byte-for-byte, validates normalized ustar ownership,
 modes, timestamps, ordering and gzip header, rejects unsafe/duplicate/link
 entries, checks all hashes and JSON metadata, and performs an unprivileged
-temporary-prefix install/remove smoke test.
+temporary-prefix install/remove smoke test through the exact packaged layout
+helper. The helper creates/admit-checks the parent chain, normalizes payload
+modes, publishes a fresh versioned directory without clobber, and removes only
+an exact layout matching the retained verified package.
 
 The smoke test runs `--version`, `--help`, `doctor`, and `status` against an
 isolated nonexistent state root. Doctor may perform the existing non-mutating
