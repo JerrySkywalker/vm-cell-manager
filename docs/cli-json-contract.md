@@ -29,6 +29,8 @@ vmcell image dependencies IMAGE
 vmcell image unregister IMAGE
 vmcell create --image IMAGE [--provider hyperv|qemu] [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
               [--accelerator auto|whpx|kvm|hvf|tcg] [--allow-tcg]
+vmcell run --image IMAGE [--provider hyperv|qemu] [--accelerator auto|whpx|kvm|hvf|tcg]
+           [--allow-tcg] [--plan-only | -- PROGRAM [ARG...]]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -129,11 +131,21 @@ transport/session failure, ownership drift, or existing nonterminal guest
 operation stops the console without replay or automatic cleanup; the durable
 operation ID is printed when transport intent was recorded.
 
-For QEMU, the image and create provider must be explicit and compatible. TCG
-requires both `--accelerator tcg` and `--allow-tcg`; `auto` never silently
-falls back unless `--allow-tcg` is present. Linux QGA guest commands are
+`run` resolves a read-only `vmcell.run-plan.v1` before credentials or mutation.
+Its precedence is explicit CLI provider/accelerator, then an explicitly present
+non-authorizing config provider preference, then deterministic compatible
+native/default resolution. The plan records provider, exact accelerator,
+transport, guest identity, support status, selection source, and
+`authorizing: false`; it omits paths, hashes, commands, credentials, and raw
+probe detail. `run --plan-only` returns that plan directly. Actual run success
+and failure objects carry it as an additive `plan` field when resolution
+completed, preserving the one-JSON-document rule.
+
+For QEMU, the selected image variant and accelerator must be compatible. TCG
+requires both `--accelerator tcg` and `--allow-tcg`; `auto` never falls back to
+TCG, even when `--allow-tcg` is present. Linux QGA guest commands are
 credentialless, reject username/password flags, and use a POSIX CellId-scoped
-workspace. Windows QGA is not advertised by M3.
+workspace. Windows QGA is not advertised.
 
 ## Successful output
 

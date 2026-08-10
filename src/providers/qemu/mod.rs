@@ -225,7 +225,6 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
         let hardware = host_accelerator();
         let selected = match requested {
             "auto" if available.iter().any(|value| value == hardware) => hardware,
-            "auto" if request.allow_tcg && available.iter().any(|value| value == "tcg") => "tcg",
             "auto" => {
                 return Err(ProviderError::Unsupported {
                     provider: "qemu",
@@ -1889,6 +1888,13 @@ mod tests {
             allow_tcg: false,
         };
         assert!(provider.select_accelerator(&request).is_err());
+
+        let auto = CreateVmRequest {
+            accelerator: Some("auto".to_owned()),
+            allow_tcg: true,
+            ..request
+        };
+        assert!(provider.select_accelerator(&auto).is_err());
     }
 
     fn qmp_start_session(expected: &ProviderVm) -> Vec<u8> {

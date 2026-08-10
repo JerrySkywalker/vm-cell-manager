@@ -63,6 +63,7 @@ pub struct UserDefaults {
 pub struct ResolvedConfig {
     pub state_root: Option<PathBuf>,
     pub provider: ConfigProvider,
+    pub provider_preference: Option<ConfigProvider>,
     pub cpu_count: u16,
     pub memory_mib: u64,
     pub lock_timeout_ms: u64,
@@ -76,6 +77,7 @@ impl Default for ResolvedConfig {
         Self {
             state_root: None,
             provider: ConfigProvider::Hyperv,
+            provider_preference: None,
             cpu_count: DEFAULT_CPU_COUNT,
             memory_mib: DEFAULT_MEMORY_MIB,
             lock_timeout_ms: 0,
@@ -169,6 +171,7 @@ fn resolve_config(
     }
     if let Some(provider) = defaults.provider {
         resolved.provider = provider;
+        resolved.provider_preference = Some(provider);
     }
     if let Some(cpu_count) = defaults.cpu_count {
         if !(1..=MAX_CPU_COUNT).contains(&cpu_count) {
@@ -321,6 +324,7 @@ mod tests {
         }
         let resolved = load_config(Some(&path)).unwrap();
         assert_eq!(resolved.provider, ConfigProvider::Qemu);
+        assert_eq!(resolved.provider_preference, Some(ConfigProvider::Qemu));
         assert_eq!(resolved.cpu_count, 4);
         assert_eq!(resolved.memory_mib, 8192);
         assert_eq!(resolved.lock_timeout_ms, 250);
@@ -354,6 +358,7 @@ mod tests {
     fn absent_implicit_config_uses_non_authorizing_defaults() {
         let resolved = ResolvedConfig::default();
         assert_eq!(resolved.provider, ConfigProvider::Hyperv);
+        assert_eq!(resolved.provider_preference, None);
         assert_eq!(resolved.cpu_count, DEFAULT_CPU_COUNT);
         assert_eq!(resolved.memory_mib, DEFAULT_MEMORY_MIB);
         assert_eq!(resolved.lock_timeout_ms, 0);

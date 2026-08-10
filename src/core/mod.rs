@@ -5,4 +5,5 @@ pub mod guest;
 pub mod image;
 pub mod lifecycle;
 pub mod ownership;
+pub mod run_selection;
 pub mod support;

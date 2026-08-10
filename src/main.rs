@@ -25,17 +25,23 @@ use vm_cell_manager::core::guest::{
     GuestFailureClass, GuestOperationKind, GuestOperationPhase, GuestOperationRecord,
 };
 use vm_cell_manager::core::image::{Architecture, GuestOs, ImageRecord};
+use vm_cell_manager::core::run_selection::{
+    HostPlatform, RequestedAccelerator, RunExecutionPlan, RunSelectionIntent, RunSelectionSource,
+    resolve_run_execution_plan,
+};
+use vm_cell_manager::core::support::{Accelerator, ProviderId};
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
     GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
     GuestOperationRecoveryReport, ImageDependencyReport, ImageUnregisterReport,
     ImageValidationReport, ImageValidationStatus, RegisterImageRequest, RunCellError,
     RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
-    ValidateImageRequest, inspect_image_dependencies, unregister_image,
+    ValidateImageRequest, inspect_image_dependencies, run_request_validation_error,
+    unregister_image, validate_run_resources,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
-use vm_cell_manager::guest::{GuestCommand, GuestCredentials, ReadinessPolicy};
+use vm_cell_manager::guest::{GuestCommand, GuestCredentials, GuestIoError, ReadinessPolicy};
 use vm_cell_manager::providers::hyperv::HyperVProvider;
 use vm_cell_manager::providers::qemu::QemuProvider;
 use vm_cell_manager::providers::{
@@ -172,6 +178,19 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             CliHumanOutput::Normal => HumanOutputPreference::Normal,
             CliHumanOutput::Quiet => HumanOutputPreference::Quiet,
         });
+    if let Command::Run {
+        cpu_count,
+        memory_mib,
+        ttl_seconds,
+        ..
+    } = &cli.command
+    {
+        validate_run_resources(
+            cpu_count.unwrap_or(defaults.cpu_count),
+            memory_mib.unwrap_or(defaults.memory_mib),
+            *ttl_seconds,
+        )?;
+    }
     match cli.command {
         Command::Doctor => {
             let report = DoctorReport::collect(state_root);
@@ -286,7 +305,35 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         command => {
             let root = state_root.unwrap_or_else(StateStore::default_root);
             let state = StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout);
-            let provider = provider_for_command(&command, &state, defaults.provider)?;
+            let run_plan = match &command {
+                Command::Run {
+                    image,
+                    provider,
+                    accelerator,
+                    allow_tcg,
+                    ..
+                } => {
+                    let image = state.load_image(image)?;
+                    Some(resolve_run_execution_plan(
+                        HostPlatform::current()?,
+                        &image,
+                        &builtin_provider_probes(),
+                        RunSelectionIntent {
+                            explicit_provider: provider.map(provider_id_from_cli),
+                            config_provider_preference: defaults
+                                .provider_preference
+                                .map(provider_id_from_config),
+                            explicit_accelerator: accelerator.map(accelerator_request_from_cli),
+                            allow_tcg: *allow_tcg,
+                        },
+                    )?)
+                }
+                _ => None,
+            };
+            let provider = run_plan.as_ref().map_or_else(
+                || provider_for_command(&command, &state, defaults.provider),
+                |plan| Ok(plan.provider.as_str().to_owned()),
+            )?;
             return match provider.as_str() {
                 "hyperv" => run_m2(
                     command,
@@ -294,6 +341,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     &CellEngine::new(state, HyperVProvider::system()),
                     &defaults,
                     human_output,
+                    run_plan,
                 ),
                 "qemu" => run_m2(
                     command,
@@ -301,6 +349,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     &CellEngine::new(state, QemuProvider::system(root)),
                     &defaults,
                     human_output,
+                    run_plan,
                 ),
                 value => Err(EngineError::Integrity(format!(
                     "unsupported persisted provider: {value}"
@@ -327,6 +376,7 @@ fn run_m2<P: LocalVmProvider>(
     engine: &CellEngine<P>,
     defaults: &ResolvedConfig,
     human_output: HumanOutputPreference,
+    run_plan: Option<RunExecutionPlan>,
 ) -> Result<ExitCode, Box<dyn Error>> {
     match command {
         Command::Image { command } => match command {
@@ -432,8 +482,9 @@ fn run_m2<P: LocalVmProvider>(
             memory_mib,
             ttl_seconds,
             provider: _,
-            accelerator,
-            allow_tcg,
+            accelerator: _,
+            allow_tcg: _,
+            plan_only,
             keep,
             keep_on_failure,
             credential,
@@ -442,16 +493,33 @@ fn run_m2<P: LocalVmProvider>(
             max_output_bytes,
             mut command,
         } => {
+            let plan = run_plan.ok_or_else(|| {
+                EngineError::Integrity(
+                    "run command was routed without an execution plan".to_owned(),
+                )
+            })?;
+            if plan_only {
+                emit(&plan, json, || {
+                    write_human_run_plan(&plan, &mut std::io::stdout().lock())
+                        .expect("stdout should remain writable");
+                })?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !json && human_output == HumanOutputPreference::Normal {
+                write_human_run_plan(&plan, &mut std::io::stderr().lock())?;
+            }
             let program = command.remove(0);
             let request = RunCellRequest {
+                plan: plan.clone(),
                 spec: CellSpec {
                     image,
                     provider: Some(engine.provider_name().to_owned()),
                     cpu_count: cpu_count.unwrap_or(defaults.cpu_count),
                     memory_mib: memory_mib.unwrap_or(defaults.memory_mib),
                     ttl_seconds,
-                    accelerator: accelerator.map(|value| value.as_str().to_owned()),
-                    allow_tcg,
+                    accelerator: (plan.provider == ProviderId::Qemu)
+                        .then(|| plan.accelerator.as_str().to_owned()),
+                    allow_tcg: plan.accelerator == Accelerator::Tcg,
                 },
                 command: GuestCommand {
                     program,
@@ -1138,6 +1206,32 @@ fn provider_for_command(
         }
     };
     Ok(provider)
+}
+
+const fn provider_id_from_cli(provider: CliProvider) -> ProviderId {
+    match provider {
+        CliProvider::Hyperv => ProviderId::Hyperv,
+        CliProvider::Qemu => ProviderId::Qemu,
+    }
+}
+
+const fn provider_id_from_config(provider: ConfigProvider) -> ProviderId {
+    match provider {
+        ConfigProvider::Hyperv => ProviderId::Hyperv,
+        ConfigProvider::Qemu => ProviderId::Qemu,
+    }
+}
+
+const fn accelerator_request_from_cli(
+    accelerator: vm_cell_manager::cli::CliAccelerator,
+) -> RequestedAccelerator {
+    match accelerator {
+        vm_cell_manager::cli::CliAccelerator::Auto => RequestedAccelerator::Auto,
+        vm_cell_manager::cli::CliAccelerator::Whpx => RequestedAccelerator::Whpx,
+        vm_cell_manager::cli::CliAccelerator::Kvm => RequestedAccelerator::Kvm,
+        vm_cell_manager::cli::CliAccelerator::Hvf => RequestedAccelerator::Hvf,
+        vm_cell_manager::cli::CliAccelerator::Tcg => RequestedAccelerator::Tcg,
+    }
 }
 
 fn exec_guest<P: LocalVmProvider>(
@@ -2140,7 +2234,8 @@ fn run_cell_guest<P: LocalVmProvider>(
     request: RunCellRequest,
     observer: &mut impl RunObserver,
 ) -> Result<RunCellReport, Box<dyn Error>> {
-    let credentials = read_credentials(engine.provider_name(), credential)?;
+    let credentials = read_credentials(engine.provider_name(), credential)
+        .map_err(|error| run_credential_error(&request.plan, error))?;
     Ok(match engine.provider_name() {
         "hyperv" => engine.run_cell_observed(
             &PowerShellDirectTransport::system(),
@@ -2162,12 +2257,45 @@ fn run_cell_guest<P: LocalVmProvider>(
     })
 }
 
+fn run_credential_error(plan: &RunExecutionPlan, error: Box<dyn Error>) -> RunCellError {
+    let source = match error.downcast::<CliInputError>() {
+        Ok(_) => EngineError::InvalidCellRequest(
+            "guest credentials do not satisfy the selected transport requirements".to_owned(),
+        ),
+        Err(error) => match error.downcast::<GuestIoError>() {
+            Ok(error) => EngineError::Guest(*error),
+            Err(_) => EngineError::Guest(GuestIoError::Transport),
+        },
+    };
+    run_request_validation_error(plan, source)
+}
+
 fn guest_exit_status(exit_code: i32) -> ExitCode {
     if exit_code == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(u8::try_from(exit_code).unwrap_or(1))
     }
+}
+
+fn write_human_run_plan(plan: &RunExecutionPlan, output: &mut impl Write) -> std::io::Result<()> {
+    let source = match plan.selection_source {
+        RunSelectionSource::ExplicitCli => "explicit_cli",
+        RunSelectionSource::ConfigPreference => "config_preference",
+        RunSelectionSource::NativeDefault => "native_default",
+    };
+    writeln!(
+        output,
+        "vmcell: run plan: image={} provider={} accelerator={} transport={} guest={}/{} support={} source={} authority=none",
+        plan.image,
+        plan.provider.as_str(),
+        plan.accelerator.as_str(),
+        plan.guest_transport.as_str(),
+        guest_os_name(plan.guest_os),
+        architecture_name(plan.guest_architecture),
+        plan.support_status.as_str(),
+        source,
+    )
 }
 
 fn write_human_run_result(
@@ -2444,6 +2572,24 @@ fn emit<T: Serialize>(
 mod tests {
     use super::*;
 
+    fn test_run_plan() -> RunExecutionPlan {
+        RunExecutionPlan {
+            schema_version: vm_cell_manager::core::run_selection::RUN_PLAN_SCHEMA_VERSION,
+            contract: vm_cell_manager::core::run_selection::RUN_PLAN_CONTRACT.to_owned(),
+            image: "windows-dev".parse().unwrap(),
+            host_os: vm_cell_manager::core::support::HostOs::Windows,
+            host_architecture: Architecture::X86_64,
+            guest_os: GuestOs::Windows,
+            guest_architecture: Architecture::X86_64,
+            provider: ProviderId::Hyperv,
+            accelerator: Accelerator::HyperV,
+            guest_transport: vm_cell_manager::core::support::GuestTransportId::PowerShellDirect,
+            support_status: vm_cell_manager::core::support::SupportStatus::Untested,
+            selection_source: RunSelectionSource::NativeDefault,
+            authorizing: false,
+        }
+    }
+
     #[test]
     fn explicit_provider_overrides_configured_provider() {
         let directory = tempfile::tempdir().unwrap();
@@ -2573,6 +2719,7 @@ mod tests {
     fn human_run_result_forwards_bounded_guest_streams_and_separates_status() {
         let report = RunCellReport {
             schema_version: 1,
+            plan: Some(test_run_plan()),
             cell_id: vm_cell_manager::core::cell::CellId::new(),
             operation_id: vm_cell_manager::core::guest::GuestOperationId::new(),
             outcome: vm_cell_manager::engine::RunOutcome::GuestNonZero,
@@ -2597,6 +2744,55 @@ mod tests {
         assert!(stderr.starts_with("guest stderr\nvmcell:"));
         assert!(stderr.contains("exit=23"));
         assert!(stderr.contains("cleanup=destroyed"));
+    }
+
+    #[test]
+    fn run_plan_human_and_json_contracts_are_safe_and_versioned() {
+        let plan = test_run_plan();
+        let mut human = Vec::new();
+        write_human_run_plan(&plan, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert_eq!(
+            human,
+            "vmcell: run plan: image=windows-dev provider=hyperv accelerator=hyper-v transport=powershell-direct guest=windows/x86_64 support=untested source=native_default authority=none\n"
+        );
+        assert!(!human.contains("credential"));
+        assert!(!human.contains("cmd.exe"));
+        assert!(!human.contains("C:\\"));
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["contract"], "vmcell.run-plan.v1");
+        assert_eq!(json["provider"], "hyperv");
+        assert_eq!(json["accelerator"], "hyper-v");
+        assert_eq!(json["guest_transport"], "powershell-direct");
+        assert_eq!(json["selection_source"], "native_default");
+        assert_eq!(json["authorizing"], false);
+        assert!(json.get("path").is_none());
+        assert!(json.get("command").is_none());
+    }
+
+    #[test]
+    fn run_credential_failure_json_retains_the_resolved_plan() {
+        let plan = test_run_plan();
+        let error = run_credential_error(
+            &plan,
+            Box::new(CliInputError("missing credential flag".to_owned())),
+        );
+        let classification = classify_cli_error(&error);
+        let envelope = RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            error.report(),
+        );
+        let json = serde_json::to_value(envelope).unwrap();
+
+        assert_eq!(json["error"]["code"], "vmcell.invalid_input");
+        assert_eq!(json["run"]["stage"], "request_validation");
+        assert_eq!(json["run"]["cleanup"], "nothing_created");
+        assert_eq!(json["run"]["plan"]["contract"], "vmcell.run-plan.v1");
+        assert_eq!(json["run"]["plan"]["image"], "windows-dev");
+        assert_eq!(json["run"]["plan"]["authorizing"], false);
     }
 
     #[test]

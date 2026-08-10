@@ -36,8 +36,11 @@ it never falls back to an ambient working-directory config file.
 For each allowed setting, the command line wins over the selected config, and
 the config wins over the built-in default. Persisted provider identity still
 wins for commands acting on an existing image or cell. The configured provider
-is consulted only when a new image validation/registration, `create`, or `run`
-request omits `--provider`.
+is consulted when a new image validation/registration or `create` request
+omits `--provider`. For `run`, an explicitly present configured provider is a
+preference between CLI overrides and deterministic compatible native/default
+selection; an absent provider setting does not invent a Hyper-V preference.
+An unavailable preferred path fails instead of silently falling through.
 
 `state_root` may be absolute or relative to the directory containing the
 config file. Dot segments are rejected. The normal state-store ordinary-path,
