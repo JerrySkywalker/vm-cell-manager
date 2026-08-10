@@ -186,6 +186,10 @@ On Windows, path identity treats ordinary drive and UNC paths as equivalent to t
 On Unix, vmcell state directories are current-user-owned `0700` directories
 and state/configuration files are `0600`. Authority-bearing file and directory
 opens use no-follow/close-on-exec flags and revalidate device/inode identity.
+Linux immutable-base use additionally watches the containing directory across
+provider consumption and rejects rename, replacement, restore, modification,
+watch overflow, or watched-parent drift, so a same-path ABA cannot satisfy only
+the before/after inode checks.
 Linux exposes KVM only when both QEMU advertises it and the current identity can
 open an ordinary `/dev/kvm` character device read/write with no-follow and a
 stable pre-open, opened-file, and current-path device/inode/device-number

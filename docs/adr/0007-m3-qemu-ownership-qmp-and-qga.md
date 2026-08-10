@@ -37,11 +37,14 @@ bounded. Unknown protocol or process identity fails closed.
 
 Registered QEMU images are ordinary immutable QCOW2 files with no backing
 image. Unix opens reject symbolic links and bind the opened device/inode to the
-current registered pathname before and after provider use. Creation produces a
-private uniquely named QCOW2 overlay, validates its full backing path, and
-publishes it to the exact CellId destination with a no-clobber hard link. Rust
-pins and re-verifies the base while `qemu-img` or QEMU consumes it. The parent
-is never converted, flattened, or mutated.
+current registered pathname before and after provider use. Linux also retains
+a containing-directory mutation watch across `qemu-img` consumption and
+rejects relevant name/content events, watch overflow, or parent drift, including
+a rename-replace-restore ABA. Creation produces a private uniquely named QCOW2
+overlay, validates its full backing path, and publishes it to the exact CellId
+destination with a no-clobber hard link. Rust pins and re-verifies the base
+while `qemu-img` or QEMU consumes it. The parent is never converted, flattened,
+or mutated.
 
 Acceleration is explicit. The native mapping is KVM on Linux, HVF on macOS,
 and WHPX on Windows. TCG is accepted only when both the persisted cell policy

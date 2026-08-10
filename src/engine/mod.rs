@@ -3290,6 +3290,8 @@ fn canonical_image_path(path: &Path) -> Result<PathBuf, EngineError> {
 struct ImmutableParentGuard {
     file: File,
     _ancestor_handles: Vec<File>,
+    #[cfg(target_os = "linux")]
+    path_mutation_guard: LinuxPathMutationGuard,
 }
 
 impl ImmutableParentGuard {
@@ -3298,6 +3300,8 @@ impl ImmutableParentGuard {
         {
             use std::os::unix::fs::MetadataExt;
 
+            #[cfg(target_os = "linux")]
+            self.path_mutation_guard.ensure_unchanged()?;
             let opened = self
                 .file
                 .metadata()
@@ -3313,6 +3317,8 @@ impl ImmutableParentGuard {
                     "immutable base open/current identity changed".to_owned(),
                 ));
             }
+            #[cfg(target_os = "linux")]
+            self.path_mutation_guard.ensure_unchanged()?;
         }
         #[cfg(not(unix))]
         if path
@@ -3329,6 +3335,8 @@ impl ImmutableParentGuard {
 }
 
 fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineError> {
+    #[cfg(target_os = "linux")]
+    let path_mutation_guard = LinuxPathMutationGuard::new(path)?;
     #[cfg(windows)]
     let ancestor_handles = pin_ordinary_copy_source_ancestors(path).map_err(|_| {
         EngineError::InvalidImage(
@@ -3369,9 +3377,151 @@ fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineErro
     let guard = ImmutableParentGuard {
         file,
         _ancestor_handles: ancestor_handles,
+        #[cfg(target_os = "linux")]
+        path_mutation_guard,
     };
     guard.validate_path_identity(path)?;
     Ok(guard)
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPathMutationGuard {
+    events: File,
+    target_name: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPathMutationGuard {
+    fn new(path: &Path) -> Result<Self, EngineError> {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = path.parent().ok_or_else(|| {
+            EngineError::ImageIntegrity("immutable base has no parent directory".to_owned())
+        })?;
+        let target_name = path
+            .file_name()
+            .ok_or_else(|| {
+                EngineError::ImageIntegrity("immutable base has no filename".to_owned())
+            })?
+            .as_bytes()
+            .to_vec();
+        let parent = CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+            EngineError::ImageIntegrity("immutable base parent path is invalid".to_owned())
+        })?;
+        let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if descriptor < 0 {
+            return Err(EngineError::ImageIntegrity(
+                "immutable base mutation watch could not be created".to_owned(),
+            ));
+        }
+        let events = unsafe { File::from_raw_fd(descriptor) };
+        let mask = libc::IN_ATTRIB
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_DELETE_SELF
+            | libc::IN_MODIFY
+            | libc::IN_MOVE_SELF
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO;
+        if unsafe { libc::inotify_add_watch(descriptor, parent.as_ptr(), mask) } < 0 {
+            return Err(EngineError::ImageIntegrity(
+                "immutable base parent mutation watch could not be installed".to_owned(),
+            ));
+        }
+        Ok(Self {
+            events,
+            target_name,
+        })
+    }
+
+    fn ensure_unchanged(&self) -> Result<(), EngineError> {
+        use std::os::fd::AsRawFd;
+
+        const SELF_OR_OVERFLOW: u32 = libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF
+            | libc::IN_UNMOUNT
+            | libc::IN_Q_OVERFLOW
+            | libc::IN_IGNORED;
+        const TARGET_MUTATION: u32 = libc::IN_ATTRIB
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_MODIFY
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO;
+        let mut bytes = [0_u8; 4096];
+        loop {
+            let count = unsafe {
+                libc::read(
+                    self.events.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if count < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(EngineError::ImageIntegrity(
+                    "immutable base mutation watch could not be read".to_owned(),
+                ));
+            }
+            if count == 0 {
+                return Err(EngineError::ImageIntegrity(
+                    "immutable base mutation watch closed unexpectedly".to_owned(),
+                ));
+            }
+            let count = usize::try_from(count).map_err(|_| {
+                EngineError::ImageIntegrity("immutable base mutation watch was invalid".to_owned())
+            })?;
+            let mut offset = 0_usize;
+            while offset < count {
+                let header_size = std::mem::size_of::<libc::inotify_event>();
+                if count - offset < header_size {
+                    return Err(EngineError::ImageIntegrity(
+                        "immutable base mutation watch frame was truncated".to_owned(),
+                    ));
+                }
+                let event = unsafe {
+                    std::ptr::read_unaligned(
+                        bytes.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                    )
+                };
+                let name_length = usize::try_from(event.len).map_err(|_| {
+                    EngineError::ImageIntegrity(
+                        "immutable base mutation watch name was invalid".to_owned(),
+                    )
+                })?;
+                let event_size = header_size.checked_add(name_length).ok_or_else(|| {
+                    EngineError::ImageIntegrity(
+                        "immutable base mutation watch frame was invalid".to_owned(),
+                    )
+                })?;
+                if event_size > count - offset {
+                    return Err(EngineError::ImageIntegrity(
+                        "immutable base mutation watch frame was truncated".to_owned(),
+                    ));
+                }
+                let name = &bytes[offset + header_size..offset + event_size];
+                let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+                if event.mask & SELF_OR_OVERFLOW != 0
+                    || (event.mask & TARGET_MUTATION != 0 && name == self.target_name)
+                {
+                    return Err(EngineError::ImageIntegrity(
+                        "immutable base pathname changed while in use".to_owned(),
+                    ));
+                }
+                offset += event_size;
+            }
+        }
+    }
 }
 
 fn sha256_file(file: &mut File) -> Result<String, EngineError> {
@@ -5469,6 +5619,27 @@ mod tests {
         assert!(matches!(
             validate_copy_source_identity(&source, &file),
             Err(EngineError::Guest(GuestIoError::PartialCopy))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_immutable_parent_guard_rejects_rename_replace_restore_aba() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("base.qcow2");
+        let retired_parent = directory.path().join("base-retired.qcow2");
+        fs::write(&parent, b"registered-parent").unwrap();
+        let guard = open_immutable_parent(&parent).unwrap();
+
+        fs::rename(&parent, &retired_parent).unwrap();
+        fs::write(&parent, b"replacement-parent").unwrap();
+        fs::remove_file(&parent).unwrap();
+        fs::rename(&retired_parent, &parent).unwrap();
+
+        assert!(matches!(
+            guard.validate_path_identity(&parent),
+            Err(EngineError::ImageIntegrity(message))
+                if message.contains("pathname changed while in use")
         ));
     }
 
