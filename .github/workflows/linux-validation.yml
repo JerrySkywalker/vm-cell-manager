@@ -23,7 +23,6 @@ jobs:
 
     env:
       RUSTUP_TOOLCHAIN: 1.85.0
-      CARGO_TARGET_DIR: ${{ runner.temp }}/vmcell-cargo-target
       EXPECTED_RUSTC: rustc 1.85.0 (4d91de4e4 2025-02-17)
       EXPECTED_CARGO_PREFIX: cargo 1.85.0
 
@@ -46,6 +45,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Bind bounded Cargo target outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_target="$RUNNER_TEMP/vmcell-cargo-target"
+          mkdir -p "$cargo_target"
+          test "$(realpath "$cargo_target")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
+          printf 'CARGO_TARGET_DIR=%s\n' "$cargo_target" >> "$GITHUB_ENV"
+
       - name: Prove native hosted baseline and exact source
         shell: bash
         env:
@@ -63,7 +71,6 @@ jobs:
           test "$ID" = 'ubuntu'
           test "$VERSION_ID" = '24.04'
           test "$CARGO_TARGET_DIR" = "$RUNNER_TEMP/vmcell-cargo-target"
-          mkdir -p "$CARGO_TARGET_DIR"
           test "$(realpath "$CARGO_TARGET_DIR")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           printf 'source_sha=%s\nrunner_environment=%s\nos=%s\narchitecture=%s\nbaseline=%s-%s\n' \
