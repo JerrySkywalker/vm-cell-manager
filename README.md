@@ -144,6 +144,7 @@ The current `dev` candidate exposes:
 vmcell doctor
 vmcell status
 vmcell state check
+vmcell completion powershell
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows --provider hyperv
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
@@ -242,11 +243,13 @@ build, mount, or modify guest images.
 ## Windows portable distribution
 
 The repository can build a deterministic portable Windows archive containing
-`vmcell.exe`, license/notice, bounded install/remove guidance, and versioned
-build provenance. A sibling `SHA256SUMS.txt` binds the archive. The manual
-trusted-runner workflow does not publish a release or create a tag; see
-[Windows Portable Package](docs/windows-portable-package.md) for layout,
-verification, and release-boundary details.
+`vmcell.exe`, generated PowerShell completion, license/notice, bounded
+install/upgrade/remove guidance, candidate-only Scoop/WinGet metadata, and
+versioned build provenance. A sibling `SHA256SUMS.txt` binds the archive. The
+manual trusted-runner workflow does not publish a package, release, or tag; see
+[Windows Portable Package](docs/windows-portable-package.md) for layout and
+verification, and [Windows install, upgrade, and remove](docs/windows-install-upgrade-remove.md)
+for the operator workflow.
 
 ## Safety and ownership
 

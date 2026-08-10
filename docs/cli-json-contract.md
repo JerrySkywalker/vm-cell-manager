@@ -17,6 +17,7 @@ echoed. Help and version output remain human-readable discovery surfaces.
 vmcell doctor
 vmcell status
 vmcell state check
+vmcell completion powershell
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows [--provider hyperv]
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
@@ -62,6 +63,12 @@ create a missing root or rewrite compatible v0.1 JSON. Unsupported durable
 schemas use `vmcell.state.upgrade_required`, integrity exit 9, and require the
 operator to stop mutation and follow
 [`state-compatibility.md`](state-compatibility.md).
+
+`completion powershell` is human-only shell integration. It is generated from
+the exact binary's Clap command graph before configuration, state, or provider
+access. Repeated runs of the same binary are byte-identical. `--json` is
+rejected as invalid input because the output is executable PowerShell text,
+not a JSON response contract.
 
 Config selection and precedence are defined in
 [`user-configuration.md`](user-configuration.md). Malformed/unsafe config uses

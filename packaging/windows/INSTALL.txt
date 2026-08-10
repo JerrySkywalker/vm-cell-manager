@@ -4,11 +4,15 @@ VM Cell Manager portable Windows package
 Install
 -------
 
-1. Extract this archive into a user-owned directory, for example:
-   %LOCALAPPDATA%\Programs\vmcell
-2. Run `vmcell.exe --version` from that directory.
-3. Either invoke the full path or add the directory to your user PATH.
+1. Extract this archive into a user-owned parent directory, for example:
+   %LOCALAPPDATA%\Programs\vmcell. The archive retains its versioned top-level
+   `vmcell-vX.Y.Z-windows-x86_64` directory.
+2. Enter that versioned directory and run `vmcell.exe --version`.
+3. Either invoke the full path or add that versioned directory to your user
+   PATH.
 4. Run `vmcell.exe doctor` before attempting provider operations.
+5. Optionally load PowerShell completion for the current session:
+   `. .\completions\vmcell.ps1`
 
 The package does not enable Hyper-V, install drivers or services, change
 virtual switches, or modify system policy. Real Hyper-V and PowerShell Direct
@@ -21,12 +25,34 @@ Run `vmcell.exe --help` for the installed command surface. VM Cell Manager
 stores per-user state outside this portable program directory unless
 `--state-root` selects another path.
 
+Upgrade
+-------
+
+1. Stop other vmcell commands that use the same state root. Do not stop or
+   remove provider objects by name.
+2. Keep the old portable directory and a recoverable copy of the state root.
+   Base image bytes remain outside the program directory and must stay
+   immutable.
+3. Extract the new archive into a new user-owned directory and verify
+   `vmcell.exe --version` plus the archive checksum.
+4. Run `vmcell.exe --state-root PATH state check` with the new binary before
+   the first mutating command. A compatible v0.1/v0.2 format-1 root is read in
+   place and is not rewritten.
+5. If state check reports upgrade-required or integrity failure, do not mutate
+   the root. Keep it unchanged and return to the binary that owns its schema.
+6. Run `vmcell.exe doctor`, then switch your user PATH to the new directory.
+   Reload the completion script if used.
+
+Replacing the program directory never migrates, adopts, deletes, or repairs
+durable state. There is no automatic downgrade path.
+
 Remove
 ------
 
 1. Inspect and safely destroy or retain any cells you still need.
 2. Remove the directory containing this portable package.
 3. Remove that directory from your user PATH if you added it.
+4. Remove any completion dot-source line you added to your PowerShell profile.
 
 Removing the program directory does not delete vmcell state, images, cells, or
 artifacts. Delete retained state only through separately reviewed, explicit

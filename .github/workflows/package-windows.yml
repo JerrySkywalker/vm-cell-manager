@@ -119,6 +119,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: vmcell-v${{ env.VMCELL_PACKAGE_VERSION }}-windows-x86_64
-          path: ${{ env.VMCELL_PACKAGE_OUTPUT }}
+          path: |
+            ${{ env.VMCELL_PACKAGE_OUTPUT }}\vmcell-v${{ env.VMCELL_PACKAGE_VERSION }}-windows-x86_64.zip
+            ${{ env.VMCELL_PACKAGE_OUTPUT }}\SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14

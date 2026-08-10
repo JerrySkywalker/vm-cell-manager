@@ -6,6 +6,10 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Bumped the repository-local candidate identity to `0.2.0` and extended the
+  deterministic Windows archive with generated PowerShell completion,
+  candidate-only Scoop/WinGet metadata, and bounded install, state-preflight,
+  rollback, and removal guidance. No package, release, or tag is published.
 - Added a provider-free, read-only `vmcell state check` format-v1 compatibility
   report for v0.1 state, stable upgrade-required rejection, and explicit
   no-rewrite/no-silent-migration guidance.

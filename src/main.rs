@@ -7,14 +7,16 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use clap::{Parser, error::ErrorKind};
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use clap_complete::{generate, shells::PowerShell};
 use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliExitCode, CliHumanOutput, CliInputError, CliProvider, Command,
-    CredentialArgs, DoctorReport, ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope,
-    ProviderCommand, RunErrorEnvelope, StateCommand, StatusCellEntry, StatusCellObservation,
-    StatusCleanupGuidance, StatusImageEntry, StatusImageObservation, StatusImageVariantObservation,
-    StatusOperationEntry, StatusReport, StatusRetention, classify_cli_error, public_error_message,
+    CompletionCommand, CredentialArgs, DoctorReport, ErrorEnvelope, GuestOperationCommand,
+    ImageCommand, ListEnvelope, ProviderCommand, RunErrorEnvelope, StateCommand, StatusCellEntry,
+    StatusCellObservation, StatusCleanupGuidance, StatusImageEntry, StatusImageObservation,
+    StatusImageVariantObservation, StatusOperationEntry, StatusReport, StatusRetention,
+    classify_cli_error, public_error_message,
 };
 use vm_cell_manager::config::{ConfigProvider, HumanOutputPreference, ResolvedConfig, load_config};
 use vm_cell_manager::core::automation::RequiredAction;
@@ -147,6 +149,16 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     if matches!(&cli.command, Command::Shell { .. }) {
         require_human_shell(cli.json)?;
     }
+    if let Command::Completion { command } = &cli.command {
+        if cli.json {
+            return Err(CliInputError(
+                "completion output is a shell script and does not support --json".to_owned(),
+            )
+            .into());
+        }
+        write_completion(*command, &mut std::io::stdout().lock());
+        return Ok(ExitCode::SUCCESS);
+    }
     let defaults = load_config(cli.config.as_deref())?;
     let state_root = cli
         .state_root
@@ -188,6 +200,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     .expect("stdout should remain writable");
             })?;
         }
+        Command::Completion { .. } => unreachable!("handled before configuration loading"),
         Command::Provider {
             command: ProviderCommand::List,
         } => {
@@ -297,6 +310,15 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn write_completion(command: CompletionCommand, output: &mut dyn Write) {
+    let mut command_line = Cli::command();
+    match command {
+        CompletionCommand::Powershell => {
+            generate(PowerShell, &mut command_line, "vmcell", output);
+        }
+    }
 }
 
 fn run_m2<P: LocalVmProvider>(
@@ -806,7 +828,11 @@ fn run_m2<P: LocalVmProvider>(
                 }
             })?;
         }
-        Command::Doctor | Command::Status | Command::State { .. } | Command::Provider { .. } => {
+        Command::Doctor
+        | Command::Status
+        | Command::State { .. }
+        | Command::Completion { .. }
+        | Command::Provider { .. } => {
             unreachable!("handled before engine creation")
         }
     }
@@ -1096,6 +1122,7 @@ fn provider_for_command(
         }
         | Command::Operation { .. }
         | Command::State { .. }
+        | Command::Completion { .. }
         | Command::Doctor
         | Command::Status
         | Command::Provider { .. } => CliProvider::Hyperv.as_str().to_owned(),

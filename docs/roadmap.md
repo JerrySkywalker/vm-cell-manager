@@ -413,6 +413,13 @@ migration or downgrade exists.
 
 Improve deterministic archive layout, completion where practical, stable version/help output, upgrade documentation, and optional Scoop/WinGet integration if maintainable.
 
+**Repository-local implementation:** the `0.2.0` candidate produces a
+byte-reproducible portable ZIP with exact-version help, generated PowerShell
+completion, schema-v1 candidate metadata shaped for later Scoop/WinGet work,
+and explicit install/upgrade/state-check/rollback/remove guidance. Packaging
+remains a trusted, manual, non-publishing workflow; no tag, release, or package
+manager submission is created by this milestone.
+
 ## Release gates
 
 The `v0.1` Windows release path remains accepted, plus real acceptance focused on repeated operation, interruption/recovery, retained cells, state upgrade compatibility, interactive/session behavior, and image lifecycle operations.

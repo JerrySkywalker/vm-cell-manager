@@ -1,6 +1,8 @@
 # Windows Human MVP Quick Start
 
-> **Release gate:** this is the canonical `v0.1.0` workflow, but real Hyper-V
+> **Release gate:** the paths below use the frozen `v0.1.0` candidate as a
+> concrete example. The same verified portable-archive workflow applies to a
+> later accepted version, but real Hyper-V
 > and PowerShell Direct acceptance is still pending. Do not run its mutating
 > steps merely because a repository build or `vmcell doctor` succeeds. Use it
 > only with an officially accepted release on the dedicated Windows host class
@@ -40,6 +42,16 @@ $vmcell = Join-Path $installParent 'vmcell-v0.1.0-windows-x86_64\vmcell.exe'
 The archive's `INSTALL.txt` describes PATH setup and removal. Removing the
 program directory never implicitly removes vmcell state, images, cells, or
 artifacts.
+
+An accepted v0.2-or-later archive also contains generated PowerShell completion.
+Load it for the current session without changing the profile:
+
+```powershell
+. (Join-Path (Split-Path -Parent $vmcell) 'completions\vmcell.ps1')
+```
+
+The complete candidate install, upgrade, rollback, and remove procedure is in
+[`windows-install-upgrade-remove.md`](windows-install-upgrade-remove.md).
 
 ## 2. Inspect host capability
 

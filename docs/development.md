@@ -60,10 +60,13 @@ Never describe mock, WSL2, or core CI evidence as real-provider acceptance.
 The Windows portable-package contract is implemented by
 `tools/package-windows.ps1` and tested by `tools/test-windows-package.ps1`.
 Normal CI proves byte-identical repeat builds, fixed archive layout, checksums,
-and provenance without publishing. The separate `Package Windows` workflow is
+generated PowerShell completion, schema-v1 candidate package metadata, and
+provenance without publishing. The separate `Package Windows` workflow is
 manual `workflow_dispatch` only on the trusted runner and uploads a bounded
 short-retention artifact; it does not tag, promote, or create a release. See
-`docs/windows-portable-package.md` for the exact contract.
+`docs/windows-portable-package.md` for the exact contract. Metadata remains
+`candidate_only`; it is input for a future reviewed Scoop/WinGet submission,
+not a package-manager publication action.
 
 Public-facing Windows usage follows `docs/quickstart-windows.md`. Keep its
 command spelling synchronized with CLI help and the portable archive layout.
