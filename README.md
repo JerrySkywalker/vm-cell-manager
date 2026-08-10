@@ -159,6 +159,7 @@ vmcell stop CELL_ID
 vmcell destroy CELL_ID
 vmcell reconcile [CELL_ID]
 vmcell exec CELL_ID --username USER --password-stdin -- PROGRAM [ARG...]
+vmcell shell CELL_ID --username USER --password-stdin
 vmcell copy-in CELL_ID --source HOST_FILE --destination GUEST_PATH --username USER --password-stdin
 vmcell copy-out CELL_ID --source GUEST_PATH --username USER --password-stdin
 vmcell artifact collect CELL_ID --path GUEST_PATH --username USER --password-stdin
@@ -179,6 +180,18 @@ state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses
 PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM, WHPX, and
 HVF acceptance remain separate host gates.
+
+`vmcell shell` is a deliberately line-oriented PowerShell Direct console for an
+already running, ready, exact-owned Hyper-V Windows cell. It is not a local or
+guest PTY: every nonempty line starts one independent bounded
+`powershell.exe -Command` operation with a fresh ownership proof. Guest stdin,
+`Read-Host`, full-screen controls, and persistent cwd/environment/process state
+are unavailable. The password is supplied on bounded stdin exactly as for
+`exec`; shell lines come from the attached Windows console. `.exit`, EOF, or a
+cooperative Ctrl-C leaves the cell running. Timeout, transport/session failure,
+ownership drift, or a prior nonterminal operation stops the loop without
+replay or automatic cleanup and reports the durable operation ID when one was
+recorded.
 
 `vmcell status` is a read-only, provider-tolerant daily-use summary. It keeps
 durable cell/image/operation evidence visible when a provider is unavailable,

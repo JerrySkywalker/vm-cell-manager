@@ -185,6 +185,27 @@ pub enum Command {
         command: Vec<String>,
     },
 
+    /// Run a line-oriented PowerShell Direct console on an exact-owned Windows cell.
+    ///
+    /// Each line is an independent bounded operation. This is not a PTY and does not preserve
+    /// guest stdin, cwd, environment, or a remote process between lines. The password is read
+    /// from bounded stdin; command lines are read separately from the attached Windows console.
+    Shell {
+        cell_id: CellId,
+
+        #[command(flatten)]
+        credential: CredentialArgs,
+
+        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
+        readiness_timeout_seconds: u64,
+
+        #[arg(long = "action-timeout-seconds", default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
+        action_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
+        max_output_bytes: u64,
+    },
+
     /// Atomically copy one ordinary host file into the guest workspace.
     CopyIn {
         cell_id: CellId,
@@ -1758,6 +1779,52 @@ mod tests {
         assert!(help.contains("--password-stdin"));
         assert!(help.contains("real execution remains release-gated"));
         assert!(!help.contains("--password secret"));
+    }
+
+    #[test]
+    fn shell_parser_and_help_are_explicit_about_the_non_pty_password_protocol() {
+        let cli = Cli::try_parse_from([
+            "vmcell",
+            "shell",
+            "00000000-0000-0000-0000-000000000001",
+            "--username",
+            "Administrator",
+            "--password-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Shell {
+                credential: CredentialArgs {
+                    password_stdin: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "vmcell",
+                "shell",
+                "00000000-0000-0000-0000-000000000001",
+                "--username",
+                "Administrator",
+                "--password",
+                "credential-sentinel",
+            ])
+            .is_err()
+        );
+
+        let mut command = Cli::command();
+        let shell = command
+            .find_subcommand_mut("shell")
+            .expect("shell subcommand should exist");
+        let help = shell.render_long_help().to_string();
+        assert!(help.contains("not a PTY"));
+        assert!(help.contains("does not preserve guest stdin"));
+        assert!(help.contains("password is read from bounded stdin"));
+        assert!(help.contains("attached Windows console"));
+        assert!(!help.contains("credential-sentinel"));
     }
 
     #[test]

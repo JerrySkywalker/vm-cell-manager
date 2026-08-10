@@ -332,6 +332,12 @@ or equivalent. It should let a human enter an already running exact-owned Window
 
 If the transport cannot provide true terminal semantics, the UX must expose that limitation rather than pretending to be a local PTY.
 
+Repository-local Slice B implements this as a line-oriented PowerShell Direct
+console over the existing guest-operation authority. Every line is separately
+bounded and freshly authorized; there is no PTY or persistent remote process,
+and unknown operations stop without replay or automatic cleanup. Real
+PowerShell Direct acceptance remains release-gated.
+
 ### Human-oriented status and diagnosis
 
 Users should be able to answer:

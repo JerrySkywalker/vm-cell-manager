@@ -174,6 +174,10 @@ struct ProcessJob(*mut core::ffi::c_void);
 #[cfg(target_os = "windows")]
 impl ProcessJob {
     fn assign(child: &mut std::process::Child) -> Result<Self, GuestIoError> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             let _ = child.kill();
@@ -181,6 +185,21 @@ impl ProcessJob {
             return Err(GuestIoError::Transport);
         }
         let job = Self(handle);
+        let mut limits = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GuestIoError::Transport);
+        }
         if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } == 0 {
             let _ = child.kill();
             let _ = child.wait();

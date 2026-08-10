@@ -32,6 +32,7 @@ vmcell stop CELL_ID
 vmcell destroy CELL_ID
 vmcell reconcile [CELL_ID]
 vmcell exec CELL_ID --username USER --password-stdin -- PROGRAM [ARG...]
+vmcell shell CELL_ID --username USER --password-stdin
 vmcell copy-in CELL_ID --source HOST_FILE --destination GUEST_PATH --username USER --password-stdin
 vmcell copy-out CELL_ID --source GUEST_PATH --username USER --password-stdin
 vmcell artifact collect CELL_ID --path GUEST_PATH [--path GUEST_PATH...] --username USER --password-stdin
@@ -64,6 +65,17 @@ Its password is read as one bounded line from stdin; there is deliberately no
 password argument or environment-variable option. Guest paths are relative to
 vmcell's fixed workspace and reject traversal, absolute paths, alternate data
 streams, device names, and ambiguous trailing dot/space forms.
+
+`vmcell shell` is human-only and rejects `--json`. It reads the bounded password
+from stdin first and then reads commands from the attached Windows console, so
+secret and command streams are not multiplexed. Each nonempty line is one
+independent bounded `powershell.exe -Command` operation with a fresh provider
+and installation authority proof. It is not a PTY and offers no guest stdin,
+`Read-Host`, full-screen controls, or persistent cwd/environment/process state.
+`.exit`, EOF, or cooperative Ctrl-C leaves the cell running. Any timeout,
+transport/session failure, ownership drift, or existing nonterminal guest
+operation stops the console without replay or automatic cleanup; the durable
+operation ID is printed when transport intent was recorded.
 
 For QEMU, the image and create provider must be explicit and compatible. TCG
 requires both `--accelerator tcg` and `--allow-tcg`; `auto` never silently

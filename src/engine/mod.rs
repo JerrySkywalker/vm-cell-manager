@@ -1524,6 +1524,20 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.exec_guest_with_ready_callback(transport, credentials, request, || Ok(()), |_| {})
     }
 
+    pub fn exec_guest_observed<G, R>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: GuestExecRequest,
+        on_recorded: R,
+    ) -> Result<GuestExecReport, EngineError>
+    where
+        G: GuestTransport,
+        R: FnOnce(GuestOperationId),
+    {
+        self.exec_guest_with_ready_callback(transport, credentials, request, || Ok(()), on_recorded)
+    }
+
     fn exec_guest_with_ready_callback<G, F, R>(
         &self,
         transport: &G,
@@ -2492,6 +2506,17 @@ impl<P: LocalVmProvider> CellEngine<P> {
         if record.phase != CellPhase::Ready {
             return Err(EngineError::LifecycleConflict(
                 "guest operations require a ready cell".to_owned(),
+            ));
+        }
+        if self
+            .state
+            .list_guest_operations()?
+            .iter()
+            .any(|operation| operation.cell_id == cell_id && !operation.phase.is_terminal())
+        {
+            return Err(EngineError::LifecycleConflict(
+                "guest operations require all earlier operations to be terminal; reconcile the cell operation history first"
+                    .to_owned(),
             ));
         }
         let guest_os = record.image.guest_os.ok_or_else(|| {
@@ -5486,6 +5511,81 @@ mod tests {
     }
 
     #[test]
+    fn line_oriented_shell_exec_uses_one_fresh_operation_per_line_and_never_cleans_up() {
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        let mut operation_ids = Vec::new();
+        for exit_code in [0, 23] {
+            {
+                let mut state = guest.state.lock().unwrap();
+                state.readiness = VecDeque::from([GuestReadiness::Ready]);
+                state.exec_result = GuestCommandResult {
+                    exit_code,
+                    stdout: format!("line-{exit_code}\n"),
+                    stderr: String::new(),
+                    encoding: "utf-8".to_owned(),
+                    stdout_bytes: format!("line-{exit_code}\n").len() as u64,
+                    stderr_bytes: 0,
+                    truncated: false,
+                };
+            }
+            let recorded = std::cell::Cell::new(None);
+            let report = engine
+                .exec_guest_observed(
+                    &guest,
+                    &credentials,
+                    GuestExecRequest {
+                        cell_id: cell.id,
+                        command: GuestCommand {
+                            program: "powershell.exe".to_owned(),
+                            args: vec!["-Command".to_owned(), format!("line-{exit_code}")],
+                            timeout: StdDuration::from_secs(1),
+                            max_output_bytes: 1024,
+                        },
+                        readiness: ReadinessPolicy {
+                            timeout: StdDuration::from_millis(10),
+                            poll_interval: StdDuration::from_millis(10),
+                        },
+                    },
+                    |id| recorded.set(Some(id)),
+                )
+                .unwrap();
+            assert_eq!(recorded.get(), Some(report.operation_id));
+            assert_eq!(report.result.exit_code, exit_code);
+            operation_ids.push(report.operation_id);
+        }
+
+        assert_ne!(operation_ids[0], operation_ids[1]);
+        for operation_id in operation_ids {
+            assert_eq!(
+                engine.inspect_guest_operation(operation_id).unwrap().phase,
+                GuestOperationPhase::Completed
+            );
+        }
+        assert_eq!(
+            engine.state.load_cell(cell.id).unwrap().state,
+            CellState::Running
+        );
+        let provider_state = engine.provider.state.lock().unwrap();
+        let provider_calls = &provider_state.calls;
+        assert!(!provider_calls.contains(&"stop_vm"));
+        assert!(!provider_calls.contains(&"remove_vm"));
+        drop(provider_state);
+        let guest_state = guest.state.lock().unwrap();
+        let guest_calls = &guest_state.calls;
+        assert_eq!(
+            guest_calls
+                .iter()
+                .filter(|call| **call == "probe_ready")
+                .count(),
+            2
+        );
+        assert_eq!(
+            guest_calls.iter().filter(|call| **call == "exec").count(),
+            2
+        );
+    }
+
+    #[test]
     fn guest_operation_reconcile_never_replays_and_validates_committed_artifacts() {
         let (_directory, engine, cell, _guest, _credentials) = running_fixture();
 
@@ -5572,11 +5672,8 @@ mod tests {
 
     #[test]
     fn credential_failure_is_terminal_but_timeout_and_large_output_are_nonreplayable() {
-        let (_directory, engine, cell, guest, credentials) = running_fixture();
-        guest.state.lock().unwrap().readiness =
-            VecDeque::from([GuestReadiness::AuthenticationFailed]);
-        let request = || GuestExecRequest {
-            cell_id: cell.id,
+        let request = |cell_id| GuestExecRequest {
+            cell_id,
             command: GuestCommand {
                 program: "cmd.exe".to_owned(),
                 args: vec!["/c".to_owned(), "exit 0".to_owned()],
@@ -5585,19 +5682,25 @@ mod tests {
             },
             readiness: readiness_for_test(),
         };
+
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
+        guest.state.lock().unwrap().readiness =
+            VecDeque::from([GuestReadiness::AuthenticationFailed]);
         assert!(matches!(
-            engine.exec_guest(&guest, &credentials, request()),
+            engine.exec_guest(&guest, &credentials, request(cell.id)),
             Err(EngineError::Guest(GuestIoError::AuthenticationFailed))
         ));
         let mut operations = engine.list_guest_operations(Some(cell.id)).unwrap();
         assert_eq!(operations.pop().unwrap().phase, GuestOperationPhase::Failed);
+
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
         {
             let mut state = guest.state.lock().unwrap();
             state.readiness = VecDeque::from([GuestReadiness::Ready]);
             state.failure = Some(InjectedGuestFailure::Timeout);
         }
         assert!(matches!(
-            engine.exec_guest(&guest, &credentials, request()),
+            engine.exec_guest(&guest, &credentials, request(cell.id)),
             Err(EngineError::Guest(GuestIoError::Timeout))
         ));
         operations = engine.list_guest_operations(Some(cell.id)).unwrap();
@@ -5605,6 +5708,13 @@ mod tests {
             operation.phase == GuestOperationPhase::TransportActive
                 && operation.failure == Some(GuestFailureClass::Timeout)
         }));
+        assert!(matches!(
+            engine.exec_guest(&guest, &credentials, request(cell.id)),
+            Err(EngineError::LifecycleConflict(message))
+                if message.contains("earlier operations")
+        ));
+
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
         {
             let mut state = guest.state.lock().unwrap();
             state.readiness = VecDeque::from([GuestReadiness::Ready]);
@@ -5620,7 +5730,7 @@ mod tests {
             };
         }
         assert!(matches!(
-            engine.exec_guest(&guest, &credentials, request()),
+            engine.exec_guest(&guest, &credentials, request(cell.id)),
             Err(EngineError::Guest(GuestIoError::InvalidResponse))
         ));
         assert!(
@@ -5634,13 +5744,14 @@ mod tests {
                 })
         );
 
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
         {
             let mut state = guest.state.lock().unwrap();
             state.readiness = VecDeque::from([GuestReadiness::Ready]);
             state.failure = Some(InjectedGuestFailure::OutputLimit);
         }
         assert!(matches!(
-            engine.exec_guest(&guest, &credentials, request()),
+            engine.exec_guest(&guest, &credentials, request(cell.id)),
             Err(EngineError::Guest(GuestIoError::OutputLimit))
         ));
         assert!(
@@ -5654,13 +5765,14 @@ mod tests {
                 })
         );
 
+        let (_directory, engine, cell, guest, credentials) = running_fixture();
         {
             let mut state = guest.state.lock().unwrap();
             state.readiness = VecDeque::from([GuestReadiness::Ready]);
             state.failure = Some(InjectedGuestFailure::Transport);
         }
         assert!(matches!(
-            engine.exec_guest(&guest, &credentials, request()),
+            engine.exec_guest(&guest, &credentials, request(cell.id)),
             Err(EngineError::Guest(GuestIoError::Transport))
         ));
         assert!(
@@ -5673,6 +5785,109 @@ mod tests {
                         && operation.failure == Some(GuestFailureClass::Unknown)
                 })
         );
+    }
+
+    #[test]
+    fn line_oriented_shell_faults_preserve_durable_phase_and_never_cleanup() {
+        let cases = [
+            (
+                GuestReadiness::AuthenticationFailed,
+                None,
+                false,
+                GuestFailureClass::Authentication,
+                true,
+            ),
+            (
+                GuestReadiness::SessionFailed,
+                None,
+                false,
+                GuestFailureClass::Session,
+                true,
+            ),
+            (
+                GuestReadiness::Ready,
+                Some(InjectedGuestFailure::Timeout),
+                false,
+                GuestFailureClass::Timeout,
+                false,
+            ),
+            (
+                GuestReadiness::Ready,
+                Some(InjectedGuestFailure::Transport),
+                false,
+                GuestFailureClass::Unknown,
+                false,
+            ),
+            (
+                GuestReadiness::Ready,
+                None,
+                true,
+                GuestFailureClass::OwnershipChanged,
+                true,
+            ),
+        ];
+
+        for (readiness, failure, drift, expected_failure, terminal) in cases {
+            let (_directory, engine, cell, guest, credentials) = running_fixture();
+            {
+                let mut state = guest.state.lock().unwrap();
+                state.readiness = VecDeque::from([readiness]);
+                state.failure = failure;
+                state.drift_on_probe = drift;
+            }
+            let recorded = std::cell::Cell::new(None);
+            let result = engine.exec_guest_observed(
+                &guest,
+                &credentials,
+                GuestExecRequest {
+                    cell_id: cell.id,
+                    command: GuestCommand {
+                        program: "powershell.exe".to_owned(),
+                        args: vec!["-Command".to_owned(), "failure-case".to_owned()],
+                        timeout: StdDuration::from_secs(1),
+                        max_output_bytes: 1024,
+                    },
+                    readiness: ReadinessPolicy {
+                        timeout: StdDuration::from_millis(10),
+                        poll_interval: StdDuration::from_millis(10),
+                    },
+                },
+                |id| recorded.set(Some(id)),
+            );
+            assert!(result.is_err());
+            let operation_id = recorded
+                .get()
+                .expect("intent should be durable before transport");
+            let operation = engine.inspect_guest_operation(operation_id).unwrap();
+            assert_eq!(operation.failure, Some(expected_failure));
+            assert_eq!(operation.phase.is_terminal(), terminal);
+            if !terminal {
+                assert!(matches!(
+                    engine.exec_guest(
+                        &guest,
+                        &credentials,
+                        GuestExecRequest {
+                            cell_id: cell.id,
+                            command: GuestCommand {
+                                program: "powershell.exe".to_owned(),
+                                args: vec!["-Command".to_owned(), "must-not-run".to_owned()],
+                                timeout: StdDuration::from_secs(1),
+                                max_output_bytes: 1024,
+                            },
+                            readiness: readiness_for_test(),
+                        }
+                    ),
+                    Err(EngineError::LifecycleConflict(_))
+                ));
+            }
+            assert_eq!(
+                engine.state.load_cell(cell.id).unwrap().state,
+                CellState::Running
+            );
+            let provider_state = engine.provider.state.lock().unwrap();
+            assert!(!provider_state.calls.contains(&"stop_vm"));
+            assert!(!provider_state.calls.contains(&"remove_vm"));
+        }
     }
 
     #[test]
