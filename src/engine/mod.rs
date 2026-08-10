@@ -3387,7 +3387,13 @@ fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineErro
 #[cfg(target_os = "linux")]
 struct LinuxPathMutationGuard {
     events: File,
-    target_name: Vec<u8>,
+    targets: Vec<LinuxPathWatchTarget>,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPathWatchTarget {
+    descriptor: i32,
+    name: Option<Vec<u8>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3397,19 +3403,11 @@ impl LinuxPathMutationGuard {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
 
-        let parent = path.parent().ok_or_else(|| {
-            EngineError::ImageIntegrity("immutable base has no parent directory".to_owned())
-        })?;
-        let target_name = path
-            .file_name()
-            .ok_or_else(|| {
-                EngineError::ImageIntegrity("immutable base has no filename".to_owned())
-            })?
-            .as_bytes()
-            .to_vec();
-        let parent = CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
-            EngineError::ImageIntegrity("immutable base parent path is invalid".to_owned())
-        })?;
+        if !path.is_absolute() {
+            return Err(EngineError::ImageIntegrity(
+                "immutable base mutation watch requires an absolute path".to_owned(),
+            ));
+        }
         let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if descriptor < 0 {
             return Err(EngineError::ImageIntegrity(
@@ -3417,7 +3415,7 @@ impl LinuxPathMutationGuard {
             ));
         }
         let events = unsafe { File::from_raw_fd(descriptor) };
-        let mask = libc::IN_ATTRIB
+        let component_mask = libc::IN_ATTRIB
             | libc::IN_CLOSE_WRITE
             | libc::IN_CREATE
             | libc::IN_DELETE
@@ -3425,16 +3423,66 @@ impl LinuxPathMutationGuard {
             | libc::IN_MODIFY
             | libc::IN_MOVE_SELF
             | libc::IN_MOVED_FROM
-            | libc::IN_MOVED_TO;
-        if unsafe { libc::inotify_add_watch(descriptor, parent.as_ptr(), mask) } < 0 {
+            | libc::IN_MOVED_TO
+            | libc::IN_ONLYDIR
+            | libc::IN_DONT_FOLLOW;
+        let inode_mask = libc::IN_ATTRIB
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_DELETE_SELF
+            | libc::IN_MODIFY
+            | libc::IN_MOVE_SELF
+            | libc::IN_DONT_FOLLOW;
+        let mut components = path.components();
+        if components.next() != Some(std::path::Component::RootDir) {
             return Err(EngineError::ImageIntegrity(
-                "immutable base parent mutation watch could not be installed".to_owned(),
+                "immutable base mutation watch path was invalid".to_owned(),
             ));
         }
-        Ok(Self {
-            events,
-            target_name,
-        })
+        let mut parent = PathBuf::from("/");
+        let mut targets = Vec::new();
+        for component in components {
+            let std::path::Component::Normal(name) = component else {
+                return Err(EngineError::ImageIntegrity(
+                    "immutable base mutation watch path was invalid".to_owned(),
+                ));
+            };
+            let parent_path = CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+                EngineError::ImageIntegrity("immutable base ancestor path is invalid".to_owned())
+            })?;
+            let watch = unsafe {
+                libc::inotify_add_watch(descriptor, parent_path.as_ptr(), component_mask)
+            };
+            if watch < 0 {
+                return Err(EngineError::ImageIntegrity(
+                    "immutable base ancestor mutation watch could not be installed".to_owned(),
+                ));
+            }
+            targets.push(LinuxPathWatchTarget {
+                descriptor: watch,
+                name: Some(name.as_bytes().to_vec()),
+            });
+            parent.push(name);
+        }
+        if parent != path {
+            return Err(EngineError::ImageIntegrity(
+                "immutable base mutation watch path was not canonical".to_owned(),
+            ));
+        }
+        let file_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            EngineError::ImageIntegrity("immutable base path is invalid".to_owned())
+        })?;
+        let file_watch =
+            unsafe { libc::inotify_add_watch(descriptor, file_path.as_ptr(), inode_mask) };
+        if file_watch < 0 {
+            return Err(EngineError::ImageIntegrity(
+                "immutable base inode mutation watch could not be installed".to_owned(),
+            ));
+        }
+        targets.push(LinuxPathWatchTarget {
+            descriptor: file_watch,
+            name: None,
+        });
+        Ok(Self { events, targets })
     }
 
     fn ensure_unchanged(&self) -> Result<(), EngineError> {
@@ -3452,6 +3500,11 @@ impl LinuxPathMutationGuard {
             | libc::IN_MODIFY
             | libc::IN_MOVED_FROM
             | libc::IN_MOVED_TO;
+        const INODE_MUTATION: u32 = libc::IN_ATTRIB
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_DELETE_SELF
+            | libc::IN_MODIFY
+            | libc::IN_MOVE_SELF;
         let mut bytes = [0_u8; 4096];
         loop {
             let count = unsafe {
@@ -3511,9 +3564,22 @@ impl LinuxPathMutationGuard {
                 }
                 let name = &bytes[offset + header_size..offset + event_size];
                 let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
-                if event.mask & SELF_OR_OVERFLOW != 0
-                    || (event.mask & TARGET_MUTATION != 0 && name == self.target_name)
-                {
+                let target = self
+                    .targets
+                    .iter()
+                    .find(|target| target.descriptor == event.wd);
+                let changed = event.mask & SELF_OR_OVERFLOW != 0
+                    || match target {
+                        Some(LinuxPathWatchTarget {
+                            name: Some(expected),
+                            ..
+                        }) => event.mask & TARGET_MUTATION != 0 && name == expected,
+                        Some(LinuxPathWatchTarget { name: None, .. }) => {
+                            event.mask & INODE_MUTATION != 0
+                        }
+                        None => true,
+                    };
+                if changed {
                     return Err(EngineError::ImageIntegrity(
                         "immutable base pathname changed while in use".to_owned(),
                     ));
@@ -5638,6 +5704,37 @@ mod tests {
 
         assert!(matches!(
             guard.validate_path_identity(&parent),
+            Err(EngineError::ImageIntegrity(message))
+                if message.contains("pathname changed while in use")
+        ));
+
+        let images = directory.path().join("images");
+        let image_set = images.join("set");
+        fs::create_dir_all(&image_set).unwrap();
+        let nested_parent = image_set.join("base.qcow2");
+        fs::write(&nested_parent, b"registered-nested-parent").unwrap();
+        let nested_guard = open_immutable_parent(&nested_parent).unwrap();
+        let retired_images = directory.path().join("images-retired");
+        fs::rename(&images, &retired_images).unwrap();
+        fs::create_dir_all(&image_set).unwrap();
+        fs::write(&nested_parent, b"replacement-nested-parent").unwrap();
+        fs::remove_dir_all(&images).unwrap();
+        fs::rename(&retired_images, &images).unwrap();
+        assert!(matches!(
+            nested_guard.validate_path_identity(&nested_parent),
+            Err(EngineError::ImageIntegrity(message))
+                if message.contains("pathname changed while in use")
+        ));
+
+        let hard_link_parent = directory.path().join("hard-link-base.qcow2");
+        let hard_link_alias = directory.path().join("hard-link-alias.qcow2");
+        fs::write(&hard_link_parent, b"registered-hard-link-parent").unwrap();
+        fs::hard_link(&hard_link_parent, &hard_link_alias).unwrap();
+        let hard_link_guard = open_immutable_parent(&hard_link_parent).unwrap();
+        fs::write(&hard_link_alias, b"replacement-hard-link-parent").unwrap();
+        fs::write(&hard_link_alias, b"registered-hard-link-parent").unwrap();
+        assert!(matches!(
+            hard_link_guard.validate_path_identity(&hard_link_parent),
             Err(EngineError::ImageIntegrity(message))
                 if message.contains("pathname changed while in use")
         ));
