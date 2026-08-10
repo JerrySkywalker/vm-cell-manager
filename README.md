@@ -287,12 +287,11 @@ Initial implementation rules:
 
 ## Platform direction
 
-| Host | Primary provider | Accelerator / native path | Initial guest focus |
-|---|---|---|---|
-| Windows | Hyper-V | Hyper-V | Windows, Linux |
-| Windows | QEMU | WHPX | Windows, Linux |
-| Linux | QEMU | KVM | Linux, Windows |
-| macOS | QEMU | HVF | Linux; other guests where technically and legally appropriate |
+The machine-validated [platform support matrix](docs/support-matrix.md) is the
+single source for host, architecture, provider, accelerator, guest, and
+transport status. An absent combination is not inferred from a similar row.
+Repository CI, mocks, fake protocols, and WSL2 evidence cannot promote a real
+platform combination to `supported`.
 
 An Apple Virtualization.framework provider may be considered later if it provides clear value beyond QEMU/HVF. libvirt, VirtualBox, VMware, Parallels, and cloud providers are not bootstrap dependencies.
 
