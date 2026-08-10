@@ -46,11 +46,21 @@ vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
-`--state-root PATH` and `--lock-timeout-ms N` are global. The lock timeout is
+`--config PATH`, `--state-root PATH`, `--lock-timeout-ms N`, and
+`--human-output normal|quiet` are global. The lock timeout is
 bounded to 30 seconds per state-lock acquisition, defaults to fail-fast, and
 never authorizes lock stealing. Commands that dispatch serially to multiple
 provider engines may consume one bounded interval per acquisition.
 Changing the state root does not authorize adoption of provider objects.
+
+Config selection and precedence are defined in
+[`user-configuration.md`](user-configuration.md). Malformed/unsafe config uses
+`vmcell.config.invalid` and exit `2`; a missing explicit config uses
+`vmcell.config.not_found` and exit `2`; an unsupported config schema uses
+`vmcell.config.unsupported_schema` and integrity exit `9`. Error envelopes do
+not include config contents or paths. Configuration is loaded before state or
+provider access and cannot contain credentials, accelerator/TCG policy, or
+authority exceptions.
 
 `image validate` is read-only. Candidate-path mode returns a schema-versioned
 validation report without registering the image. Registered-image mode repeats

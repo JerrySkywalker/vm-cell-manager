@@ -11,7 +11,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, OwnershipClassification, RequiredAction};
-use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState};
+use crate::core::cell::{
+    CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState, MAX_CPU_COUNT,
+    MAX_MEMORY_MIB, MIN_MEMORY_MIB,
+};
 use crate::core::guest::{
     ARTIFACT_SCHEMA_VERSION, ArtifactEntry, ArtifactRecord, GuestFailureClass, GuestOperationId,
     GuestOperationKind, GuestOperationPhase, GuestOperationRecord, MAX_ARTIFACT_FILES,
@@ -33,9 +36,6 @@ use crate::providers::{
 };
 use crate::state::{InstallationAuthority, MutationGuard, StateError, StateStore};
 
-const MIN_MEMORY_MIB: u64 = 512;
-const MAX_MEMORY_MIB: u64 = 1_048_576;
-const MAX_CPU_COUNT: u16 = 64;
 const MIN_TTL_SECONDS: u64 = 1;
 const MAX_TTL_SECONDS: u64 = 31_536_000;
 const MAX_ARTIFACT_RETENTION_SECONDS: u64 = 31_536_000;
