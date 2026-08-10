@@ -80,6 +80,17 @@ repository-local portability suite. It does not install Rust, QEMU, KVM
 components, packages, or change `/dev/kvm` permissions. WSL2 output is useful
 development evidence but is never recorded as real Linux host acceptance.
 
+The `Linux Validation` workflow provides the canonical repository Linux lane.
+It is manual `workflow_dispatch` only, accepts one exact lowercase 40-hex
+repository commit, and checks out and proves that SHA on the declared
+GitHub-hosted `ubuntu-24.04` x86_64 baseline. The ephemeral job installs exactly
+Rust 1.85.0 with rustfmt and Clippy, then runs locked metadata, format, check,
+Clippy, all-target tests, doc-tests, and Linux shell parsing. It has read-only
+repository permission, persists no checkout credentials, and has no `push` or
+`pull_request` trigger. It never opens `/dev/kvm` or runs provider lifecycle
+commands. Hosted Linux evidence is native repository compile/test evidence,
+not real KVM/QGA acceptance.
+
 ## Provider safety rule
 
 M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands carrying an engine-issued installation/runtime authority and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.
