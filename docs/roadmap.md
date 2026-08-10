@@ -482,6 +482,13 @@ A logical image identity can expose provider-specific variants cleanly where app
 
 Each release explicitly distinguishes supported, experimental, development-only, untested, and unsupported host/provider/accelerator/guest/transport combinations.
 
+**Repository-local contract:** the [platform support matrix](support-matrix.md)
+is rendered from one typed source and checked byte-for-byte in core tests.
+Duplicate, conflicting, undocumented, impossible, or evidence-free promoted
+combinations fail closed. Current real WHPX, KVM, QGA, and PowerShell Direct
+paths remain `untested`; explicit TCG paths are `development-only` and never an
+implicit fallback.
+
 ## Explicitly not required
 
 - fully supported macOS;
