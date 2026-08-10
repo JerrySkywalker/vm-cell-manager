@@ -178,7 +178,7 @@ def open_source() -> tuple[int, Path, dict[str, bytes]]:
     return descriptor, source, contents
 
 
-def open_private_parent(requested: Path) -> int:
+def open_private_parent(requested: Path, *, create_missing: bool) -> int:
     home_text = os.environ.get("HOME", "")
     if not home_text or not requested.is_absolute():
         raise LayoutError("install parent and HOME must be absolute")
@@ -201,10 +201,11 @@ def open_private_parent(requested: Path) -> int:
     current = os.open(home, flags)
     try:
         for index, component in enumerate(relative.parts):
-            try:
-                os.mkdir(component, 0o700, dir_fd=current)
-            except FileExistsError:
-                pass
+            if create_missing:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
             child = os.open(component, flags, dir_fd=current)
             opened = os.fstat(child)
             named = os.stat(component, dir_fd=current, follow_symlinks=False)
@@ -333,7 +334,10 @@ def main() -> int:
         target = source.name
         if not target.startswith("vmcell-v") or not target.endswith("-linux-x86_64"):
             raise LayoutError("source layout name was not a versioned vmcell package")
-        parent = open_private_parent(Path(args.parent))
+        parent = open_private_parent(
+            Path(args.parent),
+            create_missing=args.action == "install",
+        )
         try:
             if args.action == "install":
                 install(parent, target, contents)

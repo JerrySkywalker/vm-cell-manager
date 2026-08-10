@@ -72,6 +72,7 @@ function Assert-LinuxValidationContract {
     'external package build target' = 'CARGO_TARGET_DIR must be bound outside the checkout'
     'locked release package build' = 'cargo build --locked --release --bin vmcell'
     'Linux package validation' = 'python3 tools/test-linux-package\.py --binary "\$CARGO_TARGET_DIR/release/vmcell"'
+    'Linux package non-root proof' = 'Linux portable-package smoke must run as an unprivileged identity'
     'package assembly entry point' = 'tools/package-linux\.py'
     'package atomic no-replace publication' = '(?s)renameat2\(\s*parent_descriptor,\s*os\.fsencode\(stage\.name\),\s*parent_descriptor,\s*os\.fsencode\(output\.name\),\s*1,'
     'package private output parent' = 'output parent must be current-user-owned and not group/world writable'

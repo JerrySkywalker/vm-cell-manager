@@ -42,8 +42,8 @@ python3 "$layout/vmcell-portable-layout.py" install --parent "$install_parent"
 Add that exact versioned directory to the user PATH only after these checks.
 For the current shell, source `completions/vmcell.bash` in Bash or add the
 versioned `completions` directory to Zsh `fpath`. No command overwrites a shared
-binary or completion target. Retain the verified archive/checksum or a trusted
-copy of its content manifest as the removal identity.
+binary or completion target. Retain the verified archive/checksum and a full
+checksum-verified extracted layout as the removal identity and helper source.
 
 The example version follows the current repository candidate and is aligned to
 `0.3.0` during v0.3 closeout. Do not use an archive whose version, checksum,

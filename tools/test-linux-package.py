@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -376,6 +377,14 @@ def install_smoke(
     if linked.returncode == 0:
         raise ContractError("portable installer accepted a symlink parent")
 
+    missing_parent = home / "remove-typo" / "vmcell"
+    missing_remove = run(
+        [sys.executable, str(installer), "remove", "--parent", str(missing_parent)],
+        environment=environment,
+    )
+    if missing_remove.returncode == 0 or (home / "remove-typo").exists():
+        raise ContractError("removal created a missing or mistyped parent")
+
     self_remove = run(
         [
             sys.executable,
@@ -389,6 +398,34 @@ def install_smoke(
     if self_remove.returncode == 0:
         raise ContractError("installed helper authorized its own removal")
     validate_installed_layout(contents, install_root)
+
+    spec = importlib.util.spec_from_file_location("vmcell_portable_layout_contract", installer)
+    if spec is None or spec.loader is None:
+        raise ContractError("portable installer identity regression could not load")
+    installer_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installer_module)
+    identity_parent = home / "identity-parent"
+    identity_parent.mkdir(mode=0o700)
+    identity_target = identity_parent / "target"
+    identity_target.mkdir(mode=0o700)
+    identity_parent_descriptor = os.open(identity_parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        identity_status = os.stat(identity_target, follow_symlinks=False)
+        try:
+            installer_module.cleanup_layout(
+                identity_parent_descriptor,
+                identity_target.name,
+                require_valid=False,
+                forbidden_root_identity=(identity_status.st_dev, identity_status.st_ino),
+            )
+        except installer_module.LayoutError:
+            pass
+        else:
+            raise ContractError("portable remover accepted its source as the installed target")
+    finally:
+        os.close(identity_parent_descriptor)
+    if not identity_target.is_dir():
+        raise ContractError("identity-separation rejection deleted its target")
 
     removed = run(
         [sys.executable, str(installer), "remove", "--parent", str(prefix_parent)],
@@ -404,6 +441,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     args = parser.parse_args()
+    if os.geteuid() == 0:
+        raise ContractError("Linux portable-package smoke must run as an unprivileged identity")
     repository_root = Path(__file__).resolve(strict=True).parent.parent
     binary = Path(args.binary).resolve(strict=True)
     metadata = json.loads(
