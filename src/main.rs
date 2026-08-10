@@ -1,6 +1,8 @@
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Parser, error::ErrorKind};
@@ -20,10 +22,10 @@ use vm_cell_manager::core::guest::{
 use vm_cell_manager::core::image::{Architecture, GuestOs, ImageRecord};
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
-    GuestCopyInRequest, GuestCopyOutRequest, GuestExecRequest, GuestOperationRecoveryReport,
-    ImageValidationReport, ImageValidationStatus, RegisterImageRequest, RunCellError,
-    RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
-    ValidateImageRequest,
+    GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
+    GuestOperationRecoveryReport, ImageValidationReport, ImageValidationStatus,
+    RegisterImageRequest, RunCellError, RunCellReport, RunCellRequest, RunCleanupPolicy,
+    RunControl, RunObserver, RunProgressEvent, ValidateImageRequest,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -138,6 +140,9 @@ fn emit_classified_error(
 }
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
+    if matches!(&cli.command, Command::Shell { .. }) {
+        require_human_shell(cli.json)?;
+    }
     let state_root = cli.state_root.clone();
     let lock_timeout = Duration::from_millis(cli.lock_timeout_ms);
     match cli.command {
@@ -505,6 +510,80 @@ fn run_m2<P: LocalVmProvider>(
                 println!("guest exec {}", report.operation_id)
             })?;
         }
+        Command::Shell {
+            cell_id,
+            credential,
+            readiness_timeout_seconds,
+            action_timeout_seconds,
+            max_output_bytes,
+        } => {
+            if engine.provider_name() != "hyperv" {
+                return Err(CliInputError(
+                    "vmcell shell currently supports Hyper-V Windows cells through PowerShell Direct"
+                        .to_owned(),
+                )
+                .into());
+            }
+            let inspection = engine.inspect_cell(cell_id)?;
+            if inspection.classification.code
+                != vm_cell_manager::engine::ReconciliationCode::ExactOwned
+                || inspection.cell.state != CellState::Running
+                || inspection.cell.phase != CellPhase::Ready
+                || inspection.cell.image.guest_os != Some(GuestOs::Windows)
+            {
+                return Err(EngineError::LifecycleConflict(
+                    "shell requires an exact-owned, ready, running Windows cell".to_owned(),
+                )
+                .into());
+            }
+            if let Some(operation) = engine
+                .list_guest_operations(Some(cell_id))?
+                .into_iter()
+                .find(|operation| !operation.phase.is_terminal())
+            {
+                let action = if operation.phase == GuestOperationPhase::TransportActive {
+                    "manual_review"
+                } else {
+                    "operation_reconcile"
+                };
+                eprintln!(
+                    "vmcell shell: nonterminal operation={} phase={} action={action}; session refused",
+                    operation.id,
+                    guest_operation_phase_name(operation.phase)
+                );
+                return Err(EngineError::LifecycleConflict(
+                    "shell refuses a cell with a nonterminal guest operation".to_owned(),
+                )
+                .into());
+            }
+            let interrupt = ShellInterruptGuard::install()?;
+            let console = open_windows_console_input()?;
+            let credentials = read_credentials(engine.provider_name(), credential)?;
+            let mut executor = EngineShellCommandExecutor {
+                engine,
+                credentials: &credentials,
+                cell_id,
+                readiness: readiness(readiness_timeout_seconds),
+                action_timeout: Duration::from_secs(action_timeout_seconds),
+                max_output_bytes,
+            };
+            let mut input = BufReader::new(console);
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let report = run_shell_session(
+                &mut executor,
+                &mut input,
+                &mut stdout.lock(),
+                &mut stderr.lock(),
+                || interrupt.requested(),
+            )?;
+            return Ok(match report.end {
+                ShellSessionEnd::Interrupted => ExitCode::from(130),
+                ShellSessionEnd::Eof | ShellSessionEnd::ExitRequested => {
+                    guest_exit_status(report.last_exit_code)
+                }
+            });
+        }
         Command::CopyIn {
             cell_id,
             source,
@@ -849,6 +928,7 @@ fn provider_for_command(command: &Command, state: &StateStore) -> Result<String,
         | Command::Stop { cell_id }
         | Command::Destroy { cell_id }
         | Command::Exec { cell_id, .. }
+        | Command::Shell { cell_id, .. }
         | Command::CopyIn { cell_id, .. }
         | Command::CopyOut { cell_id, .. }
         | Command::Reconcile {
@@ -905,6 +985,338 @@ fn exec_guest<P: LocalVmProvider>(
             );
         }
     })
+}
+
+fn require_human_shell(json: bool) -> Result<(), CliInputError> {
+    if json {
+        Err(CliInputError(
+            "vmcell shell is an interactive human surface and does not support --json".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+const MAX_SHELL_LINE_BYTES: u64 = 8 * 1024;
+
+trait ShellCommandExecutor {
+    fn execute(&mut self, line: &str) -> Result<GuestExecReport, ShellCommandFailure>;
+}
+
+struct ShellCommandFailure {
+    operation_id: Option<vm_cell_manager::core::guest::GuestOperationId>,
+    source: Box<dyn Error>,
+}
+
+struct EngineShellCommandExecutor<'a, P: LocalVmProvider> {
+    engine: &'a CellEngine<P>,
+    credentials: &'a GuestCredentials,
+    cell_id: vm_cell_manager::core::cell::CellId,
+    readiness: ReadinessPolicy,
+    action_timeout: Duration,
+    max_output_bytes: u64,
+}
+
+impl<P: LocalVmProvider> ShellCommandExecutor for EngineShellCommandExecutor<'_, P> {
+    fn execute(&mut self, line: &str) -> Result<GuestExecReport, ShellCommandFailure> {
+        let operation_id = std::cell::Cell::new(None);
+        let result = self.engine.exec_guest_observed(
+            &PowerShellDirectTransport::system(),
+            self.credentials,
+            GuestExecRequest {
+                cell_id: self.cell_id,
+                command: shell_guest_command(line, self.action_timeout, self.max_output_bytes),
+                readiness: self.readiness,
+            },
+            |id| operation_id.set(Some(id)),
+        );
+        result.map_err(|source| ShellCommandFailure {
+            operation_id: operation_id.get(),
+            source: Box::new(source),
+        })
+    }
+}
+
+fn shell_guest_command(line: &str, timeout: Duration, max_output_bytes: u64) -> GuestCommand {
+    GuestCommand {
+        program: "powershell.exe".to_owned(),
+        args: vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            line.to_owned(),
+        ],
+        timeout,
+        max_output_bytes,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellSessionEnd {
+    Eof,
+    ExitRequested,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellSessionReport {
+    commands_executed: u64,
+    last_exit_code: i32,
+    end: ShellSessionEnd,
+}
+
+fn run_shell_session<E: ShellCommandExecutor>(
+    executor: &mut E,
+    input: &mut impl BufRead,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    interrupted: impl Fn() -> bool,
+) -> Result<ShellSessionReport, Box<dyn Error>> {
+    writeln!(
+        stderr,
+        "vmcell shell: line-oriented PowerShell Direct; each line is an independent bounded operation"
+    )?;
+    writeln!(
+        stderr,
+        "vmcell shell: no PTY, guest stdin, Read-Host, full-screen controls, or persistent cwd/env/process state"
+    )?;
+    writeln!(
+        stderr,
+        "vmcell shell: use .exit or EOF to leave; the cell is retained"
+    )?;
+    let mut commands_executed = 0_u64;
+    let mut last_exit_code = 0_i32;
+    loop {
+        if interrupted() {
+            writeln!(
+                stderr,
+                "vmcell shell: interruption requested; cell retained"
+            )?;
+            return Ok(ShellSessionReport {
+                commands_executed,
+                last_exit_code,
+                end: ShellSessionEnd::Interrupted,
+            });
+        }
+        write!(stderr, "vmcell> ")?;
+        stderr.flush()?;
+        let line = match read_shell_line(input) {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                writeln!(stderr, "\nvmcell shell: EOF; cell retained")?;
+                return Ok(ShellSessionReport {
+                    commands_executed,
+                    last_exit_code,
+                    end: ShellSessionEnd::Eof,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                writeln!(
+                    stderr,
+                    "\nvmcell shell: input interrupted before dispatch; cell retained"
+                )?;
+                return Ok(ShellSessionReport {
+                    commands_executed,
+                    last_exit_code,
+                    end: ShellSessionEnd::Interrupted,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                writeln!(stderr, "vmcell shell: invalid input; cell retained")?;
+                return Err(CliInputError(error.to_string()).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let directive = line.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        if directive.eq_ignore_ascii_case(".exit") {
+            writeln!(stderr, "vmcell shell: exit requested; cell retained")?;
+            return Ok(ShellSessionReport {
+                commands_executed,
+                last_exit_code,
+                end: ShellSessionEnd::ExitRequested,
+            });
+        }
+        if directive.eq_ignore_ascii_case(".help") {
+            writeln!(
+                stderr,
+                "vmcell shell: enter one PowerShell command per line; .exit leaves the cell running"
+            )?;
+            continue;
+        }
+        if interrupted() {
+            writeln!(
+                stderr,
+                "vmcell shell: interruption observed before dispatch; cell retained"
+            )?;
+            return Ok(ShellSessionReport {
+                commands_executed,
+                last_exit_code,
+                end: ShellSessionEnd::Interrupted,
+            });
+        }
+        let report = match executor.execute(&line) {
+            Ok(report) => report,
+            Err(failure) => {
+                let classification = classify_cli_error(failure.source.as_ref());
+                let operation = failure
+                    .operation_id
+                    .map_or_else(|| "none".to_owned(), |id| id.to_string());
+                writeln!(
+                    stderr,
+                    "vmcell shell: command failed code={} operation={operation}; session stopped and cell retained for status/operation reconcile",
+                    classification.code
+                )?;
+                return Err(failure.source);
+            }
+        };
+        commands_executed = commands_executed.saturating_add(1);
+        last_exit_code = report.result.exit_code;
+        stdout.write_all(report.result.stdout.as_bytes())?;
+        stdout.flush()?;
+        stderr.write_all(report.result.stderr.as_bytes())?;
+        if !report.result.stderr.is_empty() && !report.result.stderr.ends_with('\n') {
+            writeln!(stderr)?;
+        }
+        writeln!(
+            stderr,
+            "vmcell shell: operation={} exit={}",
+            report.operation_id, report.result.exit_code
+        )?;
+        stderr.flush()?;
+        if interrupted() {
+            writeln!(
+                stderr,
+                "vmcell shell: interruption observed after the bounded operation completed; cell retained"
+            )?;
+            return Ok(ShellSessionReport {
+                commands_executed,
+                last_exit_code,
+                end: ShellSessionEnd::Interrupted,
+            });
+        }
+    }
+}
+
+#[cfg(windows)]
+static SHELL_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+unsafe extern "system" fn shell_console_control_handler(control: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        SHELL_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        1
+    } else {
+        0
+    }
+}
+
+struct ShellInterruptGuard;
+
+impl ShellInterruptGuard {
+    #[cfg(windows)]
+    fn install() -> Result<Self, Box<dyn Error>> {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        SHELL_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+        if unsafe { SetConsoleCtrlHandler(Some(shell_console_control_handler), 1) } == 0 {
+            return Err(CliInputError(
+                "vmcell shell could not install its bounded console interruption handler"
+                    .to_owned(),
+            )
+            .into());
+        }
+        Ok(Self)
+    }
+
+    #[cfg(not(windows))]
+    fn install() -> Result<Self, Box<dyn Error>> {
+        Err(CliInputError("vmcell shell is supported only on Windows".to_owned()).into())
+    }
+
+    fn requested(&self) -> bool {
+        #[cfg(windows)]
+        {
+            SHELL_INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShellInterruptGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        let _ = unsafe { SetConsoleCtrlHandler(Some(shell_console_control_handler), 0) };
+        SHELL_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+fn read_shell_line(input: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if bytes.len().saturating_add(consumed) as u64 > MAX_SHELL_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shell input line exceeds the supported bound",
+            ));
+        }
+        let complete = available.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        bytes.extend_from_slice(&available[..consumed]);
+        input.consume(consumed);
+        if complete {
+            break;
+        }
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "shell input must not contain NUL",
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "shell input is not UTF-8")
+    })
+}
+
+#[cfg(windows)]
+fn open_windows_console_input() -> Result<std::fs::File, Box<dyn Error>> {
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .open("CONIN$")
+        .map_err(|_| {
+            CliInputError(
+                "vmcell shell requires an attached Windows console for command input".to_owned(),
+            )
+        })?)
+}
+
+#[cfg(not(windows))]
+fn open_windows_console_input() -> Result<std::fs::File, Box<dyn Error>> {
+    Err(CliInputError("vmcell shell is supported only from a Windows console".to_owned()).into())
 }
 
 fn write_registered_image(image: &ImageRecord, output: &mut impl Write) -> std::io::Result<()> {
@@ -1974,5 +2386,251 @@ mod tests {
         assert!(output.contains("action=install_or_enable_provider"));
         assert!(output.contains("next_action=investigate_provider"));
         assert!(!output.contains("admitted"));
+    }
+
+    struct MockShellExecutor {
+        lines: Vec<String>,
+        results: std::collections::VecDeque<
+            Result<GuestExecReport, vm_cell_manager::guest::GuestIoError>,
+        >,
+    }
+
+    impl ShellCommandExecutor for MockShellExecutor {
+        fn execute(&mut self, line: &str) -> Result<GuestExecReport, ShellCommandFailure> {
+            self.lines.push(line.to_owned());
+            self.results
+                .pop_front()
+                .expect("mock shell result should exist")
+                .map_err(|source| ShellCommandFailure {
+                    operation_id: Some(vm_cell_manager::core::guest::GuestOperationId::new()),
+                    source: Box::new(source),
+                })
+        }
+    }
+
+    fn shell_result(exit_code: i32, stdout: &str, stderr: &str) -> GuestExecReport {
+        GuestExecReport {
+            schema_version: 1,
+            operation_id: vm_cell_manager::core::guest::GuestOperationId::new(),
+            cell_id: vm_cell_manager::core::cell::CellId::new(),
+            result: vm_cell_manager::guest::GuestCommandResult {
+                exit_code,
+                stdout: stdout.to_owned(),
+                stderr: stderr.to_owned(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: stdout.len() as u64,
+                stderr_bytes: stderr.len() as u64,
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn shell_is_line_oriented_forwards_streams_and_retains_nonzero_status() {
+        let mut executor = MockShellExecutor {
+            lines: Vec::new(),
+            results: std::collections::VecDeque::from([
+                Ok(shell_result(0, "first\n", "")),
+                Ok(shell_result(7, "", "second-error\n")),
+            ]),
+        };
+        let mut input =
+            std::io::Cursor::new(b"  Write-Output first  \nWrite-Error second\n.exit\n");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let report = run_shell_session(&mut executor, &mut input, &mut stdout, &mut stderr, || {
+            false
+        })
+        .expect("mock shell should finish");
+
+        assert_eq!(
+            executor.lines,
+            ["  Write-Output first  ", "Write-Error second"]
+        );
+        assert_eq!(stdout, b"first\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("line-oriented PowerShell Direct"));
+        assert!(stderr.contains("no PTY, guest stdin, Read-Host, full-screen controls"));
+        assert!(stderr.contains("second-error"));
+        assert!(stderr.contains("exit=7"));
+        assert!(stderr.contains("cell retained"));
+        assert_eq!(report.commands_executed, 2);
+        assert_eq!(report.last_exit_code, 7);
+        assert_eq!(report.end, ShellSessionEnd::ExitRequested);
+    }
+
+    #[test]
+    fn shell_adapter_uses_fixed_powershell_program_and_typed_arguments() {
+        let command = shell_guest_command("  Write-Output 'a b'  ", Duration::from_secs(17), 4096);
+        assert_eq!(command.program, "powershell.exe");
+        assert_eq!(
+            command.args,
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "  Write-Output 'a b'  ",
+            ]
+        );
+        assert_eq!(command.timeout, Duration::from_secs(17));
+        assert_eq!(command.max_output_bytes, 4096);
+        command.validate().unwrap();
+    }
+
+    #[test]
+    fn shell_transport_failures_stop_without_cleanup_or_replay() {
+        for failure in [
+            vm_cell_manager::guest::GuestIoError::Timeout,
+            vm_cell_manager::guest::GuestIoError::AuthenticationFailed,
+            vm_cell_manager::guest::GuestIoError::OwnershipChanged,
+            vm_cell_manager::guest::GuestIoError::SessionFailed,
+            vm_cell_manager::guest::GuestIoError::Transport,
+        ] {
+            let mut executor = MockShellExecutor {
+                lines: Vec::new(),
+                results: std::collections::VecDeque::from([Err(failure)]),
+            };
+            let mut input = std::io::Cursor::new(b"Get-Date\nWrite-Output never\n");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            assert!(
+                run_shell_session(&mut executor, &mut input, &mut stdout, &mut stderr, || {
+                    false
+                },)
+                .is_err()
+            );
+            assert_eq!(executor.lines, ["Get-Date"]);
+            assert!(stdout.is_empty());
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(stderr.contains("cell retained for status/operation reconcile"));
+            assert!(stderr.contains("operation="));
+            assert!(!stderr.contains("credential-sentinel"));
+        }
+    }
+
+    struct InterruptedShellInput;
+
+    impl Read for InterruptedShellInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        }
+    }
+
+    impl BufRead for InterruptedShellInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    #[test]
+    fn shell_input_interruption_is_safe_before_dispatch_and_retains_cell() {
+        let mut executor = MockShellExecutor {
+            lines: Vec::new(),
+            results: std::collections::VecDeque::new(),
+        };
+        let mut input = InterruptedShellInput;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let report = run_shell_session(&mut executor, &mut input, &mut stdout, &mut stderr, || {
+            false
+        })
+        .expect("pre-dispatch interruption should be classified");
+
+        assert_eq!(report.end, ShellSessionEnd::Interrupted);
+        assert_eq!(report.commands_executed, 0);
+        assert!(executor.lines.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("input interrupted before dispatch; cell retained")
+        );
+    }
+
+    struct InterruptAfterActionShell {
+        requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ShellCommandExecutor for InterruptAfterActionShell {
+        fn execute(&mut self, _line: &str) -> Result<GuestExecReport, ShellCommandFailure> {
+            self.requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(shell_result(0, "completed\n", ""))
+        }
+    }
+
+    #[test]
+    fn shell_console_interrupt_is_observed_after_bounded_action_without_replay() {
+        let requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut executor = InterruptAfterActionShell {
+            requested: requested.clone(),
+        };
+        let mut input = std::io::Cursor::new(b"Get-Date\nWrite-Output never\n");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let report = run_shell_session(&mut executor, &mut input, &mut stdout, &mut stderr, || {
+            requested.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .expect("completed action should be reported before interruption exit");
+
+        assert_eq!(report.commands_executed, 1);
+        assert_eq!(report.end, ShellSessionEnd::Interrupted);
+        assert_eq!(stdout, b"completed\n");
+        assert!(String::from_utf8(stderr).unwrap().contains(
+            "interruption observed after the bounded operation completed; cell retained"
+        ));
+    }
+
+    #[test]
+    fn shell_input_is_strict_utf8_and_bounded() {
+        assert!(matches!(
+            read_shell_line(&mut std::io::Cursor::new([0xff, b'\n'])),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        let oversized = vec![b'a'; MAX_SHELL_LINE_BYTES as usize + 1];
+        assert!(matches!(
+            read_shell_line(&mut std::io::Cursor::new(oversized)),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(matches!(
+            read_shell_line(&mut std::io::Cursor::new(b"Get-Date\0\n")),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+
+        let mut executor = MockShellExecutor {
+            lines: Vec::new(),
+            results: std::collections::VecDeque::new(),
+        };
+        let mut input = std::io::Cursor::new([0xff, b'\n']);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_shell_session(&mut executor, &mut input, &mut stdout, &mut stderr, || {
+            false
+        })
+        .unwrap_err();
+        let classification = classify_cli_error(error.as_ref());
+        assert_eq!(classification.code, "vmcell.invalid_input");
+        assert_eq!(classification.exit_code, CliExitCode::InvalidInput);
+        assert!(executor.lines.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("invalid input; cell retained")
+        );
+    }
+
+    #[test]
+    fn shell_rejects_json_before_any_interactive_input() {
+        assert!(require_human_shell(false).is_ok());
+        assert_eq!(
+            require_human_shell(true).unwrap_err().to_string(),
+            "invalid CLI input: vmcell shell is an interactive human surface and does not support --json"
+        );
     }
 }

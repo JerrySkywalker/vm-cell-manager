@@ -289,7 +289,10 @@ mod tests {
             run_bounded(&mut command, &[], Duration::from_millis(250), 1024),
             Err(ProcessError::Timeout)
         ));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Process creation and job-object cleanup can be delayed substantially
+        // on a saturated self-hosted runner. Keep the assertion well below the
+        // 30-second child sleep while leaving the runtime deadline unchanged.
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[test]

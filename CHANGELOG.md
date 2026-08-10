@@ -6,6 +6,9 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Added a fail-closed, line-oriented `vmcell shell` workflow over existing
+  PowerShell Direct guest authority, with bounded console input, cooperative
+  interruption, durable operation IDs, and no automatic lifecycle cleanup.
 - Added a schema-versioned, read-only `vmcell status` aggregate and concise
   doctor/list/inspect/reconcile/operation diagnostics for provider availability,
   cell retention/expiry, uncertain guest operations, and fail-closed cleanup

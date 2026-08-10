@@ -126,6 +126,42 @@ owned VM, and the run output must have reported `cleanup=destroyed`. If the
 record is retained or recovery-required, follow the reported classification;
 do not delete Hyper-V objects manually by name.
 
+## 7. Open an optional retained shell session
+
+For a daily-driver session, repeat step 5 with `--keep` and copy the new
+`CELL_ID`. The cell must already be running, ready, and exact-owned. Supply the
+password on bounded stdin; shell commands are read separately from the
+attached Windows console:
+
+```powershell
+$guestPassword = Read-Host -Prompt 'Guest password' -MaskInput
+try {
+  $guestPassword | & $vmcell shell CELL_ID `
+    --username $guestUser `
+    --password-stdin
+} finally {
+  $guestPassword = $null
+}
+```
+
+This is deliberately not a PTY. Every nonempty line starts one independent,
+bounded `powershell.exe -Command` operation with a fresh ownership proof.
+Guest stdin, `Read-Host`, full-screen programs, and persistent current
+directory, environment, process, or PowerShell session state are unavailable.
+Use `.help` for the local directives and `.exit`, EOF, or cooperative Ctrl-C
+to leave the cell running.
+
+A timeout, broken transport/session, ownership drift, or prior nonterminal
+guest operation stops the shell without replay or automatic cleanup. Record
+the reported operation ID and use `vmcell status` plus `vmcell operation
+inspect` before deciding whether manual investigation is required. Never
+repeat an uncertain command automatically. When the cell is proven safe to
+remove, use the normal exact-owned lifecycle path:
+
+```powershell
+& $vmcell destroy CELL_ID
+```
+
 ## Current acceptance status
 
 Repository-local tests cover orchestration, cleanup policies, credential
