@@ -4,16 +4,23 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT};
-use crate::core::cell::{CellId, CellIdError};
-use crate::core::guest::{GuestOperationId, GuestOperationIdError};
-use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError};
-use crate::engine::{EngineError, RunCellError, RunCleanupDisposition, RunFailureReport, RunStage};
+use crate::core::automation::{
+    AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT, RequiredAction, STATUS_CONTRACT,
+};
+use crate::core::cell::{CellId, CellIdError, CellRecord};
+use crate::core::guest::{GuestOperationId, GuestOperationIdError, GuestOperationRecord};
+use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError, ImageRecord};
+use crate::engine::{
+    CellInspection, EngineError, ImageValidationReport, RunCellError, RunCleanupDisposition,
+    RunFailureReport, RunStage,
+};
 use crate::guest::{
     DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
 };
-use crate::providers::{ProviderError, ProviderProbe, builtin_provider_probes};
+use crate::providers::{
+    ProviderError, ProviderProbe, ProviderProbeStatus, builtin_provider_probes,
+};
 use crate::state::{StateError, StateStore};
 
 pub const CLI_JSON_SCHEMA_VERSION: u32 = AUTOMATION_SCHEMA_VERSION;
@@ -27,7 +34,7 @@ pub struct CliInputError(pub String);
     name = "vmcell",
     version,
     about = "Local disposable VM execution cells",
-    after_help = "Windows Human MVP examples (real execution remains release-gated):\n  vmcell doctor\n  vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell image add --id windows-dev --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell run --image windows-dev --username Administrator --password-stdin -- cmd.exe /d /c ver\n\nSee docs/quickstart-windows.md. Never place a guest password on argv."
+    after_help = "Windows Human MVP examples (real execution remains release-gated):\n  vmcell doctor\n  vmcell status\n  vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell image add --id windows-dev --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell run --image windows-dev --username Administrator --password-stdin -- cmd.exe /d /c ver\n\nSee docs/quickstart-windows.md. Never place a guest password on argv."
 )]
 pub struct Cli {
     /// Emit versioned machine-readable JSON.
@@ -55,6 +62,9 @@ pub struct Cli {
 pub enum Command {
     /// Probe the host and built-in providers without mutating host state.
     Doctor,
+
+    /// Summarize providers, cells, images, operations, and safe next actions read-only.
+    Status,
 
     /// Inspect built-in local providers.
     Provider {
@@ -512,6 +522,115 @@ impl DoctorReport {
             providers,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusReport {
+    pub schema_version: u32,
+    pub contract: &'static str,
+    pub evaluated_at: chrono::DateTime<chrono::Utc>,
+    pub providers: Vec<ProviderProbe>,
+    pub cells: Vec<StatusCellEntry>,
+    pub images: Vec<StatusImageEntry>,
+    pub operations: Vec<StatusOperationEntry>,
+}
+
+impl StatusReport {
+    #[must_use]
+    pub fn new(
+        evaluated_at: chrono::DateTime<chrono::Utc>,
+        providers: Vec<ProviderProbe>,
+        cells: Vec<StatusCellEntry>,
+        images: Vec<StatusImageEntry>,
+        operations: Vec<StatusOperationEntry>,
+    ) -> Self {
+        Self {
+            schema_version: CLI_JSON_SCHEMA_VERSION,
+            contract: STATUS_CONTRACT,
+            evaluated_at,
+            providers,
+            cells,
+            images,
+            operations,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusCellEntry {
+    pub cell: CellRecord,
+    pub retention: StatusRetention,
+    pub pending_operations: usize,
+    pub uncertain_operations: usize,
+    pub observation: StatusCellObservation,
+    pub cleanup: StatusCleanupGuidance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusRetention {
+    Manual,
+    ActiveUntilExpiry,
+    Expired,
+    None,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StatusCellObservation {
+    Observed {
+        inspection: Box<CellInspection>,
+    },
+    ProviderUnavailable {
+        provider_status: ProviderProbeStatus,
+    },
+    InspectionFailed {
+        error_code: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusCleanupGuidance {
+    ExactOwnedDestroy,
+    PhaseRecovery,
+    ReconcileThenRetry,
+    NotNeeded,
+    ManualReview,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusImageEntry {
+    pub image: ImageRecord,
+    pub observations: Vec<StatusImageVariantObservation>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusImageVariantObservation {
+    pub provider: String,
+    pub observation: StatusImageObservation,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StatusImageObservation {
+    Validated {
+        report: Box<ImageValidationReport>,
+    },
+    ProviderUnavailable {
+        provider_status: ProviderProbeStatus,
+    },
+    ValidationFailed {
+        error_code: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusOperationEntry {
+    pub operation: GuestOperationRecord,
+    pub pending: bool,
+    pub uncertain: bool,
+    pub required_action: RequiredAction,
 }
 
 #[derive(Debug, Serialize)]
@@ -1639,5 +1758,75 @@ mod tests {
         assert!(help.contains("--password-stdin"));
         assert!(help.contains("real execution remains release-gated"));
         assert!(!help.contains("--password secret"));
+    }
+
+    #[test]
+    fn status_command_and_empty_json_contract_are_stable() {
+        let cli = Cli::try_parse_from(["vmcell", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status));
+
+        let report = StatusReport::new(
+            chrono::Utc::now(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["schema_version"], CLI_JSON_SCHEMA_VERSION);
+        assert_eq!(json["contract"], STATUS_CONTRACT);
+        assert_eq!(json["providers"], serde_json::json!([]));
+        assert_eq!(json["cells"], serde_json::json!([]));
+        assert_eq!(json["images"], serde_json::json!([]));
+        assert_eq!(json["operations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn status_image_contract_keeps_each_provider_variant_visible() {
+        let image = ImageRecord {
+            schema_version: 1,
+            id: "portable-dev".parse().unwrap(),
+            guest_os: GuestOs::Linux,
+            guest_arch: Architecture::X86_64,
+            variants: vec![
+                crate::core::image::ImageVariant {
+                    provider: "hyperv".to_owned(),
+                    disk_format: "vhdx".to_owned(),
+                    path: PathBuf::from("base.vhdx"),
+                    sha256: "a".repeat(64),
+                    file_size: 1,
+                },
+                crate::core::image::ImageVariant {
+                    provider: "qemu".to_owned(),
+                    disk_format: "qcow2".to_owned(),
+                    path: PathBuf::from("base.qcow2"),
+                    sha256: "b".repeat(64),
+                    file_size: 2,
+                },
+            ],
+            registered_at: chrono::Utc::now(),
+        };
+        let entry = StatusImageEntry {
+            image,
+            observations: vec![
+                StatusImageVariantObservation {
+                    provider: "hyperv".to_owned(),
+                    observation: StatusImageObservation::ProviderUnavailable {
+                        provider_status: ProviderProbeStatus::Unavailable,
+                    },
+                },
+                StatusImageVariantObservation {
+                    provider: "qemu".to_owned(),
+                    observation: StatusImageObservation::ProviderUnavailable {
+                        provider_status: ProviderProbeStatus::Unavailable,
+                    },
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(json["observations"][0]["provider"], "hyperv");
+        assert_eq!(json["observations"][1]["provider"], "qemu");
     }
 }

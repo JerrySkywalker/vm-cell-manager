@@ -134,6 +134,7 @@ Read-only discovery remains available:
 
 ```text
 vmcell doctor [--json]
+vmcell status [--json]
 vmcell provider list [--json]
 ```
 
@@ -141,6 +142,7 @@ The current `dev` candidate exposes:
 
 ```text
 vmcell doctor
+vmcell status
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows --provider hyperv
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
@@ -177,6 +179,13 @@ state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses
 PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM, WHPX, and
 HVF acceptance remain separate host gates.
+
+`vmcell status` is a read-only, provider-tolerant daily-use summary. It keeps
+durable cell/image/operation evidence visible when a provider is unavailable,
+derives expired/manual retention at one evaluation instant, marks
+transport-active guest operations as uncertain, and reports only
+non-authorizing cleanup or manual-review guidance. Existing `list`, `inspect`,
+`reconcile`, `operation`, and `doctor` human output uses the same vocabulary.
 
 Human `vmcell run` writes concise lifecycle and cleanup progress to stderr,
 forwards bounded guest stdout/stderr to their matching streams, and returns the
