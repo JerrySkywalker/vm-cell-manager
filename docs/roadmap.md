@@ -161,8 +161,8 @@ The package currently uses pre-1.0 versioning, but no official release tag is as
 
 # v0.1.0 — Windows Human MVP
 
-**Repository-local status:** implemented on `dev`; frozen release promotion and
-real Hyper-V/PowerShell Direct acceptance remain pending.
+**Repository-local status:** implemented and frozen on `release/v0.1.0`; real
+Hyper-V/PowerShell Direct acceptance and promotion to `main` remain pending.
 
 ## Product promise
 
