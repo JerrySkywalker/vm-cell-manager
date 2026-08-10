@@ -229,6 +229,13 @@ when resolution completed, safe recovery identifiers, and cleanup disposition,
 but never guest stream contents. `run --plan-only` exposes the same versioned
 plan without credentials or mutation. See [run selection](docs/run-selection.md).
 
+The canonical [native Linux QEMU/KVM/QGA walkthrough](docs/linux-kvm-qga.md)
+uses the same provider-neutral workflow for a prepared Linux x86_64 QCOW2
+guest. KVM admission distinguishes a missing device from one that the current
+identity cannot open read/write, repairs neither condition, and never falls
+back to TCG. Its exact-SHA preflight is non-authorizing; real KVM/QGA lifecycle
+acceptance remains pending and the support row stays `untested`.
+
 Before first use of a newer binary against an existing root, `vmcell state
 check` provides a read-only, provider-free durable compatibility preflight.
 The frozen v0.1 candidate and v0.2 share durable format version 1; compatible
@@ -378,6 +385,10 @@ The first milestones are intentionally incremental:
   and non-mutating acceptance preflight are implemented; real WHPX/QGA
   acceptance remains pending and the support row remains `untested`.
 - **M4 — Linux portability foundation:** Unix state/path/process and KVM capability foundations are merged; native Linux/KVM and macOS/HVF acceptance remains gated.
+- **v0.3 native Linux QEMU/KVM/QGA:** the repository-local Linux human workflow,
+  typed KVM admission, bounded Unix control endpoints, exact process/state
+  identity, [walkthrough](docs/linux-kvm-qga.md), and non-mutating acceptance
+  preflight are implemented; real KVM/QGA acceptance remains pending.
 - **M5 — automation hardening:** repository-local implementation is merged; stable JSON, deterministic failures, reconciliation, contention, retention, and automation CLI contracts are covered by cross-provider tests.
 
 Provider-specific capabilities such as TPM, Secure Boot, nested virtualization, GPU/device support, or additional native providers come only after the core lifecycle is stable.

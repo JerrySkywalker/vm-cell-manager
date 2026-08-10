@@ -47,6 +47,12 @@ launch-argument digest, QMP/QGA endpoints, and a process instance receipt.
 QMP lifecycle proves UUID and name immediately before a verb. A pid, process
 name, socket path, or QEMU name alone is never mutation authority.
 
+On Linux, KVM selection additionally requires an ordinary no-follow
+`/dev/kvm` character-device identity that the current effective identity can
+open read/write. The probe issues no ioctl and never repairs permissions,
+groups, or modules. Unix QMP/QGA paths are bounded before persistence, and a
+stale or foreign endpoint path blocks launch without deletion.
+
 QEMU is launched networkless (`-nic none`), paused, and without an interactive
 monitor, display, shell, or daemon mode. TCG requires durable explicit opt-in;
 failure to find the native accelerator is an error rather than an emulation

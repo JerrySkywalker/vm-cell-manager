@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $workflowPath = Join-Path $repositoryRoot '.github\workflows\linux-validation.yml'
 $gatePath = Join-Path $repositoryRoot 'tools\check-linux.sh'
+$preflightPath = Join-Path $repositoryRoot 'tools\linux-kvm-preflight.sh'
+$preflightTestPath = Join-Path $repositoryRoot 'tools\test-linux-kvm-preflight.sh'
 
 if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
   throw 'Linux validation workflow is missing'
@@ -10,9 +12,17 @@ if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $gatePath -PathType Leaf)) {
   throw 'Linux repository gate is missing'
 }
+if (-not (Test-Path -LiteralPath $preflightPath -PathType Leaf)) {
+  throw 'Linux KVM preflight harness is missing'
+}
+if (-not (Test-Path -LiteralPath $preflightTestPath -PathType Leaf)) {
+  throw 'Linux KVM preflight fixture test is missing'
+}
 
 $workflow = [IO.File]::ReadAllText($workflowPath)
 $gate = [IO.File]::ReadAllText($gatePath)
+$preflight = [IO.File]::ReadAllText($preflightPath)
+$preflightTest = [IO.File]::ReadAllText($preflightTestPath)
 
 function Assert-LinuxValidationContract {
   param(
@@ -39,6 +49,9 @@ function Assert-LinuxValidationContract {
     'locked Clippy gate' = 'cargo clippy --locked (?:--workspace )?--all-targets --all-features -- -D warnings'
     'locked test gate' = 'cargo test --locked (?:--workspace )?--all-targets --all-features'
     'locked doc-test gate' = 'cargo test --locked (?:--workspace )?--all-features --doc'
+    'Linux preflight syntax gate' = 'sh -n tools/linux-kvm-preflight\.sh'
+    'Linux preflight test syntax gate' = 'sh -n tools/test-linux-kvm-preflight\.sh'
+    'Linux preflight fixture gate' = 'sh tools/test-linux-kvm-preflight\.sh'
     'post-gate clean-tree proof' = 'git diff --exit-code'
     'no ignored checkout target proof' = 'test ! -e "\$GITHUB_WORKSPACE/target"'
   }
@@ -91,11 +104,65 @@ function Assert-LinuxValidationContract {
     '^cargo check --locked --workspace --all-targets --all-features$',
     '^cargo clippy --locked --workspace --all-targets --all-features -- -D warnings$',
     '^cargo test --locked --workspace --all-targets --all-features$',
-    '^cargo test --locked --workspace --all-features --doc$'
+    '^cargo test --locked --workspace --all-features --doc$',
+    '^sh -n tools/linux-kvm-preflight\.sh$',
+    '^sh -n tools/test-linux-kvm-preflight\.sh$',
+    '^sh tools/test-linux-kvm-preflight\.sh$'
   )
   foreach ($command in $gateCommands) {
     if (-not @($allowedGateCommands | Where-Object { $command -match $_ })) {
       throw "Linux repository gate contains an unapproved command: $command"
+    }
+  }
+}
+
+function Assert-LinuxPreflightContract {
+  param(
+    [Parameter(Mandatory)] [string] $Preflight,
+    [Parameter(Mandatory)] [string] $FixtureTest
+  )
+
+  $required = [ordered]@{
+    'non-authorizing receipt' = '''  "authorizing": false,'''
+    'no-mutation receipt' = '''  "mutation_performed": false,'''
+    'no real acceptance receipt' = '''  "real_platform_acceptance": false,'''
+    'conservative support status' = '''    "support_status": "untested"'''
+    'read-only KVM open' = 'exec 9<>/dev/kvm'
+    'QEMU version probe' = '"\$qemu_system_path" --version'
+    'QEMU accelerator probe' = '"\$qemu_system_path" -accel help'
+    'qemu-img version probe' = '"\$qemu_img_path" --version'
+    'qemu-img info probe' = '"\$qemu_img_path" info --output=json "\$base_path"'
+    'fixture-only test mode' = '--fixture-evidence "\$fixture"'
+  }
+  $combined = "$Preflight`n$FixtureTest"
+  foreach ($entry in $required.GetEnumerator()) {
+    if ($combined -notmatch $entry.Value) {
+      throw "Linux KVM preflight contract lacks $($entry.Key)"
+    }
+  }
+
+  if (@([regex]::Matches($Preflight, '\$\("\$qemu_system_path"')).Count -ne 2 -or
+      @([regex]::Matches($Preflight, '\$\("\$qemu_img_path"')).Count -ne 2) {
+    throw 'Linux KVM preflight may invoke each QEMU tool only through its two declared read-only probes'
+  }
+  if ($FixtureTest -match '--qemu-system|--qemu-img') {
+    throw 'Linux KVM preflight repository test must use fixture evidence only'
+  }
+  if (@([regex]::Matches($Preflight, '<>/dev/kvm')).Count -ne 1) {
+    throw 'Linux KVM preflight must contain exactly one read-write no-ioctl KVM open'
+  }
+
+  $forbidden = [ordered]@{
+    'privileged command' = '(?m)^\s*(?:sudo|su)\s+'
+    'host package mutation' = '(?m)^\s*(?:apt|apt-get|dnf|yum|pacman|zypper)\s+'
+    'KVM repair or mutation' = '(?i)\b(?:chmod|chown|chgrp|setfacl|rm|mv|mknod)\b[^\r\n]*/dev/kvm\b|(?<!<)(?:>|>>)\s*/dev/kvm\b'
+    'kernel module mutation' = '(?im)^\s*(?:modprobe|insmod|rmmod)\s+'
+    'QEMU lifecycle option' = '(?i)"\$qemu_system_path"\s+(?:-S|-machine|-drive|-qmp|-chardev|-device|-daemonize)\b'
+    'vmcell lifecycle' = '(?i)\bvmcell\s+(?:run|exec|copy-in|copy-out|destroy|gc)\b'
+  }
+  foreach ($entry in $forbidden.GetEnumerator()) {
+    if ($combined -match $entry.Value) {
+      throw "Linux KVM preflight contains forbidden $($entry.Key)"
     }
   }
 }
@@ -115,7 +182,40 @@ function Assert-RejectedMutation {
   throw "Linux validation negative regression was accepted: $Name"
 }
 
+function Assert-RejectedPreflightMutation {
+  param(
+    [Parameter(Mandatory)] [string] $Name,
+    [Parameter(Mandatory)] [string] $Preflight,
+    [Parameter(Mandatory)] [string] $FixtureTest
+  )
+
+  try {
+    Assert-LinuxPreflightContract -Preflight $Preflight -FixtureTest $FixtureTest
+  } catch {
+    return
+  }
+  throw "Linux KVM preflight negative regression was accepted: $Name"
+}
+
 Assert-LinuxValidationContract -Workflow $workflow -Gate $gate
+Assert-LinuxPreflightContract -Preflight $preflight -FixtureTest $preflightTest
+
+Assert-RejectedPreflightMutation -Name 'privileged command' `
+  -Preflight "$preflight`nsudo true" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'host package mutation' `
+  -Preflight "$preflight`napt-get install qemu" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'KVM permission repair' `
+  -Preflight "$preflight`nchmod 0666 /dev/kvm" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'kernel module mutation' `
+  -Preflight "$preflight`nmodprobe kvm" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'QEMU lifecycle' `
+  -Preflight "$preflight`n`"`$qemu_system_path`" -S" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'vmcell lifecycle' `
+  -Preflight "$preflight`nvmcell run --image test -- true" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'second KVM open' `
+  -Preflight "$preflight`nexec 8<>/dev/kvm" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'live fixture test invocation' `
+  -Preflight $preflight -FixtureTest "$preflightTest`n--qemu-system /usr/bin/qemu-system-x86_64"
 
 Assert-RejectedMutation -Name 'automatic push' `
   -Workflow ($workflow -replace '  workflow_dispatch:', '  push: {}') -Gate $gate

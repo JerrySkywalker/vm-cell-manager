@@ -681,6 +681,19 @@ mod tests {
             include_str!("../../docs/support-matrix.md"),
             render_support_matrix_markdown()
         );
+        let linux_kvm_qga = SupportKey {
+            host_os: HostOs::Linux,
+            host_architecture: Architecture::X86_64,
+            provider: ProviderId::Qemu,
+            accelerator: Accelerator::Kvm,
+            guest_os: GuestOs::Linux,
+            guest_architecture: Architecture::X86_64,
+            guest_transport: GuestTransportId::Qga,
+        };
+        assert_eq!(
+            support_for(&linux_kvm_qga).map(|entry| entry.status),
+            Ok(SupportStatus::Untested)
+        );
     }
 
     #[test]

@@ -25,6 +25,58 @@ const QEMU_CONFIG_SCHEMA: u32 = 1;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: usize = 1024 * 1024;
+#[cfg(unix)]
+const UNIX_CONTROL_ENDPOINT_LIMIT: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvmDeviceStatus {
+    #[cfg(not(target_os = "linux"))]
+    NotApplicable,
+    #[cfg(any(target_os = "linux", test))]
+    Usable,
+    #[cfg(any(target_os = "linux", test))]
+    Missing,
+    #[cfg(any(target_os = "linux", test))]
+    PermissionDenied,
+    #[cfg(any(target_os = "linux", test))]
+    NotCharacterDevice,
+    #[cfg(any(target_os = "linux", test))]
+    IdentityChanged,
+    #[cfg(any(target_os = "linux", test))]
+    Unavailable,
+}
+
+impl KvmDeviceStatus {
+    fn usable(self) -> bool {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::NotApplicable => true,
+            #[cfg(any(target_os = "linux", test))]
+            Self::Usable => true,
+            #[cfg(any(target_os = "linux", test))]
+            _ => false,
+        }
+    }
+
+    fn diagnostic(self) -> &'static str {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::NotApplicable => "not applicable on this host",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Usable => "read-write usable by the current identity",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Missing => "/dev/kvm is missing",
+            #[cfg(any(target_os = "linux", test))]
+            Self::PermissionDenied => "/dev/kvm is not read-write usable by the current identity",
+            #[cfg(any(target_os = "linux", test))]
+            Self::NotCharacterDevice => "/dev/kvm is not an ordinary character device",
+            #[cfg(any(target_os = "linux", test))]
+            Self::IdentityChanged => "/dev/kvm identity changed while it was opened",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Unavailable => "/dev/kvm could not be opened read-write",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QemuCommandOutput {
@@ -227,7 +279,9 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
         }
     }
 
-    fn accelerators(&self) -> Result<Vec<String>, ProviderError> {
+    fn accelerator_inventory(
+        &self,
+    ) -> Result<(Vec<String>, Option<KvmDeviceStatus>, bool), ProviderError> {
         let output = self.run_checked(
             &self.system_binary,
             &[OsString::from("-accel"), OsString::from("help")],
@@ -241,7 +295,18 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             .filter(|line| matches!(*line, "whpx" | "kvm" | "hvf" | "tcg"))
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        Ok(filter_usable_accelerators(compiled, kvm_device_usable()))
+        let kvm_advertised = compiled.iter().any(|value| value == "kvm");
+        let kvm_status = kvm_advertised.then(kvm_device_status);
+        Ok((
+            filter_usable_accelerators(compiled, kvm_status.is_none_or(KvmDeviceStatus::usable)),
+            kvm_status,
+            kvm_advertised,
+        ))
+    }
+
+    fn accelerators(&self) -> Result<Vec<String>, ProviderError> {
+        self.accelerator_inventory()
+            .map(|(accelerators, _, _)| accelerators)
     }
 
     fn select_accelerator(&self, request: &CreateVmRequest) -> Result<String, ProviderError> {
@@ -514,8 +579,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 capabilities: ProviderCapabilities::unavailable(),
             };
         }
-        let accelerators = match self.accelerators() {
-            Ok(accelerators) => accelerators,
+        let (accelerators, kvm_status, kvm_advertised) = match self.accelerator_inventory() {
+            Ok(inventory) => inventory,
             Err(_) => {
                 return ProviderProbe {
                     name: "qemu",
@@ -529,9 +594,18 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let hardware = host_accelerator();
         let hardware_available = accelerators.iter().any(|value| value == hardware);
         let native_accelerator = if hardware_available {
-            "available"
+            "available".to_owned()
+        } else if hardware == "kvm" && kvm_advertised {
+            format!(
+                "unavailable ({})",
+                kvm_status
+                    .expect("advertised KVM always has a device admission result")
+                    .diagnostic()
+            )
+        } else if hardware == "kvm" {
+            "unavailable (QEMU did not advertise KVM)".to_owned()
         } else {
-            "unavailable"
+            "unavailable".to_owned()
         };
         ProviderProbe {
             name: "qemu",
@@ -718,6 +792,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ));
         }
         if expected.power_state == ProviderPowerState::Off {
+            ensure_control_endpoints_absent(&config)?;
             config.spawn_pending = true;
             replace_config(&path, &config)?;
             let args = launch_args(&config);
@@ -884,6 +959,8 @@ impl QemuVmConfig {
             || !qemu_argument_path_is_safe(&self.configuration_path)
             || !qemu_argument_path_is_safe(&self.overlay_path)
             || !qemu_argument_path_is_safe(&self.parent_path)
+            || !control_endpoint_is_safe(&self.qmp)
+            || !control_endpoint_is_safe(&self.qga)
             || self.command_sha256 != launch_digest(self)
             || self.process_id.is_some() != self.process_start_token.is_some()
             || self.process_id.is_some() != self.process_executable_sha256.is_some()
@@ -1199,6 +1276,54 @@ fn qemu_argument_path_is_safe(path: &Path) -> bool {
     })
 }
 
+fn control_endpoint_is_safe(endpoint: &ControlEndpoint) -> bool {
+    match endpoint {
+        ControlEndpoint::Unix(path) => unix_control_endpoint_is_safe(path),
+        ControlEndpoint::WindowsPipe(value) => {
+            value.starts_with(r"\\.\pipe\vmcell-")
+                && value.len() <= 256
+                && !value.chars().any(char::is_control)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_control_endpoint_is_safe(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    qemu_argument_path_is_safe(path)
+        && !path.as_os_str().as_bytes().is_empty()
+        && path.as_os_str().as_bytes().len() <= UNIX_CONTROL_ENDPOINT_LIMIT
+}
+
+#[cfg(not(unix))]
+fn unix_control_endpoint_is_safe(path: &Path) -> bool {
+    qemu_argument_path_is_safe(path)
+}
+
+fn ensure_control_endpoints_absent(config: &QemuVmConfig) -> Result<(), ProviderError> {
+    for endpoint in [&config.qmp, &config.qga] {
+        let ControlEndpoint::Unix(path) = endpoint else {
+            continue;
+        };
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU control endpoint path already exists; stale or foreign state requires manual review"
+                        .to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU control endpoint absence could not be proven".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn remaining_provider_duration(deadline: std::time::Instant) -> Result<Duration, ProviderError> {
     deadline
         .checked_duration_since(std::time::Instant::now())
@@ -1413,17 +1538,55 @@ fn filter_usable_accelerators(values: Vec<String>, kvm_usable: bool) -> Vec<Stri
 }
 
 #[cfg(target_os = "linux")]
-fn kvm_device_usable() -> bool {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
+fn kvm_device_status() -> KvmDeviceStatus {
+    probe_kvm_device(Path::new("/dev/kvm"))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn kvm_device_usable() -> bool {
-    true
+fn kvm_device_status() -> KvmDeviceStatus {
+    KvmDeviceStatus::NotApplicable
+}
+
+#[cfg(target_os = "linux")]
+fn probe_kvm_device(path: &Path) -> KvmDeviceStatus {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return classify_kvm_error(error.kind()),
+    };
+    if before.file_type().is_symlink() || !before.file_type().is_char_device() {
+        return KvmDeviceStatus::NotCharacterDevice;
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => return classify_kvm_error(error.kind()),
+    };
+    let after = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return KvmDeviceStatus::Unavailable,
+    };
+    if !after.file_type().is_char_device()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+    {
+        return KvmDeviceStatus::IdentityChanged;
+    }
+    KvmDeviceStatus::Usable
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_kvm_error(kind: std::io::ErrorKind) -> KvmDeviceStatus {
+    match kind {
+        std::io::ErrorKind::NotFound => KvmDeviceStatus::Missing,
+        std::io::ErrorKind::PermissionDenied => KvmDeviceStatus::PermissionDenied,
+        _ => KvmDeviceStatus::Unavailable,
+    }
 }
 
 #[cfg(unix)]
@@ -1874,7 +2037,7 @@ mod tests {
             probe.capabilities.schema_version,
             crate::core::automation::AUTOMATION_SCHEMA_VERSION
         );
-        let hardware_expected = host_accelerator() != "kvm" || kvm_device_usable();
+        let hardware_expected = host_accelerator() != "kvm" || kvm_device_status().usable();
         assert_eq!(probe.capabilities.hardware_acceleration, hardware_expected);
         assert!(probe.capabilities.accelerators.contains(&"tcg".to_owned()));
         assert_eq!(probe.capabilities.guest_transports, ["qga"]);
@@ -1986,6 +2149,103 @@ mod tests {
             ),
             vec!["kvm", "tcg"]
         );
+    }
+
+    #[test]
+    fn kvm_open_errors_have_stable_admission_diagnostics() {
+        assert_eq!(
+            classify_kvm_error(std::io::ErrorKind::NotFound),
+            KvmDeviceStatus::Missing
+        );
+        assert_eq!(
+            classify_kvm_error(std::io::ErrorKind::PermissionDenied),
+            KvmDeviceStatus::PermissionDenied
+        );
+        assert_eq!(
+            classify_kvm_error(std::io::ErrorKind::Other),
+            KvmDeviceStatus::Unavailable
+        );
+        assert_eq!(
+            KvmDeviceStatus::PermissionDenied.diagnostic(),
+            "/dev/kvm is not read-write usable by the current identity"
+        );
+        assert!(KvmDeviceStatus::Usable.usable());
+        assert_eq!(
+            KvmDeviceStatus::IdentityChanged.diagnostic(),
+            "/dev/kvm identity changed while it was opened"
+        );
+        assert_eq!(
+            KvmDeviceStatus::NotCharacterDevice.diagnostic(),
+            "/dev/kvm is not an ordinary character device"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kvm_probe_rejects_missing_non_device_and_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-kvm");
+        assert_eq!(probe_kvm_device(&missing), KvmDeviceStatus::Missing);
+
+        let ordinary = directory.path().join("ordinary-kvm");
+        fs::write(&ordinary, b"not a device").unwrap();
+        assert_eq!(
+            probe_kvm_device(&ordinary),
+            KvmDeviceStatus::NotCharacterDevice
+        );
+
+        let linked = directory.path().join("linked-kvm");
+        symlink(&ordinary, &linked).unwrap();
+        assert_eq!(
+            probe_kvm_device(&linked),
+            KvmDeviceStatus::NotCharacterDevice
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_control_endpoint_paths_are_bounded_and_collisions_are_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let qemu = directory.path().join("qemu");
+        fs::create_dir(&qemu).unwrap();
+        let id = Uuid::nil().to_string();
+        let mut config = QemuVmConfig {
+            schema_version: QEMU_CONFIG_SCHEMA,
+            id: id.clone(),
+            name: format!("vmcell-{id}"),
+            ownership_marker: "marker".to_owned(),
+            configuration_path: qemu.clone(),
+            overlay_path: directory.path().join("cell.qcow2"),
+            parent_path: directory.path().join("base.qcow2"),
+            cpu_count: 2,
+            memory_mib: 1024,
+            accelerator: "kvm".to_owned(),
+            qmp: ControlEndpoint::qmp(&qemu, &id),
+            qga: ControlEndpoint::qga(&qemu, &id),
+            command_sha256: String::new(),
+            spawn_pending: false,
+            process_id: None,
+            process_start_token: None,
+            process_executable_sha256: None,
+        };
+        config.command_sha256 = launch_digest(&config);
+        assert!(control_endpoint_is_safe(&config.qmp));
+        assert!(ensure_control_endpoints_absent(&config).is_ok());
+
+        let ControlEndpoint::Unix(qmp_path) = &config.qmp else {
+            unreachable!();
+        };
+        fs::write(qmp_path, b"stale").unwrap();
+        assert!(matches!(
+            ensure_control_endpoints_absent(&config),
+            Err(ProviderError::OwnershipChanged(message))
+                if message.contains("stale or foreign state")
+        ));
+
+        let long_path = PathBuf::from("x".repeat(UNIX_CONTROL_ENDPOINT_LIMIT + 1));
+        assert!(!control_endpoint_is_safe(&ControlEndpoint::Unix(long_path)));
     }
 
     #[test]
