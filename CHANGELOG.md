@@ -6,6 +6,8 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Completed the repository-local v0.2 Windows Daily Driver documentation with
+  one canonical install-to-upgrade workflow and explicit real-platform gates.
 - Bumped the repository-local candidate identity to `0.2.0` and extended the
   deterministic Windows archive with generated PowerShell completion,
   candidate-only Scoop/WinGet metadata, and bounded install, state-preflight,

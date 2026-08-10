@@ -161,8 +161,8 @@ The package currently uses pre-1.0 versioning, but no official release tag is as
 
 # v0.1.0 — Windows Human MVP
 
-**Repository-local status:** implemented on `dev`; frozen release promotion and
-real Hyper-V/PowerShell Direct acceptance remain pending.
+**Repository-local status:** implemented and frozen on `release/v0.1.0`; real
+Hyper-V/PowerShell Direct acceptance and promotion to `main` remain pending.
 
 ## Product promise
 
@@ -312,11 +312,17 @@ A new user with the documented Windows host and prepared VHDX can install the pu
 
 # v0.2.0 — Windows Daily Driver
 
+**Repository-local status:** complete on `dev`; real Windows acceptance,
+release promotion, and an immutable version tag remain pending.
+
 ## Product promise
 
 > A Windows developer can use vmcell repeatedly as a normal local development tool, not merely as a successful demo.
 
-`v0.1.0` proves the product works. `v0.2.0` makes it comfortable enough to keep installed and use repeatedly.
+The frozen `v0.1.0` candidate targets proof of one accepted end-to-end Windows
+workflow. The v0.2 repository candidate adds the ergonomics needed for repeated
+daily use. Neither candidate is a public release until its declared external
+acceptance and promotion gates pass.
 
 ## Required user-facing capabilities
 
@@ -422,7 +428,11 @@ manager submission is created by this milestone.
 
 ## Release gates
 
-The `v0.1` Windows release path remains accepted, plus real acceptance focused on repeated operation, interruption/recovery, retained cells, state upgrade compatibility, interactive/session behavior, and image lifecycle operations.
+The frozen `v0.1` Windows candidate remains the first real-platform admission
+baseline. v0.2 release acceptance additionally focuses on repeated operation,
+interruption/recovery, retained cells, state compatibility, interactive/session
+behavior, and image lifecycle operations. Neither release has real-platform
+acceptance merely because repository-local v0.2 implementation is complete.
 
 ## Human-visible completion criterion
 
@@ -883,4 +893,7 @@ v0.9  1.0 Contract Candidate
 v1.0  Stable Execution Cell Runtime
 ```
 
-The next active product milestone is **v0.1.0 — Windows Human MVP**.
+Repository-local v0.2 Windows Daily Driver implementation is complete on
+`dev`. The next repository-development milestone is **v0.3.0 — Cross-Platform
+Human MVP**. Public release advancement remains separately blocked on the
+dedicated Windows acceptance path, beginning with the frozen v0.1 candidate.
