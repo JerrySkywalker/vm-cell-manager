@@ -344,6 +344,12 @@ Users should be able to answer:
 
 This should evolve existing `doctor`, `list`, `inspect`, `operation`, and `reconcile` surfaces where possible rather than multiplying commands unnecessarily.
 
+**Repository-local implementation:** `vmcell status` now provides one
+schema-versioned read-only aggregate while the existing human surfaces use the
+same state, phase, retention, reconciliation, required-action, and uncertainty
+vocabulary. Provider unavailability preserves local evidence and forces manual
+review instead of aborting the whole summary or claiming cleanup authority.
+
 ### Better image lifecycle UX
 
 Cover the normal lifecycle of locally supplied images:

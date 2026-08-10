@@ -15,6 +15,7 @@ echoed. Help and version output remain human-readable discovery surfaces.
 
 ```text
 vmcell doctor
+vmcell status
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows [--provider hyperv]
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
@@ -85,6 +86,18 @@ The shared provider boundary derives `available` from typed `status` and the
 versioned full-system/COW lifecycle capability minimum. Contradictory ready
 responses fail closed as `probe_failed`, and non-ready responses expose no
 positive capabilities.
+
+`status --json` returns `contract: "vmcell.status.v1"`, one `evaluated_at`
+instant, and deterministic provider, cell, image, and guest-operation arrays.
+It is read-only and provider tolerant: unavailable providers preserve durable
+local records while their observations become `provider_unavailable`; they are
+never reported as exact-owned or safe to mutate. Cell entries derive retention
+(`manual`, `active_until_expiry`, `expired`, or `none`), pending and uncertain
+operation counts, and non-authorizing cleanup guidance. A
+`transport_active` guest operation is uncertain and requires `manual_review`;
+status never replays or reconciles it. Image validation is attempted only when
+the recorded provider probe is ready, otherwise the durable image remains
+visible with typed provider status.
 
 ```json
 {

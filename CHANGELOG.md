@@ -6,6 +6,10 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Added a schema-versioned, read-only `vmcell status` aggregate and concise
+  doctor/list/inspect/reconcile/operation diagnostics for provider availability,
+  cell retention/expiry, uncertain guest operations, and fail-closed cleanup
+  guidance.
 - Deterministic portable Windows ZIP/checksum packaging with schema-versioned
   build provenance, install/remove instructions, repeat-build verification,
   and a manual trusted-runner artifact workflow.
