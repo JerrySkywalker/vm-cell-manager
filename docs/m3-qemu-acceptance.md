@@ -3,6 +3,10 @@
 Repository-local tests and fake QMP/QGA peers prove protocol and ownership
 logic; they do not constitute real QEMU acceptance.
 
+The Windows-specific operator sequence and non-mutating receipt preflight are
+documented in [Windows QEMU/WHPX Human MVP](windows-qemu-whpx.md). The generated
+preflight is evidence input only; it does not authorize the real transaction.
+
 ## Admission
 
 Real-provider mutation is allowed only in an explicitly isolated context with:
@@ -62,6 +66,8 @@ may require operator cleanup inside the disposable cell.
 - accelerator discovery and explicit-TCG negative/positive tests;
 - QCOW2 no-backing base and exactly-one-overlay chain tests;
 - launch digest, `-nic none`, UUID/name, and process-receipt drift tests;
+- canonical executable identity and executable-content hash binding on Windows;
+- non-mutating Windows WHPX preflight fixture and receipt-contract tests;
 - crash/retry tests for intent, overlay, definition, spawn, handshake, start,
   stop, runtime deletion, and tombstone boundaries;
 - Windows and Linux process-tree timeout coverage;

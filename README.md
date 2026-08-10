@@ -373,6 +373,10 @@ The first milestones are intentionally incremental:
 - **M1 — Hyper-V cell foundation:** repository-local implementation is merged; real Hyper-V acceptance remains gated.
 - **M2 — Windows guest control:** repository-local implementation is merged; real PowerShell Direct guest acceptance remains gated.
 - **M3 — QEMU provider:** repository-local QMP lifecycle, QCOW2 overlay, and QGA contracts are merged; real QEMU/WHPX/KVM/HVF acceptance remains gated.
+- **v0.3 Windows QEMU/WHPX:** the repository-local Linux QCOW2 + QGA path,
+  executable/process identity hardening, [human walkthrough](docs/windows-qemu-whpx.md),
+  and non-mutating acceptance preflight are implemented; real WHPX/QGA
+  acceptance remains pending and the support row remains `untested`.
 - **M4 — Linux portability foundation:** Unix state/path/process and KVM capability foundations are merged; native Linux/KVM and macOS/HVF acceptance remains gated.
 - **M5 — automation hardening:** repository-local implementation is merged; stable JSON, deterministic failures, reconciliation, contention, retention, and automation CLI contracts are covered by cross-provider tests.
 

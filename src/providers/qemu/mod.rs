@@ -33,10 +33,11 @@ pub struct QemuCommandOutput {
     pub stderr: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QemuSpawnReceipt {
     pub process_id: u32,
     pub process_start_token: u64,
+    pub executable_sha256: String,
 }
 
 pub trait QemuCommandExecutor: Send + Sync {
@@ -60,6 +61,7 @@ pub trait QemuCommandExecutor: Send + Sync {
         start_token: u64,
         program: &OsStr,
         command_sha256: &str,
+        executable_sha256: &str,
     ) -> bool;
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool;
@@ -97,6 +99,7 @@ impl QemuCommandExecutor for SystemQemuExecutor {
         program: &OsStr,
         args: &[OsString],
     ) -> Result<QemuSpawnReceipt, ProviderError> {
+        let executable_sha256 = ordinary_file_sha256(Path::new(program))?;
         let mut command = Command::new(program);
         command
             .args(args)
@@ -116,10 +119,25 @@ impl QemuCommandExecutor for SystemQemuExecutor {
                 "QEMU process start identity was unavailable".to_owned(),
             ));
         };
+        if !process_matches(
+            process_id,
+            process_start_token,
+            program,
+            &argument_digest(args),
+            &executable_sha256,
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProviderError::OwnershipChanged(
+                "spawned QEMU process identity did not match its executable and start instance"
+                    .to_owned(),
+            ));
+        }
         drop(child);
         Ok(QemuSpawnReceipt {
             process_id,
             process_start_token,
+            executable_sha256,
         })
     }
 
@@ -129,8 +147,15 @@ impl QemuCommandExecutor for SystemQemuExecutor {
         start_token: u64,
         program: &OsStr,
         command_sha256: &str,
+        executable_sha256: &str,
     ) -> bool {
-        process_matches(process_id, start_token, program, command_sha256)
+        process_matches(
+            process_id,
+            start_token,
+            program,
+            command_sha256,
+            executable_sha256,
+        )
     }
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool {
@@ -287,6 +312,7 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             .connect_qmp(&config.qmp, Duration::from_millis(100));
         let power_state = match qmp {
             Ok(stream) => {
+                self.validate_live_process_receipt(config)?;
                 let mut qmp =
                     QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
                 validate_qmp_identity(&mut qmp, config)?;
@@ -315,6 +341,7 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
                         token,
                         &self.system_binary,
                         &config.command_sha256,
+                        config.process_executable_sha256.as_deref().unwrap_or(""),
                     ) {
                         return Err(ProviderError::OwnershipChanged(
                             "recorded QEMU process is alive but its QMP identity is unavailable"
@@ -331,6 +358,42 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             }
         };
         Ok(config.snapshot(power_state))
+    }
+
+    fn validate_live_process_receipt(
+        &self,
+        config: &QemuVmConfig,
+    ) -> Result<(u32, u64), ProviderError> {
+        if config.spawn_pending {
+            return Err(ProviderError::OwnershipChanged(
+                "QEMU launch intent has no durable process receipt".to_owned(),
+            ));
+        }
+        let (process_id, process_start_token) = config
+            .process_id
+            .zip(config.process_start_token)
+            .ok_or_else(|| {
+            ProviderError::OwnershipChanged(
+                "QEMU control requires a durable process receipt".to_owned(),
+            )
+        })?;
+        let executable_sha256 = config.process_executable_sha256.as_deref().ok_or_else(|| {
+            ProviderError::OwnershipChanged(
+                "QEMU control requires a durable executable receipt".to_owned(),
+            )
+        })?;
+        if !self.executor.process_matches(
+            process_id,
+            process_start_token,
+            &self.system_binary,
+            &config.command_sha256,
+            executable_sha256,
+        ) {
+            return Err(ProviderError::OwnershipChanged(
+                "QEMU process identity drifted from its durable receipt".to_owned(),
+            ));
+        }
+        Ok((process_id, process_start_token))
     }
 
     fn validate_overlay_chain(&self, config: &QemuVmConfig) -> Result<(), ProviderError> {
@@ -396,6 +459,16 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 capabilities: ProviderCapabilities::unavailable(),
             };
         }
+        let Some(version_line) = probe_version_line(&version.stdout, "QEMU emulator version")
+        else {
+            return ProviderProbe {
+                name: "qemu",
+                status: ProviderProbeStatus::ProbeFailed,
+                available: false,
+                detail: "QEMU system version output was invalid".to_owned(),
+                capabilities: ProviderCapabilities::unavailable(),
+            };
+        };
         let image_version = self.executor.run(
             &self.image_binary,
             &[OsString::from("--version")],
@@ -432,6 +505,15 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 capabilities: ProviderCapabilities::unavailable(),
             };
         }
+        if probe_version_line(&image_version.stdout, "qemu-img version").is_none() {
+            return ProviderProbe {
+                name: "qemu",
+                status: ProviderProbeStatus::ProbeFailed,
+                available: false,
+                detail: "QEMU image version output was invalid".to_owned(),
+                capabilities: ProviderCapabilities::unavailable(),
+            };
+        }
         let accelerators = match self.accelerators() {
             Ok(accelerators) => accelerators,
             Err(_) => {
@@ -446,16 +528,16 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         };
         let hardware = host_accelerator();
         let hardware_available = accelerators.iter().any(|value| value == hardware);
-        let version_line = std::str::from_utf8(&version.stdout)
-            .ok()
-            .and_then(|text| text.lines().next())
-            .unwrap_or("QEMU detected")
-            .to_owned();
+        let native_accelerator = if hardware_available {
+            "available"
+        } else {
+            "unavailable"
+        };
         ProviderProbe {
             name: "qemu",
             status: ProviderProbeStatus::Ready,
             available: true,
-            detail: version_line,
+            detail: format!("{version_line}; native accelerator {hardware} {native_accelerator}"),
             capabilities: ProviderCapabilities {
                 schema_version: crate::core::automation::AUTOMATION_SCHEMA_VERSION,
                 full_system_vm: true,
@@ -565,6 +647,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             spawn_pending: false,
             process_id: None,
             process_start_token: None,
+            process_executable_sha256: None,
         };
         config.command_sha256 = launch_digest(&config);
         write_config_new(&config_path, &config)?;
@@ -641,6 +724,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             let receipt = self.executor.spawn_vm(&self.system_binary, &args)?;
             config.process_id = Some(receipt.process_id);
             config.process_start_token = Some(receipt.process_start_token);
+            config.process_executable_sha256 = Some(receipt.executable_sha256);
             config.spawn_pending = false;
             replace_config(&path, &config)?;
         } else if expected.power_state != ProviderPowerState::Paused {
@@ -648,6 +732,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 "QEMU start expected an off or prelaunch VM".to_owned(),
             ));
         }
+        self.validate_live_process_receipt(&config)?;
         let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
         let mut qmp = QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
@@ -672,14 +757,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let mut config = read_config(&path)?;
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
-        let (process_id, process_start_token) = config
-            .process_id
-            .zip(config.process_start_token)
-            .ok_or_else(|| {
-            ProviderError::OwnershipChanged(
-                "QEMU stop requires a durable process receipt".to_owned(),
-            )
-        })?;
+        let (process_id, process_start_token) = self.validate_live_process_receipt(&config)?;
         let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
         let mut qmp = QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
@@ -698,6 +776,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             {
                 config.process_id = None;
                 config.process_start_token = None;
+                config.process_executable_sha256 = None;
                 config.spawn_pending = false;
                 replace_config(&path, &config)?;
                 return Ok(());
@@ -744,6 +823,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 token,
                 &self.system_binary,
                 &config.command_sha256,
+                config.process_executable_sha256.as_deref().unwrap_or(""),
             ) {
                 return Err(ProviderError::OwnershipChanged(
                     "QEMU process is still live".to_owned(),
@@ -785,6 +865,8 @@ struct QemuVmConfig {
     spawn_pending: bool,
     process_id: Option<u32>,
     process_start_token: Option<u64>,
+    #[serde(default)]
+    process_executable_sha256: Option<String>,
 }
 
 impl QemuVmConfig {
@@ -804,7 +886,14 @@ impl QemuVmConfig {
             || !qemu_argument_path_is_safe(&self.parent_path)
             || self.command_sha256 != launch_digest(self)
             || self.process_id.is_some() != self.process_start_token.is_some()
+            || self.process_id.is_some() != self.process_executable_sha256.is_some()
             || self.process_start_token == Some(0)
+            || self
+                .process_executable_sha256
+                .as_ref()
+                .is_some_and(|value| {
+                    value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
         {
             return Err(ProviderError::InvalidResponse(
                 "QEMU configuration invariants failed".to_owned(),
@@ -1217,8 +1306,70 @@ fn argument_digest(args: &[OsString]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+fn ordinary_file_sha256(path: &Path) -> Result<String, ProviderError> {
+    let requested_metadata = fs::symlink_metadata(path).map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable identity was unavailable".to_owned())
+    })?;
+    if !metadata_is_ordinary_file(&requested_metadata) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU executable is not an ordinary file".to_owned(),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable path could not be resolved".to_owned())
+    })?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable identity was unavailable".to_owned())
+    })?;
+    if !metadata_is_ordinary_file(&metadata) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU executable is not an ordinary file".to_owned(),
+        ));
+    }
+    let mut file = File::open(&canonical).map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable could not be pinned".to_owned())
+    })?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| {
+            ProviderError::OwnershipChanged("QEMU executable could not be hashed".to_owned())
+        })?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn metadata_is_ordinary_file(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn redacted_command_failure() -> String {
     "QEMU command exited unsuccessfully".to_owned()
+}
+
+fn probe_version_line(bytes: &[u8], expected_prefix: &str) -> Option<String> {
+    let line = std::str::from_utf8(bytes).ok()?.lines().next()?.trim();
+    (!line.is_empty()
+        && line.len() <= 256
+        && line.starts_with(expected_prefix)
+        && !line.chars().any(char::is_control))
+    .then(|| line.to_owned())
 }
 
 fn process_error_to_provider(error: ProcessError) -> ProviderError {
@@ -1303,7 +1454,53 @@ fn resolve_executable(name: OsString) -> OsString {
         .unwrap_or(name)
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn resolve_executable(name: OsString) -> OsString {
+    let search_paths = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    resolve_windows_executable(&name, &search_paths).unwrap_or(name)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_executable(name: &OsStr, search_paths: &[PathBuf]) -> Option<OsString> {
+    let requested = PathBuf::from(name);
+    let candidates = if requested.components().count() > 1 {
+        vec![requested]
+    } else {
+        search_paths
+            .iter()
+            .map(|directory| directory.join(&requested))
+            .collect::<Vec<_>>()
+    };
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            if candidate.extension().is_none() {
+                candidate.with_extension("exe")
+            } else {
+                candidate
+            }
+        })
+        .filter(|candidate| {
+            candidate
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        })
+        .find_map(|candidate| {
+            fs::symlink_metadata(&candidate)
+                .ok()
+                .filter(metadata_is_ordinary_file)?;
+            let canonical = candidate.canonicalize().ok()?;
+            fs::symlink_metadata(&canonical)
+                .ok()
+                .filter(metadata_is_ordinary_file)?;
+            Some(canonical)
+        })
+        .map(PathBuf::into_os_string)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn resolve_executable(name: OsString) -> OsString {
     name
 }
@@ -1367,6 +1564,7 @@ fn process_matches(
     start_token: u64,
     program: &OsStr,
     command_sha256: &str,
+    executable_sha256: &str,
 ) -> bool {
     use std::os::unix::ffi::OsStringExt;
 
@@ -1384,6 +1582,9 @@ fn process_matches(
         executable.file_name() == expected_program.file_name()
     };
     if !executable_matches {
+        return false;
+    }
+    if ordinary_file_sha256(&executable).ok().as_deref() != Some(executable_sha256) {
         return false;
     }
     let command_line = match fs::read(format!("/proc/{process_id}/cmdline")) {
@@ -1418,6 +1619,7 @@ fn process_matches(
     start_token: u64,
     program: &OsStr,
     command_sha256: &str,
+    executable_sha256: &str,
 ) -> bool {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
@@ -1447,7 +1649,7 @@ fn process_matches(
         buffer.truncate(length as usize);
         let actual = PathBuf::from(OsString::from_wide(&buffer));
         let expected = Path::new(program);
-        if expected.is_absolute() {
+        let path_matches = if expected.is_absolute() {
             actual.canonicalize().ok() == expected.canonicalize().ok()
         } else {
             actual
@@ -1457,7 +1659,8 @@ fn process_matches(
                     left.to_string_lossy()
                         .eq_ignore_ascii_case(&right.to_string_lossy())
                 })
-        }
+        };
+        path_matches && ordinary_file_sha256(&actual).ok().as_deref() == Some(executable_sha256)
     }
 }
 
@@ -1486,6 +1689,7 @@ fn process_matches(
     _start_token: u64,
     _program: &OsStr,
     _command_sha256: &str,
+    _executable_sha256: &str,
 ) -> bool {
     false
 }
@@ -1499,6 +1703,7 @@ fn process_absence_proven(_process_id: u32, _start_token: u64) -> bool {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
     use super::*;
@@ -1548,6 +1753,7 @@ mod tests {
         failed_program: Option<String>,
         backing: Option<PathBuf>,
         qmp_sessions: Mutex<VecDeque<Vec<u8>>>,
+        process_matches: AtomicBool,
     }
 
     impl QemuCommandExecutor for FakeExecutor {
@@ -1570,7 +1776,11 @@ mod tests {
             let stdout = if args == [OsString::from("-accel"), OsString::from("help")] {
                 self.accelerators.join("\n").into_bytes()
             } else if args == [OsString::from("--version")] {
-                b"QEMU emulator version test\n".to_vec()
+                if program.to_string_lossy().contains("qemu-img") {
+                    b"qemu-img version test\n".to_vec()
+                } else {
+                    b"QEMU emulator version test\n".to_vec()
+                }
             } else if args.first() == Some(&OsString::from("info")) {
                 let path = PathBuf::from(args.last().unwrap());
                 let overlay =
@@ -1599,6 +1809,7 @@ mod tests {
             Ok(QemuSpawnReceipt {
                 process_id: 4242,
                 process_start_token: 7,
+                executable_sha256: "a".repeat(64),
             })
         }
         fn process_matches(
@@ -1607,8 +1818,13 @@ mod tests {
             _start_token: u64,
             _program: &OsStr,
             _command_sha256: &str,
+            _executable_sha256: &str,
         ) -> bool {
-            false
+            self.calls
+                .lock()
+                .unwrap()
+                .push("process_matches".to_owned());
+            self.process_matches.load(Ordering::SeqCst)
         }
         fn process_absence_proven(&self, _process_id: u32, _start_token: u64) -> bool {
             self.calls
@@ -1645,6 +1861,7 @@ mod tests {
                 failed_program: None,
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -1661,6 +1878,15 @@ mod tests {
         assert_eq!(probe.capabilities.hardware_acceleration, hardware_expected);
         assert!(probe.capabilities.accelerators.contains(&"tcg".to_owned()));
         assert_eq!(probe.capabilities.guest_transports, ["qga"]);
+        assert!(probe.detail.contains(&format!(
+            "native accelerator {} {}",
+            host_accelerator(),
+            if hardware_expected {
+                "available"
+            } else {
+                "unavailable"
+            }
+        )));
         let calls = provider.executor.calls.lock().unwrap();
         assert!(
             calls
@@ -1675,6 +1901,55 @@ mod tests {
     }
 
     #[test]
+    fn probe_distinguishes_missing_qemu_system_and_native_accelerator() {
+        let missing_system = QemuProvider::new(
+            FakeExecutor {
+                accelerators: Vec::new(),
+                calls: Mutex::new(Vec::new()),
+                failed_program: Some("qemu-system-test".to_owned()),
+                backing: None,
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+            },
+            PathBuf::from("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        )
+        .probe();
+        assert_eq!(missing_system.status, ProviderProbeStatus::Unavailable);
+        assert_eq!(missing_system.detail, "QEMU system binary was not found");
+
+        let missing_native = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: None,
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+            },
+            PathBuf::from("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        )
+        .probe();
+        assert_eq!(missing_native.status, ProviderProbeStatus::Ready);
+        assert!(missing_native.available);
+        assert!(!missing_native.capabilities.hardware_acceleration);
+        assert!(missing_native.detail.contains(&format!(
+            "native accelerator {} unavailable",
+            host_accelerator()
+        )));
+
+        assert_eq!(
+            probe_version_line(b"QEMU emulator version 9.2.0\n", "QEMU emulator version"),
+            Some("QEMU emulator version 9.2.0".to_owned())
+        );
+        assert!(probe_version_line(b"unexpected tool\n", "QEMU emulator version").is_none());
+        assert!(probe_version_line(&[0xff], "QEMU emulator version").is_none());
+    }
+
+    #[test]
     fn probe_is_unavailable_when_qemu_img_is_missing() {
         let provider = QemuProvider::new(
             FakeExecutor {
@@ -1683,6 +1958,7 @@ mod tests {
                 failed_program: Some("qemu-img".to_owned()),
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -1731,6 +2007,7 @@ mod tests {
             spawn_pending: false,
             process_id: None,
             process_start_token: None,
+            process_executable_sha256: None,
         };
         let args = launch_args(&config);
         let rendered = args
@@ -1759,6 +2036,7 @@ mod tests {
                 failed_program: None,
                 backing: Some(record.image.path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
             },
             state.root().join("runtime"),
             "qemu-system-test".into(),
@@ -1813,6 +2091,25 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(persisted.process_id, Some(4242));
+        assert_eq!(persisted.process_executable_sha256, Some("a".repeat(64)));
+        provider
+            .executor
+            .qmp_sessions
+            .lock()
+            .unwrap()
+            .push_back(qmp_status_session(&configured, "paused"));
+        provider
+            .executor
+            .process_matches
+            .store(false, Ordering::SeqCst);
+        assert!(matches!(
+            provider.inspect_vm(&VmLookup::Id(configured.id.clone())),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+        provider
+            .executor
+            .process_matches
+            .store(true, Ordering::SeqCst);
         provider
             .executor
             .qmp_sessions
@@ -1830,6 +2127,19 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(qmp_start_session(&paused));
+        provider
+            .executor
+            .process_matches
+            .store(false, Ordering::SeqCst);
+        assert!(matches!(
+            provider.start_vm(&authority, &paused),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+        assert_eq!(provider.executor.qmp_sessions.lock().unwrap().len(), 1);
+        provider
+            .executor
+            .process_matches
+            .store(true, Ordering::SeqCst);
         provider.start_vm(&authority, &paused).unwrap();
         let mut running = paused;
         running.power_state = ProviderPowerState::Running;
@@ -1839,6 +2149,19 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(qmp_stop_session(&running));
+        provider
+            .executor
+            .process_matches
+            .store(false, Ordering::SeqCst);
+        assert!(matches!(
+            provider.stop_vm(&authority, &running),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+        assert_eq!(provider.executor.qmp_sessions.lock().unwrap().len(), 1);
+        provider
+            .executor
+            .process_matches
+            .store(true, Ordering::SeqCst);
         provider.stop_vm(&authority, &running).unwrap();
         assert!(
             provider
@@ -1854,6 +2177,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stopped.power_state, ProviderPowerState::Off);
+        let stopped_config = read_config(&QemuProvider::<FakeExecutor>::config_path(
+            &stopped.configuration_path,
+        ))
+        .unwrap();
+        assert!(stopped_config.process_executable_sha256.is_none());
         provider.remove_vm(&authority, &stopped).unwrap();
         assert!(
             provider
@@ -1872,6 +2200,7 @@ mod tests {
                 failed_program: None,
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -1963,6 +2292,7 @@ mod tests {
             spawn_pending: false,
             process_id: Some(42),
             process_start_token: Some(7),
+            process_executable_sha256: Some("a".repeat(64)),
         };
         let valid = qmp_start_session(&config.snapshot(ProviderPowerState::Paused));
         let drifted = String::from_utf8(valid)
@@ -2005,6 +2335,7 @@ mod tests {
             spawn_pending: false,
             process_id: None,
             process_start_token: None,
+            process_executable_sha256: None,
         };
         config.command_sha256 = launch_digest(&config);
         let path = configuration_path.join("vm.json");
@@ -2017,8 +2348,15 @@ mod tests {
         config.process_id = Some(42);
         config.process_start_token = Some(0);
         assert!(config.validate(&path).is_err());
+        config.process_start_token = Some(7);
+        assert!(config.validate(&path).is_err());
+        config.process_executable_sha256 = Some("not-a-hash".to_owned());
+        assert!(config.validate(&path).is_err());
+        config.process_executable_sha256 = Some("b".repeat(64));
+        assert!(config.validate(&path).is_ok());
         config.process_id = None;
         config.process_start_token = None;
+        config.process_executable_sha256 = None;
         config.qmp = ControlEndpoint::WindowsPipe("foreign".to_owned());
         assert!(config.validate(&path).is_err());
         config.qmp = ControlEndpoint::qmp(&configuration_path, &id);
@@ -2034,6 +2372,7 @@ mod tests {
                 failed_program: None,
                 backing: Some(config.parent_path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
             },
             directory.path().to_path_buf(),
             "qemu-system-test".into(),
@@ -2053,5 +2392,54 @@ mod tests {
         assert_ne!(start_token, 0);
         assert!(!process_absence_proven(process_id, 0));
         assert!(!process_absence_proven(process_id, start_token));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_executable_resolution_and_process_receipt_bind_exact_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("qemu-system-x86_64.exe");
+        fs::write(&candidate, b"fixture-executable").unwrap();
+        let resolved = resolve_windows_executable(
+            OsStr::new("qemu-system-x86_64"),
+            &[directory.path().to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(PathBuf::from(resolved), candidate.canonicalize().unwrap());
+        let wrong_extension = directory.path().join("qemu-system-x86_64.com");
+        fs::write(&wrong_extension, b"fixture-executable").unwrap();
+        assert!(
+            resolve_windows_executable(
+                wrong_extension.as_os_str(),
+                &[directory.path().to_path_buf()]
+            )
+            .is_none()
+        );
+
+        let current = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let process_id = std::process::id();
+        let start_token = process_start_token(process_id).unwrap();
+        let executable_sha256 = ordinary_file_sha256(&current).unwrap();
+        assert!(process_matches(
+            process_id,
+            start_token,
+            current.as_os_str(),
+            "not-observable-on-windows",
+            &executable_sha256,
+        ));
+        assert!(!process_matches(
+            process_id,
+            start_token,
+            current.as_os_str(),
+            "not-observable-on-windows",
+            &"0".repeat(64),
+        ));
+        assert!(!process_matches(
+            process_id,
+            start_token.saturating_add(1),
+            current.as_os_str(),
+            "not-observable-on-windows",
+            &executable_sha256,
+        ));
     }
 }
