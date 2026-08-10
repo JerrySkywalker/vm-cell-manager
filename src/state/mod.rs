@@ -163,9 +163,10 @@ pub(crate) struct CellRuntimeGuard {
     cell_root: PathBuf,
     configuration_path: PathBuf,
     overlay_path: PathBuf,
-    _state_handle: File,
-    _runtime_handle: File,
+    state_handle: File,
+    runtime_handle: File,
     cell_handle: Option<File>,
+    configuration_handle: Option<File>,
 }
 
 pub(crate) struct ArtifactGuard {
@@ -173,11 +174,11 @@ pub(crate) struct ArtifactGuard {
     operation_id: GuestOperationId,
     root: PathBuf,
     files_root: PathBuf,
-    _state_handle: File,
-    _artifacts_handle: File,
-    _cell_handle: File,
-    _operation_handle: File,
-    _files_handle: File,
+    state_handle: File,
+    artifacts_handle: File,
+    cell_handle: File,
+    operation_handle: File,
+    files_handle: File,
 }
 
 impl CellRuntimeGuard {
@@ -191,6 +192,28 @@ impl CellRuntimeGuard {
 
     pub(crate) fn overlay_path(&self) -> &Path {
         &self.overlay_path
+    }
+
+    pub(crate) fn validate_filesystem_identity(&self) -> Result<(), StateError> {
+        validate_open_path_identity(&self.state_root, &self.state_handle)?;
+        validate_open_path_identity(&self.runtime_root, &self.runtime_handle)?;
+        let cell_handle = self
+            .cell_handle
+            .as_ref()
+            .ok_or_else(|| StateError::UnsafeRuntimePath(self.cell_root.clone()))?;
+        validate_open_path_identity(&self.cell_root, cell_handle)?;
+        let configuration_handle = self
+            .configuration_handle
+            .as_ref()
+            .ok_or_else(|| StateError::UnsafeRuntimePath(self.configuration_path.clone()))?;
+        validate_open_path_identity(&self.configuration_path, configuration_handle)?;
+        validate_runtime_chain(&self.state_root, &self.cell_root)?;
+        if self.configuration_path.parent() != Some(self.cell_root.as_path())
+            || self.overlay_path.parent() != Some(self.cell_root.as_path())
+        {
+            return Err(StateError::UnsafeRuntimePath(self.cell_root.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -616,11 +639,11 @@ impl StateStore {
             operation_id,
             root,
             files_root,
-            _state_handle: state_handle,
-            _artifacts_handle: artifacts_handle,
-            _cell_handle: cell_handle,
-            _operation_handle: operation_handle,
-            _files_handle: files_handle,
+            state_handle,
+            artifacts_handle,
+            cell_handle,
+            operation_handle,
+            files_handle,
         })
     }
 
@@ -716,6 +739,10 @@ impl StateStore {
             }
             Err(error) => return Err(error),
         };
+        validate_open_path_identity(&self.root, &mutation.state_root.1)?;
+        validate_open_path_identity(&artifacts_root, &artifacts_handle)?;
+        validate_open_path_identity(&cell_root, &cell_handle)?;
+        validate_open_path_identity(&operation_root, &operation_handle)?;
         ensure_existing_ancestors_are_ordinary(&operation_root)?;
         ensure_no_reparse_tree(&operation_root)?;
 
@@ -741,9 +768,16 @@ impl StateStore {
 
         #[cfg(test)]
         abort_at_test_checkpoint("before_artifact_remove");
+        mutation.validate_filesystem_identity()?;
+        validate_open_path_identity(&artifacts_root, &artifacts_handle)?;
+        validate_open_path_identity(&cell_root, &cell_handle)?;
+        validate_open_path_identity(&operation_root, &operation_handle)?;
+        #[cfg(windows)]
         drop(operation_handle);
         fs::remove_dir_all(&physical_operation_root)
             .map_err(|source| io_error(&physical_operation_root, source))?;
+        #[cfg(not(windows))]
+        drop(operation_handle);
         mutation.validate_filesystem_identity()?;
         drop(cell_handle);
         drop(artifacts_handle);
@@ -827,6 +861,8 @@ impl StateStore {
         }
         create_direct_child_directory(&cell_root)?;
         let cell_handle = open_ordinary_directory(&cell_root)?;
+        create_direct_child_directory(&configuration_path)?;
+        let configuration_handle = open_ordinary_directory(&configuration_path)?;
         validate_runtime_chain(&self.root, &cell_root)?;
         ensure_no_reparse_tree(&cell_root)?;
         Ok(CellRuntimeGuard {
@@ -836,9 +872,10 @@ impl StateStore {
             configuration_path,
             overlay_path,
             cell_root,
-            _state_handle: state_handle,
-            _runtime_handle: runtime_handle,
+            state_handle,
+            runtime_handle,
             cell_handle: Some(cell_handle),
+            configuration_handle: Some(configuration_handle),
         })
     }
 
@@ -867,6 +904,7 @@ impl StateStore {
             return Err(StateError::UnsafeRuntimePath(cell_root));
         }
         let cell_handle = open_ordinary_directory(&cell_root)?;
+        let configuration_handle = open_ordinary_directory(&configuration_path)?;
         validate_runtime_chain(&self.root, &cell_root)?;
         ensure_no_reparse_tree(&cell_root)?;
         Ok(CellRuntimeGuard {
@@ -876,9 +914,10 @@ impl StateStore {
             configuration_path,
             overlay_path,
             cell_root,
-            _state_handle: state_handle,
-            _runtime_handle: runtime_handle,
+            state_handle,
+            runtime_handle,
             cell_handle: Some(cell_handle),
+            configuration_handle: Some(configuration_handle),
         })
     }
 
@@ -905,9 +944,7 @@ impl StateStore {
         {
             return Err(StateError::UnsafeRuntimePath(cell_root));
         }
-        if !cell_root.exists() {
-            return Ok(());
-        }
+        guard.validate_filesystem_identity()?;
 
         validate_runtime_chain(&self.root, &cell_root)?;
 
@@ -930,13 +967,21 @@ impl StateStore {
 
         ensure_no_reparse_tree(&physical_cell_root)?;
         validate_runtime_chain(&self.root, &cell_root)?;
-        drop(guard.cell_handle.take());
+        guard.validate_filesystem_identity()?;
+        #[cfg(windows)]
+        {
+            drop(guard.configuration_handle.take());
+            drop(guard.cell_handle.take());
+        }
 
         // Rust's Windows implementation performs handle-relative recursive
         // removal and does not follow a child swapped to a reparse point. The
         // pinned runtime-root handle prevents an ancestor swap while it runs.
         fs::remove_dir_all(&physical_cell_root)
-            .map_err(|source| io_error(&physical_cell_root, source))
+            .map_err(|source| io_error(&physical_cell_root, source))?;
+        #[cfg(not(windows))]
+        drop(guard.cell_handle.take());
+        Ok(())
     }
 
     fn image_path(&self, image_id: &ImageId) -> PathBuf {
@@ -967,6 +1012,14 @@ impl StateStore {
         if guard.root != expected_root || guard.files_root != expected_root.join("files") {
             return Err(StateError::UnsafeRuntimePath(guard.root.clone()));
         }
+        validate_open_path_identity(&self.root, &guard.state_handle)?;
+        validate_open_path_identity(&self.root.join("artifacts"), &guard.artifacts_handle)?;
+        validate_open_path_identity(
+            &self.root.join("artifacts").join(guard.cell_id.to_string()),
+            &guard.cell_handle,
+        )?;
+        validate_open_path_identity(&guard.root, &guard.operation_handle)?;
+        validate_open_path_identity(&guard.files_root, &guard.files_handle)?;
         ensure_existing_ancestors_are_ordinary(&guard.files_root)?;
         ensure_no_reparse_tree(&guard.root)
     }
@@ -2080,6 +2133,57 @@ mod tests {
             store.acquire_mutation_lock(),
             Err(StateError::UnsafeRuntimePath(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_nested_runtime_and_artifact_guards_reject_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        store.installation().unwrap();
+        let cell_id = CellId::new();
+        let runtime = store.prepare_cell_runtime(cell_id).unwrap();
+        let cell_root = store.cell_runtime_root(cell_id);
+        let retired_cell = store.root().join("runtime-retired");
+        fs::rename(&cell_root, &retired_cell).unwrap();
+        fs::create_dir(&cell_root).unwrap();
+        fs::set_permissions(&cell_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(cell_root.join("foreign"), b"retain").unwrap();
+        assert!(matches!(
+            runtime.validate_filesystem_identity(),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert!(matches!(
+            store.remove_cell_runtime(cell_id, runtime),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(fs::read(cell_root.join("foreign")).unwrap(), b"retain");
+
+        let artifact_cell = CellId::new();
+        let operation_id = GuestOperationId::new();
+        let artifact = store
+            .prepare_artifact_root(artifact_cell, operation_id)
+            .unwrap();
+        let artifact_root = store.artifact_root(artifact_cell, operation_id);
+        let retired_artifact = store.root().join("artifact-retired");
+        fs::rename(&artifact_root, &retired_artifact).unwrap();
+        fs::create_dir(&artifact_root).unwrap();
+        fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(artifact_root.join("files")).unwrap();
+        fs::set_permissions(
+            artifact_root.join("files"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.validate_artifact_guard(&artifact),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        drop(artifact);
+        drop(mutation);
     }
 
     fn test_cell_record(store: &StateStore, cell_id: CellId) -> CellRecord {

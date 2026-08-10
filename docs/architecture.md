@@ -186,9 +186,27 @@ On Windows, path identity treats ordinary drive and UNC paths as equivalent to t
 On Unix, vmcell state directories are current-user-owned `0700` directories
 and state/configuration files are `0600`. Authority-bearing file and directory
 opens use no-follow/close-on-exec flags and revalidate device/inode identity.
+Linux immutable-base use additionally watches every canonical pathname
+component plus the base inode across provider consumption. Component rename,
+replacement or restore, content/attribute mutation through another hard link,
+watch overflow, and watched-object drift all fail closed, so a same-path ABA
+cannot satisfy only the before/after inode checks.
 Linux exposes KVM only when both QEMU advertises it and the current identity can
-open `/dev/kvm`; a compiled but inaccessible accelerator is not silently
-selected.
+open an ordinary `/dev/kvm` character device read/write with no-follow and a
+stable pre-open, opened-file, and current-path device/inode/device-number
+identity; a compiled but inaccessible accelerator is not silently selected.
+Missing, permission-denied, non-device, and identity drift are fail-closed
+diagnostics and never trigger repair. Linux process receipts hash the opened
+`/proc/<pid>/exe` object and separately bind the expected canonical path and
+start token. The durable leader PID is also the owned Unix process-group id;
+live receipt validation proves that binding, and lifecycle completion requires
+the exact group to be empty. Unix QMP/QGA paths are length-bounded; launch,
+off-state inspection, stop completion, and removal reject any pre-existing
+stale or foreign endpoint path instead of unlinking or adopting it. An owned
+waiter reaps each launched QEMU child so a confirmed exit cannot remain a
+same-process zombie that blocks exact cleanup. Nested CellId/configuration and
+artifact directory handles are revalidated immediately before pathname-based
+writes or exact-owned deletion.
 
 The provider mutex coordinates `vmcell` processes; it cannot serialize unrelated Hyper-V tools. The Rust mutation guard also pins the state root and its `locks`, `images`, `cells`, and `runtime` children against replacement while an operation is active. Real-provider acceptance therefore requires an isolated host window with no concurrent external Hyper-V writer and exclusive, ACL-enforced control of the configured vmcell state root.
 

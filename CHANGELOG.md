@@ -57,6 +57,7 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - Provider-neutral lifecycle authority, bounded process execution, QMP/QGA protocol foundations, QCOW2 immutable-base/single-overlay ownership, explicit QEMU accelerator policy, and stacked QEMU CLI routing for M3.
 - Fake QMP/QGA, launch-digest, no-network, explicit-TCG, provider-authority, process-timeout, and provider-neutral lifecycle coverage for M3.
 - M4 Unix private-state/no-follow identity gates, Linux KVM device usability filtering, canonical QEMU executable discovery, Unix QMP socket coverage, and a native-Linux validation workflow.
+- Native Linux QEMU/KVM/QGA human workflow, typed missing/permission/device-identity KVM diagnostics, bounded collision-safe Unix control endpoints, and a fixture-tested non-authorizing dedicated-host preflight/receipt contract.
 
 ### Changed
 - Adopted a permanent stable-`main`/integration-`dev` branch model: ephemeral

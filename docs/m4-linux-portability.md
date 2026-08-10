@@ -20,11 +20,17 @@ A real acceptance host must prove all of the following before mutation:
 Never change KVM modules, permissions, groups, packages, host networking, or
 system virtualization settings automatically.
 
+The canonical [native Linux QEMU/KVM/QGA walkthrough](linux-kvm-qga.md)
+connects these gates to the provider-neutral image, plan, run, guest-operation,
+recovery, and cleanup surface. Its preflight harness writes a non-authorizing
+receipt only; it performs no QEMU lifecycle or KVM ioctl.
+
 ## Repository-local checks
 
 Run `tools/check-linux.sh` with the declared Rust toolchain. Tests cover the
 provider-neutral engine, accelerator no-fallback behavior, QMP/QGA framing,
-Unix process groups, state identity, schema gates, and crash recovery.
+Unix process groups, state identity, schema gates, preflight fixture behavior,
+and crash recovery.
 
 The manual `Linux Validation` workflow is the exact-SHA native-Linux CI lane.
 It uses the declared GitHub-hosted Ubuntu 24.04 x86_64 baseline and Rust 1.85.0,

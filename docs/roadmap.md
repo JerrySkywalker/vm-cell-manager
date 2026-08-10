@@ -483,6 +483,17 @@ to TCG. A fixture-tested, non-mutating dedicated-host preflight and acceptance
 receipt template are present; real WHPX/QGA lifecycle acceptance remains
 external, so the support row stays `untested`.
 
+**Native Linux QEMU/KVM/QGA foundation:** the
+[canonical native Linux walkthrough](linux-kvm-qga.md) reuses that same
+provider-neutral plan, QEMU/QMP/QGA lifecycle, immutable-base/single-overlay
+model, ownership, recovery, and artifact surface. KVM remains an accelerator.
+Admission requires a stable ordinary `/dev/kvm` character-device identity and
+a read/write open by the current identity, without ioctl, repair, module load,
+or TCG fallback. Unix control paths are bounded and stale/colliding paths are
+retained for manual review. The exact-SHA preflight and receipt template are
+non-authorizing; real KVM/QGA lifecycle acceptance remains external, so the
+support row stays `untested`.
+
 ### Real QEMU lifecycle acceptance
 
 Prove real QEMU process lifecycle, immutable QCOW2 base, exactly one overlay, QMP lifecycle/reconciliation, QGA guest readiness, command execution, file transfer, exact cleanup, and crash/failure classification.

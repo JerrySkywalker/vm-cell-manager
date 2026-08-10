@@ -94,23 +94,13 @@ impl QgaCommandExecutor for SystemQgaExecutor {
             .map(|value| value.0)
             .unwrap_or(&root);
         client.exec_simple("/bin/mkdir", &["-p", parent], action.timeout)?;
-        if action.overwrite == OverwritePolicy::Deny
-            && client.exec_exit_code("/usr/bin/test", &["-e", &destination], action.timeout)? == 0
-        {
-            return Err(GuestIoError::PathViolation);
-        }
         let temporary = format!("{destination}.vmcell-{}.tmp", action.operation_id);
         let handle = client.file_open(&temporary, "w")?;
         let write_result = client.file_write_all(handle, action.content);
         let close_result = client.file_close(handle);
         write_result?;
         close_result?;
-        let mut arguments = vec!["-f"];
-        if action.overwrite == OverwritePolicy::Deny {
-            arguments = vec!["-n"];
-        }
-        arguments.extend([temporary.as_str(), destination.as_str()]);
-        client.exec_simple("/bin/mv", &arguments, action.timeout)
+        client.commit_copy_in(&temporary, &destination, action.overwrite, action.timeout)
     }
 
     fn copy_out(
@@ -346,6 +336,11 @@ impl QgaClient {
         loop {
             let status = self.execute("guest-exec-status", Some(json!({"pid": pid})))?;
             if status.get("exited").and_then(Value::as_bool) == Some(true) {
+                for field in ["out-truncated", "err-truncated"] {
+                    if !matches!(status.get(field), None | Some(Value::Bool(false))) {
+                        return Err(GuestIoError::InvalidResponse);
+                    }
+                }
                 let stdout = decode_output(&status, "out-data", command.max_output_bytes)?;
                 let stderr = decode_output(&status, "err-data", command.max_output_bytes)?;
                 if (stdout.len() + stderr.len()) as u64 > command.max_output_bytes {
@@ -386,6 +381,26 @@ impl QgaClient {
             Ok(())
         } else {
             Err(GuestIoError::Transport)
+        }
+    }
+
+    fn commit_copy_in(
+        &mut self,
+        temporary: &str,
+        destination: &str,
+        overwrite: OverwritePolicy,
+        timeout: Duration,
+    ) -> Result<(), GuestIoError> {
+        if overwrite == OverwritePolicy::Deny {
+            let committed =
+                self.exec_exit_code("/bin/ln", &["-T", "--", temporary, destination], timeout)?;
+            if committed != 0 {
+                self.exec_simple("/bin/rm", &["--", temporary], timeout)?;
+                return Err(GuestIoError::PathViolation);
+            }
+            self.exec_simple("/bin/rm", &["--", temporary], timeout)
+        } else {
+            self.exec_simple("/bin/mv", &["-f", "--", temporary, destination], timeout)
         }
     }
 
@@ -450,11 +465,22 @@ impl QgaClient {
                 })
                 .transpose()?
                 .unwrap_or_default();
+            let count = response
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or(GuestIoError::InvalidResponse)?;
+            let eof = response
+                .get("eof")
+                .and_then(Value::as_bool)
+                .ok_or(GuestIoError::InvalidResponse)?;
+            if count != chunk.len() as u64 || count > QGA_FILE_CHUNK as u64 {
+                return Err(GuestIoError::PartialCopy);
+            }
             output.extend_from_slice(&chunk);
             if output.len() as u64 > max_bytes {
                 return Err(GuestIoError::OutputLimit);
             }
-            if response.get("eof").and_then(Value::as_bool) == Some(true) {
+            if eof {
                 return Ok(output);
             }
             if chunk.is_empty() {
@@ -722,6 +748,28 @@ mod tests {
             }),
             Err(GuestIoError::InvalidResponse)
         );
+
+        let stream = FakeQgaStream::scripted(&[
+            json!({"return": {"pid": 44}}),
+            json!({"return": {
+                "exited": true,
+                "exitcode": 0,
+                "out-truncated": true
+            }}),
+        ]);
+        let mut client = QgaClient {
+            stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(
+            client.exec(&GuestCommand {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 64,
+            }),
+            Err(GuestIoError::InvalidResponse)
+        );
     }
 
     #[test]
@@ -738,13 +786,23 @@ mod tests {
 
         let payload = base64::engine::general_purpose::STANDARD.encode(b"too-large");
         let stream = FakeQgaStream::scripted(&[json!({
-            "return": {"buf-b64": payload, "eof": true}
+            "return": {"buf-b64": payload, "count": 9, "eof": true}
         })]);
         let mut client = QgaClient {
             stream: Box::new(stream),
             deadline: Instant::now() + Duration::from_secs(1),
         };
         assert_eq!(client.file_read_all(8, 2), Err(GuestIoError::OutputLimit));
+
+        let payload = base64::engine::general_purpose::STANDARD.encode(b"short");
+        let stream = FakeQgaStream::scripted(&[json!({
+            "return": {"buf-b64": payload, "count": 4, "eof": true}
+        })]);
+        let mut client = QgaClient {
+            stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(client.file_read_all(8, 64), Err(GuestIoError::PartialCopy));
 
         let stream = FakeQgaStream::scripted(&[json!({"return": {"count": 1}})]);
         let mut expired = QgaClient {
@@ -754,6 +812,29 @@ mod tests {
         assert_eq!(
             expired.file_write_all(9, b"deadline"),
             Err(GuestIoError::Timeout)
+        );
+    }
+
+    #[test]
+    fn qga_copy_in_deny_never_treats_no_clobber_collision_as_success() {
+        let stream = FakeQgaStream::scripted(&[
+            json!({"return": {"pid": 1}}),
+            json!({"return": {"exited": true, "exitcode": 1}}),
+            json!({"return": {"pid": 2}}),
+            json!({"return": {"exited": true, "exitcode": 0}}),
+        ]);
+        let mut client = QgaClient {
+            stream: Box::new(stream),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(
+            client.commit_copy_in(
+                "/run/vmcell/temp",
+                "/run/vmcell/destination",
+                OverwritePolicy::Deny,
+                Duration::from_secs(1),
+            ),
+            Err(GuestIoError::PathViolation)
         );
     }
 

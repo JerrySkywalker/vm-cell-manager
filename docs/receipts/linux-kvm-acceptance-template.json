@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.linux-kvm-acceptance.v1",
+  "authorizing": false,
+  "real_platform_acceptance": "pending",
+  "repository": {
+    "slug": "JerrySkywalker/vm-cell-manager",
+    "candidate_sha": "REQUIRED_EXACT_40_HEX_SHA"
+  },
+  "host": {
+    "os": "linux",
+    "architecture": "x86_64",
+    "native_host_proof": "REQUIRED_NOT_WSL_OR_CONTAINER_EVIDENCE",
+    "fingerprint_sha256": "REQUIRED_SHA256",
+    "effective_uid": "REQUIRED_ACCEPTANCE_IDENTITY"
+  },
+  "provider_path": {
+    "provider": "qemu",
+    "accelerator": "kvm",
+    "guest_os": "linux",
+    "guest_architecture": "x86_64",
+    "guest_transport": "qga",
+    "support_status": "untested"
+  },
+  "preflight_receipt_sha256": "REQUIRED_SHA256",
+  "qemu_system": {
+    "canonical_path": "REQUIRED_ACCEPTANCE_HOST_PATH",
+    "version": "REQUIRED_VERSION",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "qemu_img": {
+    "canonical_path": "REQUIRED_ACCEPTANCE_HOST_PATH",
+    "version": "REQUIRED_VERSION",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "kvm": {
+    "canonical_path": "/dev/kvm",
+    "device_inode_identity": "REQUIRED_DEVICE_INODE_MAJOR_MINOR",
+    "read_write_open_by_effective_identity": "REQUIRED_BOOLEAN",
+    "ioctl_or_vm_performed_by_preflight": false,
+    "functional_evidence": "REQUIRED_DEDICATED_HOST_EVIDENCE"
+  },
+  "state_root": {
+    "canonical_path": "REQUIRED_0700_EXCLUSIVE_PATH",
+    "owner_uid": "REQUIRED_EFFECTIVE_UID",
+    "device_inode_identity": "REQUIRED_DEVICE_INODE"
+  },
+  "immutable_base": {
+    "canonical_path": "REQUIRED_QCOW2_PATH",
+    "format": "qcow2",
+    "size_before": "REQUIRED_BYTES",
+    "sha256_before": "REQUIRED_SHA256",
+    "sha256_after": "REQUIRED_SHA256",
+    "backing_parent": null
+  },
+  "qga": {
+    "guest_assumption": "prepared-linux-x86_64-qga-enabled",
+    "readiness_evidence": "REQUIRED_REAL_GUEST_EVIDENCE"
+  },
+  "foreign_prestate": {
+    "qemu_process_fingerprint_before": "REQUIRED_SHA256",
+    "qemu_process_fingerprint_after": "REQUIRED_SHA256",
+    "runtime_tree_fingerprint_before": "REQUIRED_SHA256",
+    "runtime_tree_fingerprint_after": "REQUIRED_SHA256",
+    "production_socket_pattern": "STATE_ROOT/runtime/<CELL_ID>/qemu/{qmp.sock,qga.sock}",
+    "network_fingerprint_before": "REQUIRED_SHA256",
+    "network_fingerprint_after": "REQUIRED_SHA256",
+    "unchanged_except_exact_owned_resources": "REQUIRED_BOOLEAN"
+  },
+  "writer_exclusivity": {
+    "evidence": "REQUIRED_ACCEPTANCE_WINDOW_EVIDENCE",
+    "violations": "REQUIRED_ZERO"
+  },
+  "ownership": {
+    "exact_owned_namespace": "REQUIRED_VM_CELL_NAMESPACE",
+    "process_identity": "REQUIRED_EXECUTABLE_HASH_PID_START_TOKEN_LAUNCH_DIGEST",
+    "process_group_identity": "REQUIRED_PROCESS_GROUP_EVIDENCE",
+    "overlay_identity": "REQUIRED_BASE_AND_OVERLAY_EVIDENCE",
+    "qmp_identity": "REQUIRED_UUID_NAME_CPU_MEMORY_DISK_NETWORK_EVIDENCE"
+  },
+  "recovery": {
+    "unknown_guest_effect_replayed": false,
+    "crash_reconciliation_evidence": "REQUIRED_PROCESS_QMP_QGA_STATE_EVIDENCE",
+    "manual_review_retained": "REQUIRED_BOOLEAN"
+  },
+  "cleanup": {
+    "policy": "exact-owned-only",
+    "rollback_evidence": "REQUIRED_STOP_DESTROY_ENDPOINT_PROCESS_OVERLAY_EVIDENCE",
+    "foreign_state_unchanged": "REQUIRED_BOOLEAN"
+  },
+  "result": "PENDING_REAL_PLATFORM_GATE"
+}

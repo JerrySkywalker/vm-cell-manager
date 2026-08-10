@@ -25,6 +25,58 @@ const QEMU_CONFIG_SCHEMA: u32 = 1;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: usize = 1024 * 1024;
+#[cfg(unix)]
+const UNIX_CONTROL_ENDPOINT_LIMIT: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvmDeviceStatus {
+    #[cfg(not(target_os = "linux"))]
+    NotApplicable,
+    #[cfg(any(target_os = "linux", test))]
+    Usable,
+    #[cfg(any(target_os = "linux", test))]
+    Missing,
+    #[cfg(any(target_os = "linux", test))]
+    PermissionDenied,
+    #[cfg(any(target_os = "linux", test))]
+    NotCharacterDevice,
+    #[cfg(any(target_os = "linux", test))]
+    IdentityChanged,
+    #[cfg(any(target_os = "linux", test))]
+    Unavailable,
+}
+
+impl KvmDeviceStatus {
+    fn usable(self) -> bool {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::NotApplicable => true,
+            #[cfg(any(target_os = "linux", test))]
+            Self::Usable => true,
+            #[cfg(any(target_os = "linux", test))]
+            _ => false,
+        }
+    }
+
+    fn diagnostic(self) -> &'static str {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::NotApplicable => "not applicable on this host",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Usable => "read-write usable by the current identity",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Missing => "/dev/kvm is missing",
+            #[cfg(any(target_os = "linux", test))]
+            Self::PermissionDenied => "/dev/kvm is not read-write usable by the current identity",
+            #[cfg(any(target_os = "linux", test))]
+            Self::NotCharacterDevice => "/dev/kvm is not an ordinary character device",
+            #[cfg(any(target_os = "linux", test))]
+            Self::IdentityChanged => "/dev/kvm identity changed while it was opened",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Unavailable => "/dev/kvm could not be opened read-write",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QemuCommandOutput {
@@ -65,6 +117,8 @@ pub trait QemuCommandExecutor: Send + Sync {
     ) -> bool;
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool;
+
+    fn process_group_absence_proven(&self, process_group_id: u32) -> bool;
 
     fn connect_qmp(
         &self,
@@ -133,7 +187,7 @@ impl QemuCommandExecutor for SystemQemuExecutor {
                     .to_owned(),
             ));
         }
-        drop(child);
+        start_process_reaper(child)?;
         Ok(QemuSpawnReceipt {
             process_id,
             process_start_token,
@@ -160,6 +214,10 @@ impl QemuCommandExecutor for SystemQemuExecutor {
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool {
         process_absence_proven(process_id, start_token)
+    }
+
+    fn process_group_absence_proven(&self, process_group_id: u32) -> bool {
+        process_group_absence_proven(process_group_id)
     }
 
     fn connect_qmp(
@@ -227,7 +285,9 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
         }
     }
 
-    fn accelerators(&self) -> Result<Vec<String>, ProviderError> {
+    fn accelerator_inventory(
+        &self,
+    ) -> Result<(Vec<String>, Option<KvmDeviceStatus>, bool), ProviderError> {
         let output = self.run_checked(
             &self.system_binary,
             &[OsString::from("-accel"), OsString::from("help")],
@@ -241,7 +301,18 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             .filter(|line| matches!(*line, "whpx" | "kvm" | "hvf" | "tcg"))
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        Ok(filter_usable_accelerators(compiled, kvm_device_usable()))
+        let kvm_advertised = compiled.iter().any(|value| value == "kvm");
+        let kvm_status = kvm_advertised.then(kvm_device_status);
+        Ok((
+            filter_usable_accelerators(compiled, kvm_status.is_none_or(KvmDeviceStatus::usable)),
+            kvm_status,
+            kvm_advertised,
+        ))
+    }
+
+    fn accelerators(&self) -> Result<Vec<String>, ProviderError> {
+        self.accelerator_inventory()
+            .map(|(accelerators, _, _)| accelerators)
     }
 
     fn select_accelerator(&self, request: &CreateVmRequest) -> Result<String, ProviderError> {
@@ -353,7 +424,13 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
                             "recorded QEMU process absence cannot be proven".to_owned(),
                         ));
                     }
+                    if !self.executor.process_group_absence_proven(pid) {
+                        return Err(ProviderError::OwnershipChanged(
+                            "recorded QEMU process group is not empty".to_owned(),
+                        ));
+                    }
                 }
+                ensure_control_endpoints_absent(config)?;
                 ProviderPowerState::Off
             }
         };
@@ -514,8 +591,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 capabilities: ProviderCapabilities::unavailable(),
             };
         }
-        let accelerators = match self.accelerators() {
-            Ok(accelerators) => accelerators,
+        let (accelerators, kvm_status, kvm_advertised) = match self.accelerator_inventory() {
+            Ok(inventory) => inventory,
             Err(_) => {
                 return ProviderProbe {
                     name: "qemu",
@@ -529,9 +606,18 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let hardware = host_accelerator();
         let hardware_available = accelerators.iter().any(|value| value == hardware);
         let native_accelerator = if hardware_available {
-            "available"
+            "available".to_owned()
+        } else if hardware == "kvm" && kvm_advertised {
+            format!(
+                "unavailable ({})",
+                kvm_status
+                    .expect("advertised KVM always has a device admission result")
+                    .diagnostic()
+            )
+        } else if hardware == "kvm" {
+            "unavailable (QEMU did not advertise KVM)".to_owned()
         } else {
-            "unavailable"
+            "unavailable".to_owned()
         };
         ProviderProbe {
             name: "qemu",
@@ -587,12 +673,20 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         request: &CreateOverlayRequest,
     ) -> Result<ProviderImageInfo, ProviderError> {
         authority.validate_overlay_request(request)?;
-        if request.overlay_path.exists() {
-            return Err(ProviderError::Collision(
-                "QEMU overlay already exists".to_owned(),
-            ));
-        }
-        self.run_checked(
+        prove_path_absent(&request.overlay_path, "QEMU overlay")?;
+        let parent = request.overlay_path.parent().ok_or_else(|| {
+            ProviderError::Authority("QEMU overlay path has no runtime parent".to_owned())
+        })?;
+        let file_name = request
+            .overlay_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                ProviderError::Authority("QEMU overlay filename is invalid".to_owned())
+            })?;
+        let staged_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        prove_path_absent(&staged_path, "QEMU staged overlay")?;
+        let create_result = self.run_checked(
             &self.image_binary,
             &[
                 OsString::from("create"),
@@ -602,9 +696,56 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 OsString::from("qcow2"),
                 OsString::from("-b"),
                 request.parent_path.as_os_str().to_owned(),
-                request.overlay_path.as_os_str().to_owned(),
+                staged_path.as_os_str().to_owned(),
             ],
-        )?;
+        );
+        if let Err(error) = create_result {
+            cleanup_staged_overlay(&staged_path);
+            return Err(error);
+        }
+        authority.validate_overlay_request(request)?;
+        let staged_file = open_private_qemu_file(&staged_path)?;
+        let staged = match self.inspect_image(staged_path.clone()) {
+            Ok(staged) => staged,
+            Err(error) => {
+                cleanup_exact_staged_overlay(&staged_path, &staged_file);
+                return Err(error);
+            }
+        };
+        if staged.disk_format != "qcow2"
+            || staged.disk_type != "overlay"
+            || staged
+                .parent_path
+                .as_ref()
+                .is_none_or(|path| !provider_path_equal(path, &request.parent_path))
+        {
+            cleanup_exact_staged_overlay(&staged_path, &staged_file);
+            return Err(ProviderError::OwnershipChanged(
+                "staged QEMU overlay did not bind the exact immutable parent".to_owned(),
+            ));
+        }
+        ensure_private_qemu_file(&staged_path, &staged_file)?;
+        prove_path_absent(&request.overlay_path, "QEMU overlay")?;
+        fs::hard_link(&staged_path, &request.overlay_path).map_err(|error| {
+            cleanup_exact_staged_overlay(&staged_path, &staged_file);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ProviderError::Collision("QEMU overlay already exists".to_owned())
+            } else {
+                ProviderError::Command(format!(
+                    "failed to publish QEMU overlay without replacement: {error}"
+                ))
+            }
+        })?;
+        ensure_private_qemu_file(&request.overlay_path, &staged_file)?;
+        authority.validate_overlay_request(request)?;
+        fs::remove_file(&staged_path).map_err(|error| {
+            ProviderError::Command(format!("failed to retire staged QEMU overlay: {error}"))
+        })?;
+        sync_parent_directory(&request.overlay_path).map_err(|error| {
+            ProviderError::Command(format!(
+                "failed to persist QEMU overlay publication: {error}"
+            ))
+        })?;
         self.inspect_image(request.overlay_path.clone())
     }
 
@@ -650,6 +791,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             process_executable_sha256: None,
         };
         config.command_sha256 = launch_digest(&config);
+        config.validate(&config_path)?;
         write_config_new(&config_path, &config)?;
         Ok(ProviderVmIdentity {
             id,
@@ -718,6 +860,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ));
         }
         if expected.power_state == ProviderPowerState::Off {
+            ensure_control_endpoints_absent(&config)?;
             config.spawn_pending = true;
             replace_config(&path, &config)?;
             let args = launch_args(&config);
@@ -774,6 +917,12 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                     .executor
                     .process_absence_proven(process_id, process_start_token)
             {
+                if !self.executor.process_group_absence_proven(process_id) {
+                    return Err(ProviderError::OwnershipChanged(
+                        "QEMU leader exited while its owned process group remained live".to_owned(),
+                    ));
+                }
+                ensure_control_endpoints_absent(&config)?;
                 config.process_id = None;
                 config.process_start_token = None;
                 config.process_executable_sha256 = None;
@@ -834,7 +983,13 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                     "QEMU process absence cannot be proven".to_owned(),
                 ));
             }
+            if !self.executor.process_group_absence_proven(pid) {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU process group is still live".to_owned(),
+                ));
+            }
         }
+        ensure_control_endpoints_absent(&config)?;
         fs::remove_file(&path).map_err(|error| {
             ProviderError::Command(format!("failed to remove QEMU configuration: {error}"))
         })?;
@@ -884,6 +1039,8 @@ impl QemuVmConfig {
             || !qemu_argument_path_is_safe(&self.configuration_path)
             || !qemu_argument_path_is_safe(&self.overlay_path)
             || !qemu_argument_path_is_safe(&self.parent_path)
+            || !control_endpoint_is_safe(&self.qmp)
+            || !control_endpoint_is_safe(&self.qga)
             || self.command_sha256 != launch_digest(self)
             || self.process_id.is_some() != self.process_start_token.is_some()
             || self.process_id.is_some() != self.process_executable_sha256.is_some()
@@ -930,6 +1087,72 @@ struct QemuImgInfo {
     backing_filename: Option<String>,
     #[serde(rename = "full-backing-filename")]
     full_backing_filename: Option<PathBuf>,
+}
+
+fn prove_path_absent(path: &Path, label: &str) -> Result<(), ProviderError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ProviderError::Collision(format!(
+            "{label} path already exists"
+        ))),
+        Err(_) => Err(ProviderError::OwnershipChanged(format!(
+            "{label} absence could not be proven"
+        ))),
+    }
+}
+
+fn open_private_qemu_file(path: &Path) -> Result<File, ProviderError> {
+    let current = fs::symlink_metadata(path).map_err(|_| {
+        ProviderError::OwnershipChanged(
+            "QEMU staged overlay path metadata could not be pinned".to_owned(),
+        )
+    })?;
+    if !metadata_is_ordinary_file(&current) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU staged overlay path is not an ordinary file".to_owned(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_qemu_file_options(&mut options, false);
+    let file = options.open(path).map_err(|error| {
+        ProviderError::OwnershipChanged(format!("QEMU staged overlay could not be pinned: {error}"))
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        ProviderError::OwnershipChanged(
+            "QEMU staged overlay metadata could not be pinned".to_owned(),
+        )
+    })?;
+    if !metadata_is_ordinary_file(&metadata) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU staged overlay is not an ordinary file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| {
+                ProviderError::OwnershipChanged(
+                    "QEMU staged overlay privacy could not be enforced".to_owned(),
+                )
+            })?;
+    }
+    ensure_private_qemu_file(path, &file)?;
+    Ok(file)
+}
+
+fn cleanup_staged_overlay(path: &Path) {
+    if let Ok(file) = open_private_qemu_file(path) {
+        cleanup_exact_staged_overlay(path, &file);
+    }
+}
+
+fn cleanup_exact_staged_overlay(path: &Path, file: &File) {
+    if ensure_private_qemu_file(path, file).is_ok() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn create_ordinary_directory(path: &Path) -> Result<(), ProviderError> {
@@ -1199,6 +1422,54 @@ fn qemu_argument_path_is_safe(path: &Path) -> bool {
     })
 }
 
+fn control_endpoint_is_safe(endpoint: &ControlEndpoint) -> bool {
+    match endpoint {
+        ControlEndpoint::Unix(path) => unix_control_endpoint_is_safe(path),
+        ControlEndpoint::WindowsPipe(value) => {
+            value.starts_with(r"\\.\pipe\vmcell-")
+                && value.len() <= 256
+                && !value.chars().any(char::is_control)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_control_endpoint_is_safe(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    qemu_argument_path_is_safe(path)
+        && !path.as_os_str().as_bytes().is_empty()
+        && path.as_os_str().as_bytes().len() <= UNIX_CONTROL_ENDPOINT_LIMIT
+}
+
+#[cfg(not(unix))]
+fn unix_control_endpoint_is_safe(path: &Path) -> bool {
+    qemu_argument_path_is_safe(path)
+}
+
+fn ensure_control_endpoints_absent(config: &QemuVmConfig) -> Result<(), ProviderError> {
+    for endpoint in [&config.qmp, &config.qga] {
+        let ControlEndpoint::Unix(path) = endpoint else {
+            continue;
+        };
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU control endpoint path already exists; stale or foreign state requires manual review"
+                        .to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU control endpoint absence could not be proven".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn remaining_provider_duration(deadline: std::time::Instant) -> Result<Duration, ProviderError> {
     deadline
         .checked_duration_since(std::time::Instant::now())
@@ -1329,6 +1600,10 @@ fn ordinary_file_sha256(path: &Path) -> Result<String, ProviderError> {
     let mut file = File::open(&canonical).map_err(|_| {
         ProviderError::OwnershipChanged("QEMU executable could not be pinned".to_owned())
     })?;
+    opened_file_sha256(&mut file)
+}
+
+fn opened_file_sha256(file: &mut File) -> Result<String, ProviderError> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1413,17 +1688,88 @@ fn filter_usable_accelerators(values: Vec<String>, kvm_usable: bool) -> Vec<Stri
 }
 
 #[cfg(target_os = "linux")]
-fn kvm_device_usable() -> bool {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
+fn kvm_device_status() -> KvmDeviceStatus {
+    probe_kvm_device(Path::new("/dev/kvm"))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn kvm_device_usable() -> bool {
-    true
+fn kvm_device_status() -> KvmDeviceStatus {
+    KvmDeviceStatus::NotApplicable
+}
+
+#[cfg(target_os = "linux")]
+fn probe_kvm_device(path: &Path) -> KvmDeviceStatus {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return classify_kvm_error(error.kind()),
+    };
+    let Some(before_identity) = kvm_device_identity(&before) else {
+        return KvmDeviceStatus::NotCharacterDevice;
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => return classify_kvm_error(error.kind()),
+    };
+    let opened = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return KvmDeviceStatus::Unavailable,
+    };
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return KvmDeviceStatus::IdentityChanged,
+    };
+    let opened_identity = kvm_device_identity(&opened);
+    let current_identity = kvm_device_identity(&current);
+    if !kvm_device_identity_is_stable(before_identity, opened_identity, current_identity) {
+        return KvmDeviceStatus::IdentityChanged;
+    }
+    KvmDeviceStatus::Usable
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KvmDeviceIdentity {
+    device: u64,
+    inode: u64,
+    raw_device: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn kvm_device_identity(metadata: &fs::Metadata) -> Option<KvmDeviceIdentity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    (!metadata.file_type().is_symlink() && metadata.file_type().is_char_device()).then_some(
+        KvmDeviceIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            raw_device: metadata.rdev(),
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn kvm_device_identity_is_stable(
+    before: KvmDeviceIdentity,
+    opened: Option<KvmDeviceIdentity>,
+    current: Option<KvmDeviceIdentity>,
+) -> bool {
+    opened == Some(before) && current == Some(before)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_kvm_error(kind: std::io::ErrorKind) -> KvmDeviceStatus {
+    match kind {
+        std::io::ErrorKind::NotFound => KvmDeviceStatus::Missing,
+        std::io::ErrorKind::PermissionDenied => KvmDeviceStatus::PermissionDenied,
+        _ => KvmDeviceStatus::Unavailable,
+    }
 }
 
 #[cfg(unix)]
@@ -1511,6 +1857,31 @@ fn configure_detached_process(command: &mut Command) {
     command.process_group(0);
 }
 
+fn start_process_reaper(child: std::process::Child) -> Result<(), ProviderError> {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let waiter = std::sync::Arc::clone(&shared);
+    match std::thread::Builder::new()
+        .name("vmcell-qemu-reaper".to_owned())
+        .spawn(move || {
+            let child = waiter.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+        }) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let child = shared.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(ProviderError::Command(
+                "QEMU process reaper could not be started".to_owned(),
+            ))
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn configure_detached_process(command: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -1527,6 +1898,17 @@ fn process_start_token(process_id: u32) -> Option<u64> {
         .1
         .split_whitespace()
         .nth(19)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_id(process_id: u32) -> Option<u32> {
+    let text = fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    text.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
         .parse()
         .ok()
 }
@@ -1568,7 +1950,9 @@ fn process_matches(
 ) -> bool {
     use std::os::unix::ffi::OsStringExt;
 
-    if process_start_token(process_id) != Some(start_token) {
+    if process_start_token(process_id) != Some(start_token)
+        || process_group_id(process_id) != Some(process_id)
+    {
         return false;
     }
     let executable = match fs::read_link(format!("/proc/{process_id}/exe")) {
@@ -1584,7 +1968,9 @@ fn process_matches(
     if !executable_matches {
         return false;
     }
-    if ordinary_file_sha256(&executable).ok().as_deref() != Some(executable_sha256) {
+    if process_executable_sha256(process_id).as_deref() != Some(executable_sha256)
+        || process_start_token(process_id) != Some(start_token)
+    {
         return false;
     }
     let command_line = match fs::read(format!("/proc/{process_id}/cmdline")) {
@@ -1598,6 +1984,16 @@ fn process_matches(
         .map(|value| OsString::from_vec(value.to_vec()))
         .collect::<Vec<_>>();
     argument_digest(&arguments) == command_sha256
+        && process_start_token(process_id) == Some(start_token)
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_sha256(process_id: u32) -> Option<String> {
+    let mut file = File::open(format!("/proc/{process_id}/exe")).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    opened_file_sha256(&mut file).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -1611,6 +2007,52 @@ fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
         Err(_) => false,
         Ok(_) => process_start_token(process_id).is_some_and(|actual| actual != start_token),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn process_group_absence_proven(_process_group_id: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_absence_proven(process_group_id: u32) -> bool {
+    if process_group_id == 0 {
+        return false;
+    }
+    let entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return false,
+        };
+        let Some(_process_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match fs::read_to_string(entry.path().join("stat")) {
+            Ok(text) => {
+                let group = text
+                    .rsplit_once(')')
+                    .and_then(|(_, fields)| fields.split_whitespace().nth(2))
+                    .and_then(|value| value.parse::<u32>().ok());
+                if group == Some(process_group_id) {
+                    return false;
+                }
+                if group.is_none() {
+                    return false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -1699,6 +2141,11 @@ fn process_absence_proven(_process_id: u32, _start_token: u64) -> bool {
     false
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn process_group_absence_proven(_process_group_id: u32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1783,8 +2230,10 @@ mod tests {
                 }
             } else if args.first() == Some(&OsString::from("info")) {
                 let path = PathBuf::from(args.last().unwrap());
-                let overlay =
-                    path.file_name().and_then(|value| value.to_str()) == Some("cell.qcow2");
+                let overlay = self
+                    .backing
+                    .as_ref()
+                    .is_some_and(|backing| !provider_path_equal(&path, backing));
                 serde_json::to_vec(&serde_json::json!({
                     "format": "qcow2",
                     "virtual-size": 1048576,
@@ -1792,6 +2241,9 @@ mod tests {
                     "full-backing-filename": overlay.then(|| self.backing.as_ref().unwrap())
                 }))
                 .unwrap()
+            } else if args.first() == Some(&OsString::from("create")) {
+                fs::write(PathBuf::from(args.last().unwrap()), b"overlay").unwrap();
+                Vec::new()
             } else {
                 Vec::new()
             };
@@ -1831,6 +2283,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push("process_absence_proven".to_owned());
+            true
+        }
+        fn process_group_absence_proven(&self, _process_group_id: u32) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("process_group_absence_proven".to_owned());
             true
         }
         fn connect_qmp(
@@ -1874,7 +2333,7 @@ mod tests {
             probe.capabilities.schema_version,
             crate::core::automation::AUTOMATION_SCHEMA_VERSION
         );
-        let hardware_expected = host_accelerator() != "kvm" || kvm_device_usable();
+        let hardware_expected = host_accelerator() != "kvm" || kvm_device_status().usable();
         assert_eq!(probe.capabilities.hardware_acceleration, hardware_expected);
         assert!(probe.capabilities.accelerators.contains(&"tcg".to_owned()));
         assert_eq!(probe.capabilities.guest_transports, ["qga"]);
@@ -1986,6 +2445,223 @@ mod tests {
             ),
             vec!["kvm", "tcg"]
         );
+    }
+
+    #[test]
+    fn kvm_open_errors_have_stable_admission_diagnostics() {
+        assert_eq!(
+            classify_kvm_error(std::io::ErrorKind::NotFound),
+            KvmDeviceStatus::Missing
+        );
+        assert_eq!(
+            classify_kvm_error(std::io::ErrorKind::PermissionDenied),
+            KvmDeviceStatus::PermissionDenied
+        );
+        assert_eq!(
+            classify_kvm_error(std::io::ErrorKind::Other),
+            KvmDeviceStatus::Unavailable
+        );
+        assert_eq!(
+            KvmDeviceStatus::PermissionDenied.diagnostic(),
+            "/dev/kvm is not read-write usable by the current identity"
+        );
+        assert!(KvmDeviceStatus::Usable.usable());
+        assert_eq!(
+            KvmDeviceStatus::IdentityChanged.diagnostic(),
+            "/dev/kvm identity changed while it was opened"
+        );
+        assert_eq!(
+            KvmDeviceStatus::NotCharacterDevice.diagnostic(),
+            "/dev/kvm is not an ordinary character device"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kvm_probe_rejects_missing_non_device_and_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-kvm");
+        assert_eq!(probe_kvm_device(&missing), KvmDeviceStatus::Missing);
+
+        let ordinary = directory.path().join("ordinary-kvm");
+        fs::write(&ordinary, b"not a device").unwrap();
+        assert_eq!(
+            probe_kvm_device(&ordinary),
+            KvmDeviceStatus::NotCharacterDevice
+        );
+
+        let linked = directory.path().join("linked-kvm");
+        symlink(&ordinary, &linked).unwrap();
+        assert_eq!(
+            probe_kvm_device(&linked),
+            KvmDeviceStatus::NotCharacterDevice
+        );
+
+        let exact = KvmDeviceIdentity {
+            device: 1,
+            inode: 2,
+            raw_device: 3,
+        };
+        assert!(kvm_device_identity_is_stable(
+            exact,
+            Some(exact),
+            Some(exact)
+        ));
+        assert!(!kvm_device_identity_is_stable(
+            exact,
+            Some(exact),
+            Some(KvmDeviceIdentity { inode: 4, ..exact })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_reaper_makes_exited_child_absence_provable() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let start_token = process_start_token(process_id).unwrap();
+        start_process_reaper(child).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !process_absence_proven(process_id, start_token)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_absence_proven(process_id, start_token));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_exit_does_not_prove_the_owned_process_group_empty() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & sleep 0.2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_detached_process(&mut command);
+        let child = command.spawn().unwrap();
+        let process_id = child.id();
+        let start_token = process_start_token(process_id).unwrap();
+        assert_eq!(process_group_id(process_id), Some(process_id));
+        start_process_reaper(child).unwrap();
+
+        let leader_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !process_absence_proven(process_id, start_token)
+            && std::time::Instant::now() < leader_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_absence_proven(process_id, start_token));
+        assert!(!process_group_absence_proven(process_id));
+
+        unsafe {
+            libc::kill(-(process_id as i32), libc::SIGTERM);
+        }
+        let group_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !process_group_absence_proven(process_id)
+            && std::time::Instant::now() < group_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_group_absence_proven(process_id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_executable_hash_uses_proc_handle_not_replaced_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let true_program = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("qemu-system-fixture");
+        let retired = directory.path().join("qemu-system-fixture.retired");
+        fs::copy(sleep, &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let launched_sha256 = ordinary_file_sha256(&program).unwrap();
+        let mut child = Command::new(&program)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let start_token = process_start_token(process_id).unwrap();
+
+        fs::rename(&program, &retired).unwrap();
+        fs::copy(true_program, &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_sha256 = ordinary_file_sha256(&program).unwrap();
+        let running_sha256 = process_executable_sha256(process_id).unwrap();
+
+        assert_eq!(running_sha256, launched_sha256);
+        assert_ne!(running_sha256, replacement_sha256);
+        assert_eq!(process_start_token(process_id), Some(start_token));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_control_endpoint_paths_are_bounded_and_collisions_are_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let qemu = directory.path().join("qemu");
+        fs::create_dir(&qemu).unwrap();
+        let id = Uuid::nil().to_string();
+        let mut config = QemuVmConfig {
+            schema_version: QEMU_CONFIG_SCHEMA,
+            id: id.clone(),
+            name: format!("vmcell-{id}"),
+            ownership_marker: "marker".to_owned(),
+            configuration_path: qemu.clone(),
+            overlay_path: directory.path().join("cell.qcow2"),
+            parent_path: directory.path().join("base.qcow2"),
+            cpu_count: 2,
+            memory_mib: 1024,
+            accelerator: "kvm".to_owned(),
+            qmp: ControlEndpoint::qmp(&qemu, &id),
+            qga: ControlEndpoint::qga(&qemu, &id),
+            command_sha256: String::new(),
+            spawn_pending: false,
+            process_id: None,
+            process_start_token: None,
+            process_executable_sha256: None,
+        };
+        config.command_sha256 = launch_digest(&config);
+        assert!(control_endpoint_is_safe(&config.qmp));
+        assert!(ensure_control_endpoints_absent(&config).is_ok());
+
+        let ControlEndpoint::Unix(qmp_path) = &config.qmp else {
+            unreachable!();
+        };
+        fs::write(qmp_path, b"stale").unwrap();
+        assert!(matches!(
+            ensure_control_endpoints_absent(&config),
+            Err(ProviderError::OwnershipChanged(message))
+                if message.contains("stale or foreign state")
+        ));
+
+        let long_path = PathBuf::from("x".repeat(UNIX_CONTROL_ENDPOINT_LIMIT + 1));
+        assert!(!control_endpoint_is_safe(&ControlEndpoint::Unix(long_path)));
     }
 
     #[test]
@@ -2182,6 +2858,19 @@ mod tests {
         ))
         .unwrap();
         assert!(stopped_config.process_executable_sha256.is_none());
+        #[cfg(unix)]
+        {
+            let ControlEndpoint::Unix(qga_path) = &stopped_config.qga else {
+                unreachable!();
+            };
+            fs::write(qga_path, b"foreign").unwrap();
+            assert!(matches!(
+                provider.remove_vm(&authority, &stopped),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+            assert_eq!(fs::read(qga_path).unwrap(), b"foreign");
+            fs::remove_file(qga_path).unwrap();
+        }
         provider.remove_vm(&authority, &stopped).unwrap();
         assert!(
             provider
@@ -2189,6 +2878,115 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_vm_rejects_overlong_control_endpoints_before_persisting_config() {
+        let (_directory, state, installation, runtime, mut record) =
+            crate::providers::test_mutation_fixture_for(
+                "qemu",
+                "qcow2",
+                crate::core::image::GuestOs::Linux,
+            );
+        drop(runtime);
+        let configuration_path = state
+            .cell_runtime_root(record.id)
+            .join("q".repeat(UNIX_CONTROL_ENDPOINT_LIMIT + 1));
+        record.ownership.configuration_path = configuration_path.clone();
+        let runtime = state
+            .prepare_cell_runtime_for(
+                record.id,
+                configuration_path.clone(),
+                record.ownership.overlay_path.clone(),
+            )
+            .unwrap();
+        let mutation = state.acquire_mutation_lock().unwrap();
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: Some(record.image.path.clone()),
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+            },
+            state.root().join("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+        let request = CreateVmRequest {
+            name: record.ownership.provider_object_name.clone(),
+            configuration_path: configuration_path.clone(),
+            overlay_path: record.ownership.overlay_path.clone(),
+            parent_path: record.image.path.clone(),
+            memory_mib: record.spec.memory_mib,
+            cpu_count: record.spec.cpu_count,
+            accelerator: Some("tcg".to_owned()),
+            allow_tcg: true,
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+
+        assert!(matches!(
+            provider.create_vm(&authority, &request),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(!configuration_path.join("vm.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_creation_uses_staging_and_rejects_dangling_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, state, installation, runtime, record) =
+            crate::providers::test_mutation_fixture_for(
+                "qemu",
+                "qcow2",
+                crate::core::image::GuestOs::Linux,
+            );
+        let mutation = state.acquire_mutation_lock().unwrap();
+        fs::write(&record.image.path, b"base").unwrap();
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: Some(record.image.path.clone()),
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+            },
+            state.root().join("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+        let request = CreateOverlayRequest {
+            parent_path: record.image.path.clone(),
+            overlay_path: record.ownership.overlay_path.clone(),
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+        let overlay = provider.create_overlay(&authority, &request).unwrap();
+        assert_eq!(overlay.path, request.overlay_path);
+        assert!(request.overlay_path.is_file());
+        assert!(
+            fs::read_dir(request.overlay_path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+
+        fs::remove_file(&request.overlay_path).unwrap();
+        let external = state.root().join("external.qcow2");
+        fs::write(&external, b"retain").unwrap();
+        symlink(&external, &request.overlay_path).unwrap();
+        assert!(matches!(
+            provider.create_overlay(&authority, &request),
+            Err(ProviderError::Collision(_))
+        ));
+        assert_eq!(fs::read(&external).unwrap(), b"retain");
     }
 
     #[test]
