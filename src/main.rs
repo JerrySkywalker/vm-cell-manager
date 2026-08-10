@@ -537,7 +537,7 @@ fn run_m2<P: LocalVmProvider>(
                     keep_on_failure,
                 },
             };
-            let interrupt = RunInterruptGuard::install()?;
+            let interrupt = install_run_interrupt(&plan)?;
             let report = if json || human_output == HumanOutputPreference::Quiet {
                 let mut observer = |_event: &RunProgressEvent| {
                     if interrupt.requested() {
@@ -1543,6 +1543,24 @@ impl RunInterruptGuard {
             false
         }
     }
+}
+
+fn install_run_interrupt(plan: &RunExecutionPlan) -> Result<RunInterruptGuard, RunCellError> {
+    install_run_interrupt_with(plan, RunInterruptGuard::install)
+}
+
+fn install_run_interrupt_with(
+    plan: &RunExecutionPlan,
+    install: impl FnOnce() -> Result<RunInterruptGuard, Box<dyn Error>>,
+) -> Result<RunInterruptGuard, RunCellError> {
+    install().map_err(|_| {
+        run_request_validation_error(
+            plan,
+            EngineError::InvalidCellRequest(
+                "the bounded run interruption handler is unavailable".to_owned(),
+            ),
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -2777,7 +2795,7 @@ mod tests {
         let plan = test_run_plan();
         let error = run_credential_error(
             &plan,
-            Box::new(CliInputError("missing credential flag".to_owned())),
+            Box::new(CliInputError("credential-secret-sentinel".to_owned())),
         );
         let classification = classify_cli_error(&error);
         let envelope = RunErrorEnvelope::new(
@@ -2793,6 +2811,76 @@ mod tests {
         assert_eq!(json["run"]["plan"]["contract"], "vmcell.run-plan.v1");
         assert_eq!(json["run"]["plan"]["image"], "windows-dev");
         assert_eq!(json["run"]["plan"]["authorizing"], false);
+        assert!(
+            !serde_json::to_string(&json)
+                .unwrap()
+                .contains("credential-secret-sentinel")
+        );
+    }
+
+    #[test]
+    fn interrupt_install_failure_json_retains_the_safe_resolved_plan() {
+        let plan = test_run_plan();
+        let error = match install_run_interrupt_with(&plan, || {
+            Err(CliInputError("interrupt-secret-sentinel".to_owned()).into())
+        }) {
+            Ok(_) => panic!("injected interrupt installation failure should be reported"),
+            Err(error) => error,
+        };
+        let classification = classify_cli_error(&error);
+        let envelope = RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            error.report(),
+        );
+        let json = serde_json::to_value(envelope).unwrap();
+        let serialized = serde_json::to_string(&json).unwrap();
+
+        assert_eq!(json["error"]["code"], "vmcell.invalid_input");
+        assert_eq!(json["run"]["stage"], "request_validation");
+        assert_eq!(json["run"]["cleanup"], "nothing_created");
+        assert_eq!(json["run"]["plan"]["contract"], "vmcell.run-plan.v1");
+        assert_eq!(json["run"]["plan"]["authorizing"], false);
+        assert!(!serialized.contains("interrupt-secret-sentinel"));
+        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("cmd.exe"));
+        assert!(!serialized.contains("C:\\"));
+    }
+
+    #[test]
+    fn pre_plan_input_failure_stays_generic_while_planned_failures_are_redacted() {
+        let pre_plan = CliInputError("pre-plan-secret-sentinel".to_owned());
+        let classification = classify_cli_error(&pre_plan);
+        let generic = serde_json::to_value(ErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+        ))
+        .unwrap();
+        let generic_serialized = serde_json::to_string(&generic).unwrap();
+
+        assert!(generic.get("run").is_none());
+        assert!(generic.get("plan").is_none());
+        assert!(!generic_serialized.contains("pre-plan-secret-sentinel"));
+
+        let plan = test_run_plan();
+        let planned = run_request_validation_error(
+            &plan,
+            EngineError::ProviderUnavailable("raw-provider-diagnostic-sentinel".to_owned()),
+        );
+        let classification = classify_cli_error(&planned);
+        let planned_json = serde_json::to_value(RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            planned.report(),
+        ))
+        .unwrap();
+        let planned_serialized = serde_json::to_string(&planned_json).unwrap();
+
+        assert_eq!(
+            planned_json["run"]["plan"],
+            serde_json::to_value(&plan).unwrap()
+        );
+        assert!(!planned_serialized.contains("raw-provider-diagnostic-sentinel"));
     }
 
     #[test]
