@@ -403,7 +403,14 @@ def install_smoke(
     if spec is None or spec.loader is None:
         raise ContractError("portable installer identity regression could not load")
     installer_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(installer_module)
+    previous_bytecode_policy = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(installer_module)
+    finally:
+        sys.dont_write_bytecode = previous_bytecode_policy
+    if (layout / "__pycache__").exists():
+        raise ContractError("identity regression modified the retained verified source layout")
     identity_parent = home / "identity-parent"
     identity_parent.mkdir(mode=0o700)
     identity_target = identity_parent / "target"
@@ -432,7 +439,8 @@ def install_smoke(
         environment=environment,
     )
     if removed.returncode != 0 or install_root.exists():
-        raise ContractError("exact portable-package removal failed")
+        detail = removed.stderr.decode("utf-8", errors="replace").strip()
+        raise ContractError(f"exact portable-package removal failed: {detail}")
     if not sentinel.is_file() or sentinel.read_text(encoding="utf-8") != "retain\n":
         raise ContractError("package removal touched an unrelated owner file")
 
