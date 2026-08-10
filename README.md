@@ -143,6 +143,7 @@ The current `dev` candidate exposes:
 ```text
 vmcell doctor
 vmcell status
+vmcell state check
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows --provider hyperv
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
@@ -214,6 +215,13 @@ forwards bounded guest stdout/stderr to their matching streams, and returns the
 guest exit code after a completed command. `--json` suppresses progress and
 emits the versioned run report; failure envelopes include safe recovery
 identifiers and cleanup disposition but never guest stream contents.
+
+Before first use of a newer binary against an existing root, `vmcell state
+check` provides a read-only, provider-free durable compatibility preflight.
+The frozen v0.1 candidate and v0.2 share durable format version 1; compatible
+v0.1 records are read in place without rewrite. Unknown schemas fail with
+`vmcell.state.upgrade_required` before mutation. See
+[durable-state compatibility and recovery](docs/state-compatibility.md).
 
 `vmcell image validate` is read-only. Candidate-path mode proves that the
 ordinary non-reparse base file has the selected provider's format, has no

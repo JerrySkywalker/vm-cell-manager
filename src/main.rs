@@ -1,5 +1,7 @@
 use std::error::Error;
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +12,7 @@ use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliExitCode, CliHumanOutput, CliInputError, CliProvider, Command,
     CredentialArgs, DoctorReport, ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope,
-    ProviderCommand, RunErrorEnvelope, StatusCellEntry, StatusCellObservation,
+    ProviderCommand, RunErrorEnvelope, StateCommand, StatusCellEntry, StatusCellObservation,
     StatusCleanupGuidance, StatusImageEntry, StatusImageObservation, StatusImageVariantObservation,
     StatusOperationEntry, StatusReport, StatusRetention, classify_cli_error, public_error_message,
 };
@@ -38,7 +40,7 @@ use vm_cell_manager::providers::{
     LocalVmProvider, ProviderPowerState, ProviderProbe, ProviderProbeStatus,
     builtin_provider_probes,
 };
-use vm_cell_manager::state::StateStore;
+use vm_cell_manager::state::{StateCompatibilityReport, StateCompatibilityStatus, StateStore};
 use zeroize::Zeroizing;
 
 fn main() -> ExitCode {
@@ -173,6 +175,16 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             )?;
             emit(&report, cli.json, || {
                 write_status_report(&report, &mut std::io::stdout().lock())
+                    .expect("stdout should remain writable");
+            })?;
+        }
+        Command::State {
+            command: StateCommand::Check,
+        } => {
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let report = StateStore::new(root).check_compatibility()?;
+            emit(&report, cli.json, || {
+                write_state_compatibility(&report, &mut std::io::stdout().lock())
                     .expect("stdout should remain writable");
             })?;
         }
@@ -435,11 +447,19 @@ fn run_m2<P: LocalVmProvider>(
                     keep_on_failure,
                 },
             };
+            let interrupt = RunInterruptGuard::install()?;
             let report = if json || human_output == HumanOutputPreference::Quiet {
-                let mut observer = |_event: &RunProgressEvent| RunControl::Continue;
+                let mut observer = |_event: &RunProgressEvent| {
+                    if interrupt.requested() {
+                        RunControl::Cancel
+                    } else {
+                        RunControl::Continue
+                    }
+                };
                 run_cell_guest(engine, credential, request, &mut observer)?
             } else {
-                let mut observer = HumanRunObserver::new(std::io::stderr());
+                let mut observer =
+                    HumanRunObserver::with_interrupt(std::io::stderr(), || interrupt.requested());
                 let result = run_cell_guest(engine, credential, request, &mut observer);
                 let output_result = observer.finish().map(|_| ());
                 let report = result?;
@@ -608,7 +628,7 @@ fn run_m2<P: LocalVmProvider>(
                 )
                 .into());
             }
-            let interrupt = ShellInterruptGuard::install()?;
+            let interrupt = ConsoleInterruptGuard::install()?;
             let console = open_windows_console_input()?;
             let credentials = read_credentials(engine.provider_name(), credential)?;
             let mut executor = EngineShellCommandExecutor {
@@ -786,7 +806,7 @@ fn run_m2<P: LocalVmProvider>(
                 }
             })?;
         }
-        Command::Doctor | Command::Status | Command::Provider { .. } => {
+        Command::Doctor | Command::Status | Command::State { .. } | Command::Provider { .. } => {
             unreachable!("handled before engine creation")
         }
     }
@@ -1075,6 +1095,7 @@ fn provider_for_command(
             command: ImageCommand::List,
         }
         | Command::Operation { .. }
+        | Command::State { .. }
         | Command::Doctor
         | Command::Status
         | Command::Provider { .. } => CliProvider::Hyperv.as_str().to_owned(),
@@ -1326,30 +1347,29 @@ fn run_shell_session<E: ShellCommandExecutor>(
 }
 
 #[cfg(windows)]
-static SHELL_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CONSOLE_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
-unsafe extern "system" fn shell_console_control_handler(control: u32) -> i32 {
+unsafe extern "system" fn console_control_handler(control: u32) -> i32 {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
     if matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
-        SHELL_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        CONSOLE_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
         1
     } else {
         0
     }
 }
 
-struct ShellInterruptGuard;
+struct ConsoleInterruptGuard;
 
-impl ShellInterruptGuard {
+impl ConsoleInterruptGuard {
     #[cfg(windows)]
     fn install() -> Result<Self, Box<dyn Error>> {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-        SHELL_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
-        if unsafe { SetConsoleCtrlHandler(Some(shell_console_control_handler), 1) } == 0 {
+        CONSOLE_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+        if unsafe { SetConsoleCtrlHandler(Some(console_control_handler), 1) } == 0 {
             return Err(CliInputError(
-                "vmcell shell could not install its bounded console interruption handler"
-                    .to_owned(),
+                "vmcell could not install its bounded console interruption handler".to_owned(),
             )
             .into());
         }
@@ -1364,7 +1384,38 @@ impl ShellInterruptGuard {
     fn requested(&self) -> bool {
         #[cfg(windows)]
         {
-            SHELL_INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+            CONSOLE_INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
+struct RunInterruptGuard {
+    #[cfg(windows)]
+    _console: ConsoleInterruptGuard,
+}
+
+impl RunInterruptGuard {
+    fn install() -> Result<Self, Box<dyn Error>> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                _console: ConsoleInterruptGuard::install()?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    fn requested(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self._console.requested()
         }
         #[cfg(not(windows))]
         {
@@ -1374,11 +1425,11 @@ impl ShellInterruptGuard {
 }
 
 #[cfg(windows)]
-impl Drop for ShellInterruptGuard {
+impl Drop for ConsoleInterruptGuard {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-        let _ = unsafe { SetConsoleCtrlHandler(Some(shell_console_control_handler), 0) };
-        SHELL_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+        let _ = unsafe { SetConsoleCtrlHandler(Some(console_control_handler), 0) };
+        CONSOLE_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1578,6 +1629,27 @@ fn write_doctor_report(report: &DoctorReport, output: &mut impl Write) -> std::i
             "next_action=investigate_provider provider_probe=unavailable"
         )
     }
+}
+
+fn write_state_compatibility(
+    report: &StateCompatibilityReport,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let status = match report.status {
+        StateCompatibilityStatus::Empty => "empty",
+        StateCompatibilityStatus::Compatible => "compatible",
+    };
+    writeln!(
+        output,
+        "state format={} status={} installations={} images={} cells={} operations={} artifacts={}",
+        report.durable_state_format_version,
+        status,
+        report.counts.installations,
+        report.counts.images,
+        report.counts.cells,
+        report.counts.guest_operations,
+        report.counts.artifacts
+    )
 }
 
 fn write_status_report(report: &StatusReport, output: &mut impl Write) -> std::io::Result<()> {
@@ -2090,16 +2162,34 @@ fn write_human_run_result(
     )
 }
 
-struct HumanRunObserver<W: Write> {
+struct HumanRunObserver<W: Write, F: Fn() -> bool = fn() -> bool> {
     writer: W,
     error: Option<std::io::Error>,
+    interrupted: F,
 }
 
-impl<W: Write> HumanRunObserver<W> {
+#[cfg(test)]
+fn never_interrupted() -> bool {
+    false
+}
+
+#[cfg(test)]
+impl<W: Write> HumanRunObserver<W, fn() -> bool> {
     fn new(writer: W) -> Self {
         Self {
             writer,
             error: None,
+            interrupted: never_interrupted,
+        }
+    }
+}
+
+impl<W: Write, F: Fn() -> bool> HumanRunObserver<W, F> {
+    fn with_interrupt(writer: W, interrupted: F) -> Self {
+        Self {
+            writer,
+            error: None,
+            interrupted,
         }
     }
 
@@ -2119,7 +2209,7 @@ impl<W: Write> HumanRunObserver<W> {
     }
 }
 
-impl<W: Write> RunObserver for HumanRunObserver<W> {
+impl<W: Write, F: Fn() -> bool> RunObserver for HumanRunObserver<W, F> {
     fn observe(&mut self, event: &RunProgressEvent) -> RunControl {
         match event {
             RunProgressEvent::ImageVerified { image } => {
@@ -2160,7 +2250,11 @@ impl<W: Write> RunObserver for HumanRunObserver<W> {
                 ));
             }
         }
-        RunControl::Continue
+        if (self.interrupted)() {
+            RunControl::Cancel
+        } else {
+            RunControl::Continue
+        }
     }
 }
 
@@ -2256,27 +2350,54 @@ fn read_credentials(
     let username = args
         .username
         .ok_or_else(|| CliInputError("PowerShell Direct requires --username".to_owned()))?;
-    let mut password = Zeroizing::new(String::new());
-    if let Err(error) = std::io::stdin().take(4097).read_to_string(&mut password) {
-        if error.kind() == std::io::ErrorKind::InvalidData {
-            return Err(
-                CliInputError("guest password stdin must be valid UTF-8".to_owned()).into(),
-            );
-        }
-        return Err(error.into());
-    }
-    while password.ends_with(['\r', '\n']) {
-        password.pop();
-    }
-    if password.len() > 4096 || password.contains(['\r', '\n']) {
-        return Err(
-            CliInputError("guest password stdin must contain one bounded line".to_owned()).into(),
-        );
-    }
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut password = read_password_line(&mut stdin)?;
     Ok(GuestCredentials::new(
         username,
         std::mem::take(&mut *password),
     )?)
+}
+
+fn read_password_line(input: &mut impl BufRead) -> Result<Zeroizing<String>, Box<dyn Error>> {
+    const MAX_PASSWORD_BYTES: usize = 4096;
+
+    let mut bytes = Zeroizing::new(Vec::new());
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            bytes.extend_from_slice(&available[..=newline]);
+            input.consume(newline + 1);
+            break;
+        }
+        if bytes.len().saturating_add(available.len()) > MAX_PASSWORD_BYTES {
+            return Err(CliInputError(
+                "guest password stdin must contain one bounded line".to_owned(),
+            )
+            .into());
+        }
+        let consumed = available.len();
+        bytes.extend_from_slice(available);
+        input.consume(consumed);
+    }
+
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > MAX_PASSWORD_BYTES || bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+        return Err(
+            CliInputError("guest password stdin must contain one bounded line".to_owned()).into(),
+        );
+    }
+    let password = std::str::from_utf8(&bytes)
+        .map_err(|_| CliInputError("guest password stdin must be valid UTF-8".to_owned()))?;
+    Ok(Zeroizing::new(password.to_owned()))
 }
 
 fn emit<T: Serialize>(
@@ -2491,6 +2612,38 @@ mod tests {
             "vmcell: cleanup refused: cell={cell_id} reason=ambiguous_state"
         )));
         assert!(!output.contains("credential-sentinel"));
+    }
+
+    #[test]
+    fn run_observer_samples_interruption_at_the_next_durable_stage_boundary() {
+        let cell_id = vm_cell_manager::core::cell::CellId::new();
+        let mut observer = HumanRunObserver::with_interrupt(Vec::new(), || true);
+        assert_eq!(
+            observer.observe(&RunProgressEvent::ProviderStarted { cell_id }),
+            RunControl::Cancel
+        );
+        let output = String::from_utf8(observer.finish().unwrap()).unwrap();
+        assert!(output.contains(&format!("provider started: {cell_id}")));
+    }
+
+    #[test]
+    fn password_pipe_reads_one_bounded_line_without_waiting_for_eof() {
+        let mut input = std::io::BufReader::new(std::io::Cursor::new(
+            b"credential-sentinel\r\nignored-after-first-line".to_vec(),
+        ));
+        let password = read_password_line(&mut input).unwrap();
+        assert_eq!(&**password, "credential-sentinel");
+        let mut remainder = String::new();
+        input.read_to_string(&mut remainder).unwrap();
+        assert_eq!(remainder, "ignored-after-first-line");
+
+        let mut oversized = std::io::BufReader::new(std::io::Cursor::new(vec![b'x'; 4097]));
+        let error = read_password_line(&mut oversized).unwrap_err();
+        assert!(error.downcast_ref::<CliInputError>().is_some());
+
+        let mut invalid = std::io::BufReader::new(std::io::Cursor::new(vec![0xff, b'\n']));
+        let error = read_password_line(&mut invalid).unwrap_err();
+        assert!(error.downcast_ref::<CliInputError>().is_some());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
@@ -22,6 +23,9 @@ use crate::core::image::{IMAGE_SCHEMA_VERSION, ImageId, ImageRecord};
 use crate::core::ownership::OWNERSHIP_MARKER_SCHEMA;
 
 pub const INSTALL_SCHEMA_VERSION: u32 = 1;
+pub const STATE_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
+pub const DURABLE_STATE_FORMAT_VERSION: u32 = 1;
+pub const STATE_COMPATIBILITY_CONTRACT: &str = "vmcell.state-compatibility.v1";
 pub const MAX_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REDACTED_LEGACY_ERROR_CODE: &str = "vmcell.legacy.redacted";
@@ -36,6 +40,42 @@ pub struct StateStore {
 pub struct InstallationRecord {
     pub schema_version: u32,
     pub install_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateCompatibilityStatus {
+    Empty,
+    Compatible,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateCompatibilityCounts {
+    pub installations: u64,
+    pub images: u64,
+    pub cells: u64,
+    pub guest_operations: u64,
+    pub artifacts: u64,
+}
+
+impl StateCompatibilityCounts {
+    fn is_empty(&self) -> bool {
+        self.installations == 0
+            && self.images == 0
+            && self.cells == 0
+            && self.guest_operations == 0
+            && self.artifacts == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StateCompatibilityReport {
+    pub schema_version: u32,
+    pub contract: &'static str,
+    pub durable_state_format_version: u32,
+    pub status: StateCompatibilityStatus,
+    pub checked_at: DateTime<Utc>,
+    pub counts: StateCompatibilityCounts,
 }
 
 #[derive(Debug, Error)]
@@ -78,6 +118,15 @@ pub enum StateError {
         kind: &'static str,
         path: PathBuf,
         expected: u32,
+        actual: u32,
+    },
+
+    #[error(
+        "durable {kind} schema requires a different vmcell version: supported {supported}, found {actual}"
+    )]
+    UpgradeRequired {
+        kind: &'static str,
+        supported: u32,
         actual: u32,
     },
 
@@ -197,6 +246,59 @@ impl StateStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Validate every active core durable record without creating state,
+    /// contacting a provider, replaying guest work, or rewriting older
+    /// compatible JSON. Tombstoned or quarantined artifact subtrees are not
+    /// compatibility evidence and remain subject to their recovery paths.
+    pub fn check_compatibility(&self) -> Result<StateCompatibilityReport, StateError> {
+        let _state_root = match fs::symlink_metadata(&self.root) {
+            Ok(_) => Some(open_ordinary_directory(&self.root)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(io_error(&self.root, source)),
+        };
+        let installation_path = self.root.join("installation.json");
+        let installations = match fs::symlink_metadata(&installation_path) {
+            Ok(_) => {
+                self.load_installation().map_err(as_upgrade_required)?;
+                1
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(source) => return Err(io_error(&installation_path, source)),
+        };
+        let images = self.list_images().map_err(as_upgrade_required)?;
+        let cells = self.list_cells().map_err(as_upgrade_required)?;
+        let operations = self.list_guest_operations().map_err(as_upgrade_required)?;
+        let mut artifacts = 0_u64;
+        for operation in &operations {
+            if operation.artifact_id == Some(operation.id) && operation.artifact_pruned_at.is_none()
+            {
+                self.load_artifact(operation.cell_id, operation.id)
+                    .map_err(as_upgrade_required)?;
+                artifacts = artifacts.saturating_add(1);
+            }
+        }
+        let counts = StateCompatibilityCounts {
+            installations,
+            images: images.len() as u64,
+            cells: cells.len() as u64,
+            guest_operations: operations.len() as u64,
+            artifacts,
+        };
+        let status = if counts.is_empty() {
+            StateCompatibilityStatus::Empty
+        } else {
+            StateCompatibilityStatus::Compatible
+        };
+        Ok(StateCompatibilityReport {
+            schema_version: STATE_COMPATIBILITY_SCHEMA_VERSION,
+            contract: STATE_COMPATIBILITY_CONTRACT,
+            durable_state_format_version: DURABLE_STATE_FORMAT_VERSION,
+            status,
+            checked_at: Utc::now(),
+            counts,
+        })
     }
 
     pub(crate) fn acquire_mutation_lock(&self) -> Result<MutationGuard, StateError> {
@@ -1845,6 +1947,22 @@ fn ensure_schema(
     }
 }
 
+fn as_upgrade_required(error: StateError) -> StateError {
+    match error {
+        StateError::UnsupportedSchema {
+            kind,
+            expected,
+            actual,
+            ..
+        } => StateError::UpgradeRequired {
+            kind,
+            supported: expected,
+            actual,
+        },
+        error => error,
+    }
+}
+
 fn validate_runtime_chain(state_root: &Path, cell_root: &Path) -> Result<(), StateError> {
     let runtime_root = state_root.join("runtime");
     if cell_root.parent() != Some(runtime_root.as_path()) {
@@ -2044,6 +2162,130 @@ mod tests {
             Err(StateError::NotFound(_))
         ));
         assert!(!store.root().join("installation.json").exists());
+    }
+
+    #[test]
+    fn compatibility_check_is_read_only_for_empty_and_v01_state() {
+        let directory = tempdir().unwrap();
+        let empty_root = directory.path().join("empty-state");
+        let empty = StateStore::new(empty_root.clone())
+            .check_compatibility()
+            .unwrap();
+        assert_eq!(empty.status, StateCompatibilityStatus::Empty);
+        assert_eq!(empty.counts, StateCompatibilityCounts::default());
+        assert!(!empty_root.exists());
+
+        let store = StateStore::new(directory.path().join("v01-state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        store.installation().unwrap();
+        let image_id = ImageId::parse("crash-base").unwrap();
+        let image = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: image_id,
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: vec![ImageVariant {
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: directory.path().join("v01-base.vhdx"),
+                sha256: "v01-fixture-hash".to_owned(),
+                file_size: 42,
+            }],
+            registered_at: Utc::now(),
+        };
+        store.save_image_new(&image).unwrap();
+        let cell_id = CellId::new();
+        store.save_cell(&test_cell_record(&store, cell_id)).unwrap();
+        let now = Utc::now();
+        let mut operation = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
+        operation.phase = GuestOperationPhase::Failed;
+        operation.failure = Some(GuestFailureClass::Authentication);
+        operation.completed_at = Some(now);
+        store.save_guest_operation(&operation).unwrap();
+        let operation_path = store.guest_operation_path(operation.id);
+        let mut legacy_operation = serde_json::to_value(&operation).unwrap();
+        legacy_operation
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_pruned_at");
+        fs::write(
+            &operation_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&legacy_operation).unwrap()
+            ),
+        )
+        .unwrap();
+        drop(mutation);
+
+        let tracked_paths = [
+            store.root().join("installation.json"),
+            store.image_path(&image.id),
+            store.cell_path(cell_id),
+            operation_path,
+        ];
+        let before = tracked_paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let report = store.check_compatibility().unwrap();
+        let after = tracked_paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(report.contract, STATE_COMPATIBILITY_CONTRACT);
+        assert_eq!(report.durable_state_format_version, 1);
+        assert_eq!(report.status, StateCompatibilityStatus::Compatible);
+        assert_eq!(report.counts.installations, 1);
+        assert_eq!(report.counts.images, 1);
+        assert_eq!(report.counts.cells, 1);
+        assert_eq!(report.counts.guest_operations, 1);
+        assert_eq!(report.counts.artifacts, 0);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn compatibility_check_rejects_future_schema_without_rewriting_it() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        let image_id = ImageId::parse("future-base").unwrap();
+        let image = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: image_id.clone(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: vec![ImageVariant {
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: directory.path().join("future.vhdx"),
+                sha256: "future-fixture-hash".to_owned(),
+                file_size: 42,
+            }],
+            registered_at: Utc::now(),
+        };
+        store.save_image_new(&image).unwrap();
+        let path = store.image_path(&image_id);
+        let mut future = serde_json::to_value(&image).unwrap();
+        future["schema_version"] = serde_json::json!(IMAGE_SCHEMA_VERSION + 1);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&future).unwrap()),
+        )
+        .unwrap();
+        drop(mutation);
+        let before = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            store.check_compatibility(),
+            Err(StateError::UpgradeRequired {
+                kind: "image record",
+                supported: IMAGE_SCHEMA_VERSION,
+                actual,
+            }) if actual == IMAGE_SCHEMA_VERSION + 1
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]

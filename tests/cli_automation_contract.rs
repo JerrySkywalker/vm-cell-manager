@@ -271,6 +271,51 @@ fn config_state_root_is_used_and_cli_state_root_wins() {
 }
 
 #[test]
+fn state_check_is_read_only_versioned_and_rejects_future_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let empty_root = directory.path().join("empty-state");
+    let empty = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--state-root"])
+        .arg(&empty_root)
+        .args(["state", "check"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["contract"], "vmcell.state-compatibility.v1");
+    assert_eq!(report["durable_state_format_version"], 1);
+    assert_eq!(report["status"], "empty");
+    assert!(!empty_root.exists());
+
+    let state_root = directory.path().join("future-state");
+    let base_path = directory.path().join("base.vhdx");
+    write_image_fixture(&state_root, &base_path);
+    let manifest = state_root.join("images").join("daily-image.json");
+    let mut future: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    future["schema_version"] = serde_json::json!(2);
+    fs::write(&manifest, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+    let before = fs::read(&manifest).unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--state-root"])
+        .arg(&state_root)
+        .args(["state", "check"])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(9));
+    let error: serde_json::Value = serde_json::from_slice(&rejected.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "vmcell.state.upgrade_required");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stop mutation")
+    );
+    assert_eq!(fs::read(manifest).unwrap(), before);
+}
+
+#[test]
 fn malformed_or_unsupported_config_fails_before_state_access_and_is_redacted() {
     let directory = tempfile::tempdir().unwrap();
     let forbidden_root = directory.path().join("must-not-exist");

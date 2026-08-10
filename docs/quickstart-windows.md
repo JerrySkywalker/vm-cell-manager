@@ -85,6 +85,20 @@ Registration records the canonical path, format, file size, and SHA-256.
 `image inspect` repeats the provider/content proof before any cell is created.
 Do not modify or replace the registered VHDX.
 
+If this state root was used by the frozen v0.1 candidate, stop other vmcell
+commands and run the v0.2 compatibility preflight before the first mutation:
+
+```powershell
+& $vmcell state check
+if ($LASTEXITCODE -ne 0) {
+  throw 'state is not compatible; keep it unchanged and follow docs/state-compatibility.md'
+}
+```
+
+v0.1 and v0.2 share durable format 1, so compatible records are not migrated or
+rewritten. An upgrade-required or integrity result is a hard stop, not a repair
+invitation.
+
 ## 5. Run one command and observe automatic cleanup
 
 The guest password is read from bounded stdin and never belongs on argv or in
@@ -112,6 +126,12 @@ guest readiness, guest stdout/stderr and exit status, cleanup, and the final
 cell disposition. The default policy destroys the exact-owned cell after a
 completed successful command. Unknown or ambiguous guest/provider state is
 retained for explicit recovery and is never automatically replayed.
+
+Ctrl-C is cooperative: vmcell observes it at the next bounded orchestration
+stage. If guest transport was active, the operation and cell are retained for
+inspection; if the command had already completed, its result remains durable
+and the configured keep/cleanup policy applies. See
+[`state-compatibility.md`](state-compatibility.md) for the recovery matrix.
 
 ## 6. Verify the cleanup record
 

@@ -73,6 +73,12 @@ pub enum Command {
     /// Summarize providers, cells, images, operations, and safe next actions read-only.
     Status,
 
+    /// Check durable-state compatibility without mutation or provider access.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
+
     /// Inspect built-in local providers.
     Provider {
         #[command(subcommand)]
@@ -366,6 +372,12 @@ pub enum GuestOperationCommand {
 
     /// Reconcile a durable operation without replaying guest side effects.
     Reconcile { operation_id: GuestOperationId },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StateCommand {
+    /// Validate every core durable record against the current supported format.
+    Check,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -831,7 +843,10 @@ pub struct CliErrorClassification {
 }
 
 #[must_use]
-pub const fn public_error_message(classification: CliErrorClassification) -> &'static str {
+pub fn public_error_message(classification: CliErrorClassification) -> &'static str {
+    if matches!(classification.code, "vmcell.state.upgrade_required") {
+        return "durable state requires a different vmcell version; stop mutation and follow the documented upgrade path";
+    }
     match classification.category {
         CliErrorCategory::InvalidInput => "request input is invalid",
         CliErrorCategory::NotFound => "requested state object was not found",
@@ -1048,6 +1063,12 @@ fn classify_state_error(error: &StateError) -> CliErrorClassification {
         | StateError::ArtifactIntegrity { .. }
         | StateError::GuestOperationIntegrity { .. } => classification(
             "vmcell.state.integrity",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        StateError::UpgradeRequired { .. } => classification(
+            "vmcell.state.upgrade_required",
             CliErrorCategory::Integrity,
             CliExitCode::Integrity,
             false,
@@ -1983,6 +2004,19 @@ mod tests {
         assert_eq!(json["cells"], serde_json::json!([]));
         assert_eq!(json["images"], serde_json::json!([]));
         assert_eq!(json["operations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn state_check_is_an_explicit_nested_read_only_command() {
+        let cli = Cli::try_parse_from(["vmcell", "--json", "state", "check"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::State {
+                command: StateCommand::Check
+            }
+        ));
+        assert!(Cli::try_parse_from(["vmcell", "state"]).is_err());
     }
 
     #[test]

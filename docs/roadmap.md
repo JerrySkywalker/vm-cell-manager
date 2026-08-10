@@ -392,9 +392,22 @@ Normal human interruption must be understandable across Ctrl-C, readiness/comman
 
 The user is told whether nothing was created, an exact-owned cell remains, cleanup succeeded, or cleanup was refused because state is ambiguous.
 
+**Repository-local implementation:** Windows `run` now samples Ctrl-C
+cooperatively at durable stage boundaries. Safe pre-guest interruption can use
+the existing exact-owned cleanup path; transport-active/unknown work remains
+nonterminal, retained, and nonreplayed; completed commands retain their result
+and requested keep policy. Status, operation reconciliation, and explicit GC
+continue to provide the recovery path for retained/expired cells.
+
 ### Upgrade compatibility
 
 A user upgrading from `v0.1.x` to `v0.2.0` receives a defined durable-state compatibility story. Older state is either supported, explicitly migrated through a bounded path, or rejected with deterministic upgrade instructions. Silent reinterpretation is forbidden.
+
+**Repository-local implementation:** the frozen v0.1 candidate and v0.2 share
+durable format version 1. `vmcell state check` validates active schema-1 records
+read-only without provider access or rewrite. Unknown schemas return the stable
+`vmcell.state.upgrade_required` integrity result and stop mutation; no implicit
+migration or downgrade exists.
 
 ### Windows installation quality
 
