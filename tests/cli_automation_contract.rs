@@ -25,7 +25,7 @@ fn run_vmcell(arguments: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn version_help_and_powershell_completion_are_stable_and_state_free() {
+fn version_help_and_shell_completions_are_stable_and_state_free() {
     let version = run_vmcell(&["--version"]);
     assert!(version.status.success());
     assert_eq!(
@@ -43,14 +43,20 @@ fn version_help_and_powershell_completion_are_stable_and_state_free() {
     let directory = tempfile::tempdir().unwrap();
     let absent_state = directory.path().join("must-not-exist");
     let state = absent_state.to_string_lossy().into_owned();
-    let first = run_vmcell(&["--state-root", state.as_str(), "completion", "powershell"]);
-    let second = run_vmcell(&["--state-root", state.as_str(), "completion", "powershell"]);
-    assert!(first.status.success());
-    assert!(second.status.success());
-    assert_eq!(first.stdout, second.stdout);
-    assert!(first.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&first.stdout).contains("Register-ArgumentCompleter"));
-    assert!(!absent_state.exists());
+    for (shell, marker) in [
+        ("bash", "complete"),
+        ("powershell", "Register-ArgumentCompleter"),
+        ("zsh", "#compdef vmcell"),
+    ] {
+        let first = run_vmcell(&["--state-root", state.as_str(), "completion", shell]);
+        let second = run_vmcell(&["--state-root", state.as_str(), "completion", shell]);
+        assert!(first.status.success());
+        assert!(second.status.success());
+        assert_eq!(first.stdout, second.stdout);
+        assert!(first.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&first.stdout).contains(marker));
+        assert!(!absent_state.exists());
+    }
 
     let json = run_vmcell(&[
         "--json",

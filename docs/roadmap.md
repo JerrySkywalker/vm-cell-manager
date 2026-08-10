@@ -502,6 +502,16 @@ Prove real QEMU process lifecycle, immutable QCOW2 base, exactly one overlay, QM
 
 Publish a supported native Linux binary/install path and prove Unix state permissions, path containment, process-tree termination, QMP Unix sockets, KVM admission, durable state, and cleanup semantics.
 
+**Repository-local implementation:** the manual exact-SHA native-Linux lane
+builds and validates a deterministic `x86_64-unknown-linux-gnu` portable
+archive on the declared Ubuntu 24.04/Rust 1.85.0 baseline. The package carries
+generated Bash/Zsh completion, exact source/build provenance, internal and
+adjacent checksums, an observed GLIBC symbol floor, and bounded install,
+upgrade, rollback, and removal guidance. Repeated package assembly from the
+same binary and declared inputs is byte-identical; cross-environment binary
+reproducibility is not claimed. No apt/rpm publication or real KVM/QGA
+acceptance is implied.
+
 ### Cross-platform image variants
 
 A logical image identity can expose provider-specific variants cleanly where appropriate, without requiring users to understand internal manifest mechanics.

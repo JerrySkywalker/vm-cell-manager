@@ -85,8 +85,11 @@ It is manual `workflow_dispatch` only, accepts one exact lowercase 40-hex
 repository commit, and checks out and proves that SHA on the declared
 GitHub-hosted `ubuntu-24.04` x86_64 baseline. The ephemeral job installs exactly
 Rust 1.85.0 with rustfmt and Clippy, then runs locked metadata, format, check,
-Clippy, all-target tests, doc-tests, Linux shell parsing, and the fixture-only
-Linux KVM preflight contract. It has read-only
+Clippy, all-target tests, doc-tests, Linux shell parsing, the fixture-only
+Linux KVM preflight contract, and the deterministic Linux portable-package
+contract. The package gate builds into the external Cargo target, records the
+observed GLIBC symbol floor, validates two byte-identical assemblies, and runs
+only an unprivileged temporary-prefix install/remove smoke. It has read-only
 repository permission, persists no checkout credentials, and has no `push` or
 `pull_request` trigger. Repository tests may perform the existing non-mutating
 KVM usability probe, which can open `/dev/kvm` read/write but issues no KVM

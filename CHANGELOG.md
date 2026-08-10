@@ -58,6 +58,10 @@ The project is currently pre-release and follows an architecture-first bootstrap
 - Fake QMP/QGA, launch-digest, no-network, explicit-TCG, provider-authority, process-timeout, and provider-neutral lifecycle coverage for M3.
 - M4 Unix private-state/no-follow identity gates, Linux KVM device usability filtering, canonical QEMU executable discovery, Unix QMP socket coverage, and a native-Linux validation workflow.
 - Native Linux QEMU/KVM/QGA human workflow, typed missing/permission/device-identity KVM diagnostics, bounded collision-safe Unix control endpoints, and a fixture-tested non-authorizing dedicated-host preflight/receipt contract.
+- Deterministic `x86_64-unknown-linux-gnu` portable archive assembly with
+  generated Bash/Zsh completion, exact source/build provenance, measured GLIBC
+  symbol floor, layered SHA-256 manifests, archive-safety regressions, and an
+  unprivileged temporary-prefix install/remove smoke contract.
 
 ### Changed
 - Adopted a permanent stable-`main`/integration-`dev` branch model: ephemeral

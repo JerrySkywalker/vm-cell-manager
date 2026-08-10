@@ -270,6 +270,15 @@ manual trusted-runner workflow does not publish a package, release, or tag; see
 verification, and [Windows install, upgrade, and remove](docs/windows-install-upgrade-remove.md)
 for the operator workflow.
 
+The repository-local Linux distribution mirrors that discipline for
+`x86_64-unknown-linux-gnu`: a deterministic versioned `.tar.gz`, generated Bash
+and Zsh completion, in-archive and adjacent SHA-256 manifests, exact build
+provenance, and an unprivileged temporary-prefix install/remove smoke test. The
+manual native-Linux exact-SHA lane records the observed GLIBC symbol floor and
+does not claim musl/static portability or real KVM/QGA acceptance. See the
+[Linux portable package](docs/linux-portable-package.md) and
+[Linux install, upgrade, and remove](docs/linux-install-upgrade-remove.md).
+
 ## Safety and ownership
 
 The local runtime is designed to be conservative around host state.

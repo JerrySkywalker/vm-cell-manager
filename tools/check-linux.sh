@@ -12,3 +12,5 @@ cargo test --locked --workspace --all-features --doc
 sh -n tools/linux-kvm-preflight.sh
 sh -n tools/test-linux-kvm-preflight.sh
 sh tools/test-linux-kvm-preflight.sh
+sh -n tools/check-linux-package.sh
+sh tools/check-linux-package.sh
