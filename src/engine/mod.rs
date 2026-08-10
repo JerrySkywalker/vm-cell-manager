@@ -3743,7 +3743,9 @@ mod tests {
         fail_remove: bool,
         malformed_create_identity: bool,
         noncanonical_create_identity: bool,
+        #[cfg(windows)]
         installation_rotation_path: Option<PathBuf>,
+        #[cfg(windows)]
         installation_rotation_blocked: bool,
     }
 

@@ -90,10 +90,10 @@ impl HyperVCommandExecutor for PowerShellHyperVExecutor {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = action;
-            return Err(ProviderError::Unsupported {
+            Err(ProviderError::Unsupported {
                 provider: "hyperv",
                 operation: "powershell_command",
-            });
+            })
         }
 
         #[cfg(target_os = "windows")]
