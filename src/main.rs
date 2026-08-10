@@ -23,9 +23,10 @@ use vm_cell_manager::core::image::{Architecture, GuestOs, ImageRecord};
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
     GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
-    GuestOperationRecoveryReport, ImageValidationReport, ImageValidationStatus,
-    RegisterImageRequest, RunCellError, RunCellReport, RunCellRequest, RunCleanupPolicy,
-    RunControl, RunObserver, RunProgressEvent, ValidateImageRequest,
+    GuestOperationRecoveryReport, ImageDependencyReport, ImageUnregisterReport,
+    ImageValidationReport, ImageValidationStatus, RegisterImageRequest, RunCellError,
+    RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
+    ValidateImageRequest, inspect_image_dependencies, unregister_image,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -172,6 +173,28 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     write_provider_probe(probe, &mut std::io::stdout().lock())
                         .expect("stdout should remain writable");
                 }
+            })?;
+        }
+        Command::Image {
+            command: ImageCommand::Dependencies { id },
+        } => {
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let state = StateStore::new(root).with_mutation_lock_timeout(lock_timeout);
+            let report = inspect_image_dependencies(&state, &id)?;
+            emit(&report, cli.json, || {
+                write_image_dependencies(&report, &mut std::io::stdout().lock())
+                    .expect("stdout should remain writable");
+            })?;
+        }
+        Command::Image {
+            command: ImageCommand::Unregister { id },
+        } => {
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let state = StateStore::new(root).with_mutation_lock_timeout(lock_timeout);
+            let report = unregister_image(&state, &id)?;
+            emit(&report, cli.json, || {
+                write_image_unregister(&report, &mut std::io::stdout().lock())
+                    .expect("stdout should remain writable");
             })?;
         }
         Command::Reconcile { cell_id: None } => {
@@ -324,6 +347,9 @@ fn run_m2<P: LocalVmProvider>(
                         return Ok(ExitCode::from(CliExitCode::Integrity.as_u8()));
                     }
                 }
+            }
+            ImageCommand::Dependencies { .. } | ImageCommand::Unregister { .. } => {
+                unreachable!("provider-neutral image command was routed before provider selection")
             }
         },
         Command::Create {
@@ -964,6 +990,13 @@ fn provider_for_command(command: &Command, state: &StateStore) -> Result<String,
         Command::Reconcile { cell_id: None } | Command::Gc => {
             return Err("multi-provider command was not routed before provider selection".into());
         }
+        Command::Image {
+            command: ImageCommand::Dependencies { .. } | ImageCommand::Unregister { .. },
+        } => {
+            return Err(
+                "provider-neutral image command was not routed before provider selection".into(),
+            );
+        }
     };
     Ok(provider)
 }
@@ -1340,6 +1373,41 @@ fn write_registered_image(image: &ImageRecord, output: &mut impl Write) -> std::
         )?;
     }
     Ok(())
+}
+
+fn write_image_dependencies(
+    report: &ImageDependencyReport,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "image={} can_unregister={} dependencies={}",
+        report.image_id,
+        report.can_unregister,
+        report.dependencies.len()
+    )?;
+    for dependency in &report.dependencies {
+        writeln!(
+            output,
+            "  cell={} state={:?} phase={:?} blocking={}",
+            dependency.cell_id, dependency.state, dependency.phase, dependency.blocking
+        )?;
+    }
+    Ok(())
+}
+
+fn write_image_unregister(
+    report: &ImageUnregisterReport,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "image={} metadata_removed={} bytes_deleted={} destroyed_references={}",
+        report.image_id,
+        report.metadata_removed,
+        report.bytes_deleted,
+        report.destroyed_references.len()
+    )
 }
 
 fn write_image_validation(

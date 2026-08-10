@@ -368,6 +368,13 @@ Cover the normal lifecycle of locally supplied images:
 
 No online image marketplace or general-purpose image builder is required.
 
+**Repository-local implementation:** candidate and registered validation,
+provider-variant status, content/backing drift proof, CellId-sorted dependency
+inspection, and metadata-only `image unregister` are implemented. All
+non-destroyed cell references block removal. The operation never probes a
+provider or touches base-image bytes; real provider/image acceptance remains a
+separate release gate.
+
 ### Configuration ergonomics
 
 Introduce a small explicit user configuration mechanism for appropriate defaults such as provider policy, CPU/memory defaults, safe state-root defaults, and human-output preferences. Configuration never silently grants destructive authority; command-line arguments remain authoritative.

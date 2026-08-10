@@ -347,6 +347,86 @@ impl StateStore {
         read_json_directory(&self.root.join("images"), validate_image_schema)
     }
 
+    pub(crate) fn validate_image_removal_candidate(
+        &self,
+        image_id: &ImageId,
+    ) -> Result<(), StateError> {
+        let path = self.image_path(image_id);
+        let mut file = open_state_file_for_authority(&path)?;
+        let record: ImageRecord = read_json_from_file(&path, &mut file)?;
+        validate_image_schema(&path, &record)?;
+        if &record.id != image_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "image record",
+                path,
+                expected: image_id.to_string(),
+            });
+        }
+        validate_image_record_for_metadata_removal(&path, &record, &file)
+    }
+
+    pub(crate) fn remove_image_record(
+        &self,
+        mutation: &MutationGuard,
+        image_id: &ImageId,
+    ) -> Result<bool, StateError> {
+        mutation.validate_filesystem_identity()?;
+        let images_root = self.root.join("images");
+        let images_handle = open_ordinary_directory(&images_root)?;
+        let path = self.image_path(image_id);
+        let mut file = match open_state_file_for_authority(&path) {
+            Ok(file) => file,
+            Err(StateError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let record: ImageRecord = read_json_from_file(&path, &mut file)?;
+        validate_image_schema(&path, &record)?;
+        if &record.id != image_id {
+            return Err(StateError::IdentityMismatch {
+                kind: "image record",
+                path,
+                expected: image_id.to_string(),
+            });
+        }
+        validate_image_record_for_metadata_removal(&path, &record, &file)?;
+        validate_open_path_identity(&path, &file)?;
+        let physical_state_root = self
+            .root
+            .canonicalize()
+            .map_err(|source| io_error(&self.root, source))?;
+        let physical_images_root = images_root
+            .canonicalize()
+            .map_err(|source| io_error(&images_root, source))?;
+        let physical_path = path
+            .canonicalize()
+            .map_err(|source| io_error(&path, source))?;
+        if physical_images_root.parent() != Some(physical_state_root.as_path())
+            || physical_path.parent() != Some(physical_images_root.as_path())
+        {
+            return Err(StateError::UnsafeRuntimePath(path));
+        }
+
+        #[cfg(test)]
+        abort_at_test_checkpoint("before_image_remove");
+        drop(file);
+        let retired_path = physical_images_root.join(format!(
+            "{}.json.unregistered-{}",
+            image_id.as_str(),
+            Uuid::new_v4()
+        ));
+        fs::rename(&physical_path, &retired_path)
+            .map_err(|source| io_error(&physical_path, source))?;
+        #[cfg(not(windows))]
+        images_handle
+            .sync_all()
+            .map_err(|source| io_error(&physical_images_root, source))?;
+        #[cfg(test)]
+        abort_at_test_checkpoint("after_image_remove");
+        mutation.validate_filesystem_identity()?;
+        drop(images_handle);
+        Ok(true)
+    }
+
     pub(crate) fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
         let path = self.cell_path(record.id);
         let mut record = record.clone();
@@ -1262,6 +1342,252 @@ fn validate_image_schema(path: &Path, record: &ImageRecord) -> Result<(), StateE
     Ok(())
 }
 
+fn validate_image_record_for_metadata_removal(
+    manifest_path: &Path,
+    record: &ImageRecord,
+    manifest_file: &File,
+) -> Result<(), StateError> {
+    if record.variants.is_empty() {
+        return Err(StateError::UnsafeRuntimePath(manifest_path.to_path_buf()));
+    }
+
+    for variant in &record.variants {
+        let expected_format = match variant.provider.as_str() {
+            "hyperv" => "vhdx",
+            "qemu" => "qcow2",
+            _ => return Err(StateError::UnsafeRuntimePath(manifest_path.to_path_buf())),
+        };
+        let extension_matches = variant
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(expected_format));
+        if !variant.path.is_absolute()
+            || !variant.disk_format.eq_ignore_ascii_case(expected_format)
+            || !extension_matches
+            || removable_paths_equal(&variant.path, manifest_path)
+            || windows_path_has_stream_or_device_ambiguity(&variant.path)
+        {
+            return Err(StateError::UnsafeRuntimePath(manifest_path.to_path_buf()));
+        }
+        validate_variant_file_identity(manifest_path, manifest_file, &variant.path)?;
+    }
+    Ok(())
+}
+
+fn validate_variant_file_identity(
+    manifest_path: &Path,
+    manifest_file: &File,
+    variant_path: &Path,
+) -> Result<(), StateError> {
+    ensure_existing_ancestors_are_ordinary(variant_path)?;
+    let metadata = match fs::symlink_metadata(variant_path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(variant_path, source)),
+    };
+    if !metadata.is_file() || is_reparse_point(variant_path)? {
+        return Err(StateError::UnsafeRuntimePath(manifest_path.to_path_buf()));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    let variant_file = options
+        .open(variant_path)
+        .map_err(|source| io_error(variant_path, source))?;
+    if file_metadata_is_reparse(&variant_file).map_err(|source| io_error(variant_path, source))?
+        || file_identity_equal(manifest_path, manifest_file, variant_path, &variant_file)?
+    {
+        return Err(StateError::UnsafeRuntimePath(manifest_path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity_equal(
+    manifest_path: &Path,
+    manifest_file: &File,
+    variant_path: &Path,
+    variant_file: &File,
+) -> Result<bool, StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let manifest = manifest_file
+        .metadata()
+        .map_err(|source| io_error(manifest_path, source))?;
+    let variant = variant_file
+        .metadata()
+        .map_err(|source| io_error(variant_path, source))?;
+    Ok(manifest.dev() == variant.dev() && manifest.ino() == variant.ino())
+}
+
+#[cfg(windows)]
+fn file_identity_equal(
+    manifest_path: &Path,
+    manifest_file: &File,
+    variant_path: &Path,
+    variant_file: &File,
+) -> Result<bool, StateError> {
+    fn identity(path: &Path, file: &File) -> Result<(u32, u64), StateError> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io_error(path, std::io::Error::last_os_error()));
+        }
+        let index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        Ok((information.dwVolumeSerialNumber, index))
+    }
+
+    Ok(identity(manifest_path, manifest_file)? == identity(variant_path, variant_file)?)
+}
+
+fn lexically_normalized_absolute_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Some(normalized)
+}
+
+#[cfg(windows)]
+fn removable_paths_equal(left: &Path, right: &Path) -> bool {
+    fn identity(path: &Path) -> Option<String> {
+        let normalized = lexically_normalized_absolute_path(path)?;
+        let value = normalized.to_string_lossy().replace('/', "\\");
+        let value = if value
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+        {
+            format!(r"\\{}", &value[8..])
+        } else if value
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
+        {
+            value[4..].to_owned()
+        } else {
+            value
+        };
+        Some(value.to_ascii_lowercase())
+    }
+
+    identity(left).is_some_and(|left| identity(right).is_some_and(|right| left == right))
+}
+
+#[cfg(not(windows))]
+fn removable_paths_equal(left: &Path, right: &Path) -> bool {
+    lexically_normalized_absolute_path(left)
+        .zip(lexically_normalized_absolute_path(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+#[cfg(windows)]
+fn windows_path_has_stream_or_device_ambiguity(path: &Path) -> bool {
+    let value = path.to_string_lossy().replace('/', "\\");
+    if value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\.\"))
+        || value
+            .get(..15)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\GLOBALROOT\"))
+    {
+        return true;
+    }
+    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
+    if value.starts_with(r"UNC\") {
+        return value.contains(':');
+    }
+    let without_drive = value
+        .as_bytes()
+        .get(1)
+        .filter(|byte| **byte == b':')
+        .map_or(value, |_| &value[2..]);
+    if without_drive.contains(':') {
+        return true;
+    }
+    let Some(file_name) = Path::new(value).file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    let device_stem = file_name
+        .split('.')
+        .next()
+        .unwrap_or(file_name)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    matches!(
+        device_stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_path_has_stream_or_device_ambiguity(_path: &Path) -> bool {
+    false
+}
+
 fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateError> {
     ensure_schema(
         path,
@@ -1802,6 +2128,215 @@ mod tests {
     }
 
     #[test]
+    fn image_record_removal_is_atomic_idempotent_and_never_touches_base_bytes() {
+        if std::env::var_os("VMCELL_TEST_IMAGE_REMOVE_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let image_id = ImageId::parse(std::env::var("VMCELL_TEST_IMAGE_ID").unwrap()).unwrap();
+            let store = StateStore::new(root);
+            let mutation = store.acquire_mutation_lock().unwrap();
+            assert!(store.remove_image_record(&mutation, &image_id).unwrap());
+            std::process::exit(77);
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let image_id = ImageId::parse("removable-image").unwrap();
+        let base_path = directory.path().join("base.vhdx");
+        fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+        store
+            .save_image_new(&ImageRecord {
+                schema_version: IMAGE_SCHEMA_VERSION,
+                id: image_id.clone(),
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                variants: vec![ImageVariant {
+                    provider: "hyperv".to_owned(),
+                    disk_format: "vhdx".to_owned(),
+                    path: base_path.clone(),
+                    sha256: "sentinel-hash".to_owned(),
+                    file_size: 23,
+                }],
+                registered_at: Utc::now(),
+            })
+            .unwrap();
+        let manifest_path = store.image_path(&image_id);
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+
+        let before = subprocess_for(
+            "state::tests::image_record_removal_is_atomic_idempotent_and_never_touches_base_bytes",
+        )
+        .env("VMCELL_TEST_IMAGE_REMOVE_CHILD", "1")
+        .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+        .env("VMCELL_TEST_ABORT_AT", "before_image_remove")
+        .env("VMCELL_TEST_STATE_ROOT", store.root())
+        .env("VMCELL_TEST_IMAGE_ID", image_id.as_str())
+        .output()
+        .unwrap();
+        assert!(!before.status.success());
+        assert_ne!(before.status.code(), Some(77));
+        assert!(store.load_image(&image_id).is_ok());
+        assert_eq!(fs::read(&base_path).unwrap(), b"immutable-base-sentinel");
+
+        let after = subprocess_for(
+            "state::tests::image_record_removal_is_atomic_idempotent_and_never_touches_base_bytes",
+        )
+        .env("VMCELL_TEST_IMAGE_REMOVE_CHILD", "1")
+        .env("VMCELL_TEST_ATOMIC_CRASH_CHILD", "1")
+        .env("VMCELL_TEST_ABORT_AT", "after_image_remove")
+        .env("VMCELL_TEST_STATE_ROOT", store.root())
+        .env("VMCELL_TEST_IMAGE_ID", image_id.as_str())
+        .output()
+        .unwrap();
+        assert!(!after.status.success());
+        assert_ne!(after.status.code(), Some(77));
+        assert!(matches!(
+            store.load_image(&image_id),
+            Err(StateError::NotFound(_))
+        ));
+        assert_eq!(fs::read(&base_path).unwrap(), b"immutable-base-sentinel");
+        let retired = fs::read_dir(store.root().join("images"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("removable-image.json.unregistered-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(fs::read(&retired[0]).unwrap(), manifest_bytes);
+
+        let mutation = store.acquire_mutation_lock().unwrap();
+        assert!(!store.remove_image_record(&mutation, &image_id).unwrap());
+    }
+
+    #[test]
+    fn image_record_removal_rejects_manifest_alias_without_touching_it() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        let image_id = ImageId::parse("aliased-image").unwrap();
+        let manifest_path = store.image_path(&image_id);
+        let alias_path = directory.path().join("base.vhdx");
+        let record = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: image_id.clone(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: vec![ImageVariant {
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: alias_path.clone(),
+                sha256: "forged-manifest-alias".to_owned(),
+                file_size: 1,
+            }],
+            registered_at: Utc::now(),
+        };
+        store.save_image_new(&record).unwrap();
+        fs::hard_link(&manifest_path, &alias_path).unwrap();
+        let before = fs::read(&manifest_path).unwrap();
+
+        assert!(matches!(
+            store.remove_image_record(&mutation, &image_id),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        assert_eq!(fs::read(&alias_path).unwrap(), before);
+        assert_eq!(store.load_image(&image_id).unwrap(), record);
+    }
+
+    #[test]
+    fn image_record_removal_rejects_valid_format_reparse_alias() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        let image_id = ImageId::parse("reparse-aliased-image").unwrap();
+        let manifest_path = store.image_path(&image_id);
+        let alias_path = directory.path().join("base.vhdx");
+        let record = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: image_id.clone(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: vec![ImageVariant {
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: alias_path.clone(),
+                sha256: "forged-reparse-alias".to_owned(),
+                file_size: 1,
+            }],
+            registered_at: Utc::now(),
+        };
+        store.save_image_new(&record).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&manifest_path, &alias_path).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&manifest_path, &alias_path).is_err() {
+            return;
+        }
+        let before = fs::read(&manifest_path).unwrap();
+
+        assert!(matches!(
+            store.remove_image_record(&mutation, &image_id),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_record_removal_rejects_manifest_alternate_data_stream_alias() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        let image_id = ImageId::parse("stream-aliased-image").unwrap();
+        let manifest_path = store.image_path(&image_id);
+        let stream_path = PathBuf::from(format!("{}:base.vhdx", manifest_path.display()));
+        let record = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: image_id.clone(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: vec![ImageVariant {
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: stream_path,
+                sha256: "forged-stream-alias".to_owned(),
+                file_size: 1,
+            }],
+            registered_at: Utc::now(),
+        };
+        store.save_image_new(&record).unwrap();
+        let before = fs::read(&manifest_path).unwrap();
+
+        assert!(matches!(
+            store.remove_image_record(&mutation, &image_id),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_removal_path_policy_rejects_windows_device_namespaces_and_names() {
+        for path in [
+            r"\\.\PhysicalDrive0.vhdx",
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\base.vhdx",
+            r"C:\images\NUL.vhdx",
+            r"C:\images\COM1.vhdx",
+            r"C:\images\LPT².vhdx",
+        ] {
+            assert!(
+                windows_path_has_stream_or_device_ambiguity(Path::new(path)),
+                "{path}"
+            );
+        }
+        assert!(!windows_path_has_stream_or_device_ambiguity(Path::new(
+            r"C:\images\base.vhdx"
+        )));
+    }
+
+    #[test]
     fn guest_operation_and_artifact_records_are_identity_bound_and_secret_free() {
         let directory = tempdir().unwrap();
         let store = StateStore::new(directory.path().join("state"));
@@ -2260,6 +2795,43 @@ mod tests {
             store.acquire_installation_authority(),
             Err(StateError::UnsafeRuntimePath(_))
         ));
+    }
+
+    #[test]
+    fn image_removal_rejects_manifest_reparse_without_touching_target() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let image_id = ImageId::parse("reparse-image").unwrap();
+        let record = ImageRecord {
+            schema_version: IMAGE_SCHEMA_VERSION,
+            id: image_id.clone(),
+            guest_os: GuestOs::Windows,
+            guest_arch: Architecture::X86_64,
+            variants: vec![ImageVariant {
+                provider: "hyperv".to_owned(),
+                disk_format: "vhdx".to_owned(),
+                path: directory.path().join("base.vhdx"),
+                sha256: "reparse-sentinel".to_owned(),
+                file_size: 1,
+            }],
+            registered_at: Utc::now(),
+        };
+        store.save_image_new(&record).unwrap();
+        let manifest = store.image_path(&image_id);
+        fs::remove_file(&manifest).unwrap();
+        let external = directory.path().join("external-image.json");
+        let external_bytes = serde_json::to_vec(&record).unwrap();
+        fs::write(&external, &external_bytes).unwrap();
+        if create_file_link(&external, &manifest).is_err() {
+            return;
+        }
+
+        let mutation = store.acquire_mutation_lock().unwrap();
+        assert!(matches!(
+            store.remove_image_record(&mutation, &image_id),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert_eq!(fs::read(&external).unwrap(), external_bytes);
     }
 
     #[test]

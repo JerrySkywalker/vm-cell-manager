@@ -6,6 +6,10 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Added provider-neutral image dependency reports and an idempotent,
+  dependency-gated `image unregister` command that removes metadata only and
+  never reads or deletes registered base-image bytes; bounded file-identity
+  metadata checks reject manifest aliases and reparses.
 - Added a fail-closed, line-oriented `vmcell shell` workflow over existing
   PowerShell Direct guest authority, with bounded console input, cooperative
   interruption, durable operation IDs, and no automatic lifecycle cleanup.

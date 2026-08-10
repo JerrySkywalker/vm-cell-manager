@@ -40,6 +40,18 @@ image.
 
 The first practical implementation should prefer simple strong checks over clever reconciliation.
 
+`vmcell image dependencies IMAGE` reports durable cell references without
+contacting a provider. `vmcell image unregister IMAGE` then rechecks the same
+dependency graph under the state mutation lock and removes only the validated
+registration manifest from the active JSON namespace by an atomic
+same-directory rename to a non-JSON retirement receipt. Any non-destroyed cell
+blocks removal; destroyed tombstones keep their copied binding and do not.
+Unregister never reads, hashes, changes, or deletes provider image contents. A
+bounded read-only/no-follow identity check rejects variant paths that are
+reparses or the same file as the registration manifest. The operation is
+idempotent across a process crash before or after the single manifest
+retirement rename.
+
 ## Disposable overlay
 
 The normal storage shape is exactly one writable layer:

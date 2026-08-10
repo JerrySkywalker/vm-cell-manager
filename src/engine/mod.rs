@@ -40,6 +40,8 @@ const MIN_TTL_SECONDS: u64 = 1;
 const MAX_TTL_SECONDS: u64 = 31_536_000;
 const MAX_ARTIFACT_RETENTION_SECONDS: u64 = 31_536_000;
 const MAX_ARTIFACT_PRUNE_BATCH: usize = 256;
+pub const IMAGE_DEPENDENCY_CONTRACT: &str = "vmcell.image-dependencies.v1";
+pub const IMAGE_UNREGISTER_CONTRACT: &str = "vmcell.image-unregister.v1";
 
 pub struct CellEngine<P> {
     state: StateStore,
@@ -126,6 +128,33 @@ pub struct ImageValidationReport {
     pub registered_sha256: Option<String>,
     pub status: ImageValidationStatus,
     pub issues: Vec<ImageValidationIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageDependency {
+    pub cell_id: CellId,
+    pub state: CellState,
+    pub phase: CellPhase,
+    pub blocking: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageDependencyReport {
+    pub schema_version: u32,
+    pub contract: &'static str,
+    pub image_id: ImageId,
+    pub dependencies: Vec<ImageDependency>,
+    pub can_unregister: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageUnregisterReport {
+    pub schema_version: u32,
+    pub contract: &'static str,
+    pub image_id: ImageId,
+    pub metadata_removed: bool,
+    pub bytes_deleted: bool,
+    pub destroyed_references: Vec<ImageDependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,6 +590,12 @@ pub enum EngineError {
     #[error("image id is already registered with different identity: {0}")]
     ImageConflict(ImageId),
 
+    #[error("image {image_id} is still referenced by {blocking_cells} non-destroyed cell(s)")]
+    ImageInUse {
+        image_id: ImageId,
+        blocking_cells: usize,
+    },
+
     #[error("invalid cell request: {0}")]
     InvalidCellRequest(String),
 
@@ -600,6 +635,93 @@ impl RunCellError {
     #[must_use]
     pub fn engine_error(&self) -> &EngineError {
         &self.source
+    }
+}
+
+pub fn inspect_image_dependencies(
+    state: &StateStore,
+    image_id: &ImageId,
+) -> Result<ImageDependencyReport, EngineError> {
+    state.validate_image_removal_candidate(image_id)?;
+    let dependencies = collect_image_dependencies(state, image_id)?;
+    Ok(image_dependency_report(image_id.clone(), dependencies))
+}
+
+pub fn unregister_image(
+    state: &StateStore,
+    image_id: &ImageId,
+) -> Result<ImageUnregisterReport, EngineError> {
+    let mutation = state.acquire_mutation_lock()?;
+    let dependencies = collect_image_dependencies(state, image_id)?;
+    let blocking_cells = dependencies
+        .iter()
+        .filter(|dependency| dependency.blocking)
+        .count();
+    if blocking_cells != 0 {
+        return Err(EngineError::ImageInUse {
+            image_id: image_id.clone(),
+            blocking_cells,
+        });
+    }
+
+    let registered = match state.load_image(image_id) {
+        Ok(_) => true,
+        Err(StateError::NotFound(_)) => false,
+        Err(error) => return Err(error.into()),
+    };
+    let metadata_removed = if registered {
+        state.remove_image_record(&mutation, image_id)?
+    } else {
+        false
+    };
+    Ok(ImageUnregisterReport {
+        schema_version: AUTOMATION_SCHEMA_VERSION,
+        contract: IMAGE_UNREGISTER_CONTRACT,
+        image_id: image_id.clone(),
+        metadata_removed,
+        bytes_deleted: false,
+        destroyed_references: dependencies,
+    })
+}
+
+fn collect_image_dependencies(
+    state: &StateStore,
+    image_id: &ImageId,
+) -> Result<Vec<ImageDependency>, EngineError> {
+    let mut dependencies = Vec::new();
+    for cell in state.list_cells()? {
+        if cell.spec.image != cell.image.image_id {
+            return Err(EngineError::Integrity(format!(
+                "cell {} has inconsistent image dependency identity",
+                cell.id
+            )));
+        }
+        if &cell.image.image_id != image_id {
+            continue;
+        }
+        let blocking = cell.state != CellState::Destroyed || cell.phase != CellPhase::Destroyed;
+        dependencies.push(ImageDependency {
+            cell_id: cell.id,
+            state: cell.state,
+            phase: cell.phase,
+            blocking,
+        });
+    }
+    dependencies.sort_by_key(|dependency| dependency.cell_id.to_string());
+    Ok(dependencies)
+}
+
+fn image_dependency_report(
+    image_id: ImageId,
+    dependencies: Vec<ImageDependency>,
+) -> ImageDependencyReport {
+    let can_unregister = dependencies.iter().all(|dependency| !dependency.blocking);
+    ImageDependencyReport {
+        schema_version: AUTOMATION_SCHEMA_VERSION,
+        contract: IMAGE_DEPENDENCY_CONTRACT,
+        image_id,
+        dependencies,
+        can_unregister,
     }
 }
 
@@ -2615,6 +2737,7 @@ fn durable_error_code(error: &EngineError) -> &'static str {
         EngineError::InvalidImage(_) => "vmcell.image.invalid",
         EngineError::ImageIntegrity(_) => "vmcell.image.integrity",
         EngineError::ImageConflict(_) => "vmcell.image.conflict",
+        EngineError::ImageInUse { .. } => "vmcell.image.in_use",
         EngineError::InvalidCellRequest(_) => "vmcell.request.invalid",
         EngineError::LifecycleConflict(_) => "vmcell.lifecycle.conflict",
         EngineError::Integrity(_) => "vmcell.state.integrity",
@@ -3914,6 +4037,179 @@ mod tests {
                 .issues
                 .contains(&ImageValidationIssue::DifferencingBase)
         );
+    }
+
+    #[test]
+    fn image_unregister_is_provider_neutral_dependency_gated_and_byte_preserving() {
+        let (directory, engine, image_id) = fixture();
+        let base_path = directory.path().join("base.vhdx");
+        let base_before = fs::read(&base_path).unwrap();
+        let cell = engine.create_cell(spec(image_id.clone())).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+
+        let dependencies = inspect_image_dependencies(engine.state(), &image_id).unwrap();
+        assert!(!dependencies.can_unregister);
+        assert_eq!(dependencies.dependencies.len(), 1);
+        assert!(dependencies.dependencies[0].blocking);
+        assert!(matches!(
+            unregister_image(engine.state(), &image_id),
+            Err(EngineError::ImageInUse {
+                blocking_cells: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+        assert_eq!(fs::read(&base_path).unwrap(), base_before);
+        assert!(engine.state().load_image(&image_id).is_ok());
+
+        engine.destroy_cell(cell.id).unwrap();
+        let calls_after_destroy = engine.provider.state.lock().unwrap().calls.len();
+        let dependencies = inspect_image_dependencies(engine.state(), &image_id).unwrap();
+        assert!(dependencies.can_unregister);
+        assert_eq!(dependencies.dependencies.len(), 1);
+        assert!(!dependencies.dependencies[0].blocking);
+
+        let removed = unregister_image(engine.state(), &image_id).unwrap();
+        assert!(removed.metadata_removed);
+        assert!(!removed.bytes_deleted);
+        assert_eq!(removed.destroyed_references.len(), 1);
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_after_destroy
+        );
+        assert_eq!(fs::read(&base_path).unwrap(), base_before);
+        assert!(matches!(
+            engine.state().load_image(&image_id),
+            Err(StateError::NotFound(_))
+        ));
+
+        let repeated = unregister_image(engine.state(), &image_id).unwrap();
+        assert!(!repeated.metadata_removed);
+        assert!(!repeated.bytes_deleted);
+        assert_eq!(repeated.destroyed_references.len(), 1);
+    }
+
+    #[test]
+    fn image_dependency_scan_rejects_inconsistent_durable_cell_binding() {
+        let (_directory, engine, image_id) = fixture();
+        let cell = engine.create_cell(spec(image_id.clone())).unwrap();
+        let mut inconsistent = engine.state().load_cell(cell.id).unwrap();
+        inconsistent.spec.image = ImageId::parse("different-image").unwrap();
+        engine.state.save_cell(&inconsistent).unwrap();
+
+        assert!(matches!(
+            inspect_image_dependencies(engine.state(), &image_id),
+            Err(EngineError::Integrity(_))
+        ));
+        assert!(matches!(
+            unregister_image(engine.state(), &image_id),
+            Err(EngineError::Integrity(_))
+        ));
+        assert!(engine.state().load_image(&image_id).is_ok());
+    }
+
+    #[test]
+    fn image_dependency_matrix_is_provider_neutral_and_phase_exact() {
+        fn exercise(provider: &str) {
+            let (_directory, engine, image_id) = if provider == "qemu" {
+                qemu_fixture()
+            } else {
+                fixture()
+            };
+            let cell = if provider == "qemu" {
+                engine.create_cell(qemu_spec(image_id.clone())).unwrap()
+            } else {
+                engine.create_cell(spec(image_id.clone())).unwrap()
+            };
+            let calls_after_create = engine.provider.state.lock().unwrap().calls.len();
+            let mut record = engine.state().load_cell(cell.id).unwrap();
+            for (state, phase) in [
+                (CellState::Creating, CellPhase::IntentRecorded),
+                (CellState::Creating, CellPhase::OverlayCreated),
+                (CellState::Creating, CellPhase::ProviderObjectCreated),
+                (CellState::Creating, CellPhase::ProviderObjectClaimed),
+                (CellState::Stopped, CellPhase::Ready),
+                (CellState::Running, CellPhase::Ready),
+                (CellState::Failed, CellPhase::Ready),
+                (CellState::Destroying, CellPhase::Destroying),
+                (CellState::Destroying, CellPhase::DestroyingProvisioning),
+                (CellState::Destroyed, CellPhase::Ready),
+                (CellState::Stopped, CellPhase::Destroyed),
+            ] {
+                record.state = state;
+                record.phase = phase;
+                engine.state.save_cell(&record).unwrap();
+                let report = inspect_image_dependencies(engine.state(), &image_id).unwrap();
+                assert_eq!(report.dependencies.len(), 1);
+                assert!(report.dependencies[0].blocking, "{state:?}/{phase:?}");
+                assert!(!report.can_unregister);
+            }
+
+            record.state = CellState::Destroyed;
+            record.phase = CellPhase::Destroyed;
+            engine.state.save_cell(&record).unwrap();
+            let report = inspect_image_dependencies(engine.state(), &image_id).unwrap();
+            assert!(report.can_unregister);
+            assert!(!report.dependencies[0].blocking);
+            assert_eq!(
+                engine.provider.state.lock().unwrap().calls.len(),
+                calls_after_create
+            );
+        }
+
+        exercise("hyperv");
+        exercise("qemu");
+    }
+
+    #[test]
+    fn image_dependency_preview_rejects_unremovable_manifest_metadata() {
+        let directory = tempdir().unwrap();
+        let state = StateStore::new(directory.path().join("state"));
+        let _mutation = state.acquire_mutation_lock().unwrap();
+        let image_id = ImageId::parse("malformed-image").unwrap();
+        state
+            .save_image_new(&ImageRecord {
+                schema_version: IMAGE_SCHEMA_VERSION,
+                id: image_id.clone(),
+                guest_os: GuestOs::Windows,
+                guest_arch: Architecture::X86_64,
+                variants: Vec::new(),
+                registered_at: Utc::now(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            inspect_image_dependencies(&state, &image_id),
+            Err(EngineError::State(StateError::UnsafeRuntimePath(_)))
+        ));
+    }
+
+    #[test]
+    fn image_unregister_needs_neither_provider_nor_base_but_respects_contention() {
+        let (directory, engine, image_id) = qemu_fixture();
+        let base_path = directory.path().join("base.qcow2");
+        fs::remove_file(&base_path).unwrap();
+        let calls_before = engine.provider.state.lock().unwrap().calls.len();
+
+        let mutation = engine.state().acquire_mutation_lock().unwrap();
+        assert!(matches!(
+            unregister_image(engine.state(), &image_id),
+            Err(EngineError::State(StateError::MutationBusy))
+        ));
+        assert!(engine.state().load_image(&image_id).is_ok());
+        drop(mutation);
+
+        let removed = unregister_image(engine.state(), &image_id).unwrap();
+        assert!(removed.metadata_removed);
+        assert!(!removed.bytes_deleted);
+        assert_eq!(
+            engine.provider.state.lock().unwrap().calls.len(),
+            calls_before
+        );
+        assert!(!base_path.exists());
     }
 
     #[test]
