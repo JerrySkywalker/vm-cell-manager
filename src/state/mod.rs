@@ -2688,12 +2688,8 @@ mod tests {
         let mut operation =
             GuestOperationRecord::intent(cell_id, GuestOperationKind::CopyIn, Utc::now());
         let operations = store.root().join("operations");
-        fs::create_dir_all(&operations).unwrap();
-        fs::write(
-            operations.join(format!("{requested_id}.json")),
-            serde_json::to_vec(&operation).unwrap(),
-        )
-        .unwrap();
+        let operation_path = operations.join(format!("{requested_id}.json"));
+        write_json_atomic(&operation_path, &operation).unwrap();
         assert!(matches!(
             store.load_guest_operation(requested_id),
             Err(StateError::IdentityMismatch {
@@ -2705,22 +2701,14 @@ mod tests {
         operation.id = requested_id;
         operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION;
         operation.phase = GuestOperationPhase::Completed;
-        fs::write(
-            operations.join(format!("{requested_id}.json")),
-            serde_json::to_vec(&operation).unwrap(),
-        )
-        .unwrap();
+        write_json_atomic(&operation_path, &operation).unwrap();
         assert!(matches!(
             store.load_guest_operation(requested_id),
             Err(StateError::GuestOperationIntegrity { .. })
         ));
 
         operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION + 1;
-        fs::write(
-            operations.join(format!("{requested_id}.json")),
-            serde_json::to_vec(&operation).unwrap(),
-        )
-        .unwrap();
+        write_json_atomic(&operation_path, &operation).unwrap();
         assert!(matches!(
             store.load_guest_operation(requested_id),
             Err(StateError::UnsupportedSchema {
@@ -2999,8 +2987,7 @@ mod tests {
             registered_at: Utc::now(),
         };
         let path = store.image_path(&requested_id);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        write_json_atomic(&path, &record).unwrap();
 
         assert!(matches!(
             store.load_image(&requested_id),
@@ -3363,7 +3350,6 @@ mod tests {
 
         let image_id = ImageId::parse("unsupported-image").unwrap();
         let image_path = store.image_path(&image_id);
-        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
         let image = ImageRecord {
             schema_version: IMAGE_SCHEMA_VERSION + 1,
             id: image_id.clone(),
@@ -3372,7 +3358,7 @@ mod tests {
             variants: Vec::new(),
             registered_at: Utc::now(),
         };
-        fs::write(&image_path, serde_json::to_vec(&image).unwrap()).unwrap();
+        write_json_atomic(&image_path, &image).unwrap();
         assert!(matches!(
             store.load_image(&image_id),
             Err(StateError::UnsupportedSchema {
@@ -3383,7 +3369,6 @@ mod tests {
 
         let cell_id = CellId::new();
         let cell_path = store.cell_path(cell_id);
-        fs::create_dir_all(cell_path.parent().unwrap()).unwrap();
         let ownership = CellOwnership::new(
             Uuid::new_v4(),
             cell_id,
@@ -3422,7 +3407,7 @@ mod tests {
             expires_at: None,
             last_error: None,
         };
-        fs::write(&cell_path, serde_json::to_vec(&cell).unwrap()).unwrap();
+        write_json_atomic(&cell_path, &cell).unwrap();
         assert!(matches!(
             store.load_cell(cell_id),
             Err(StateError::UnsupportedSchema {
@@ -3433,7 +3418,7 @@ mod tests {
 
         cell.schema_version = CELL_SCHEMA_VERSION;
         cell.ownership.schema_version = OWNERSHIP_MARKER_SCHEMA + 1;
-        fs::write(&cell_path, serde_json::to_vec(&cell).unwrap()).unwrap();
+        write_json_atomic(&cell_path, &cell).unwrap();
         assert!(matches!(
             store.load_cell(cell_id),
             Err(StateError::UnsupportedSchema {
