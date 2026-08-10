@@ -474,6 +474,15 @@ config preference, which outranks deterministic native resolution. TCG
 requires its two explicit CLI flags and is never a fallback. Real platform
 acceptance remains deferred.
 
+**Windows QEMU/WHPX foundation:** the
+[canonical Windows QEMU/WHPX walkthrough](windows-qemu-whpx.md) reuses the
+existing QEMU/QMP/QGA lifecycle and provider-neutral plan for a prepared Linux
+x86_64 QCOW2 guest. Windows discovery binds canonical executable identities
+and content hashes, reports WHPX capability explicitly, and never falls back
+to TCG. A fixture-tested, non-mutating dedicated-host preflight and acceptance
+receipt template are present; real WHPX/QGA lifecycle acceptance remains
+external, so the support row stays `untested`.
+
 ### Real QEMU lifecycle acceptance
 
 Prove real QEMU process lifecycle, immutable QCOW2 base, exactly one overlay, QMP lifecycle/reconciliation, QGA guest readiness, command execution, file transfer, exact cleanup, and crash/failure classification.

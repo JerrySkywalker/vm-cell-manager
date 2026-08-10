@@ -40,6 +40,10 @@ $guestDynamicExecutionCommands = @(
 $files = @($scriptRoots | ForEach-Object {
   Get-ChildItem -LiteralPath $_ -Filter '*.ps1' -File
 })
+$files += @(
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\windows-whpx-preflight.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-whpx-preflight.ps1'))
+)
 if ($files.Count -eq 0) { throw 'no PowerShell provider or guest scripts were found' }
 
 foreach ($file in $files) {

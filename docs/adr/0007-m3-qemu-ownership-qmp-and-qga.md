@@ -16,9 +16,15 @@ Rust remains the only orchestration state machine. A QEMU cell is authorized by
 the current installation, CellId-derived UUID and name, an engine-issued
 mutation authority, the exact provider configuration directory, one overlay,
 its immutable registered parent, CPU and memory, an explicit accelerator
-policy, and a hash of the complete launch argument vector. The versioned QEMU
+policy, a canonical executable-content hash, and a hash of the complete launch
+argument vector. The versioned QEMU
 runtime receipt additionally records QMP/QGA endpoints and, after spawn, the
 process id plus platform process-start token.
+
+Any live QMP inspection and every `cont` or `quit` mutation first revalidate
+that durable PID, start token, launch digest, canonical executable, and
+executable-content hash. A matching QMP UUID/name/shape alone cannot substitute
+for the process receipt.
 
 No destructive operation is authorized by process id, process name, socket
 path, or QEMU name alone. Start and stop negotiate QMP capabilities, correlate

@@ -176,6 +176,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\check-powershell.ps1
 
+      - name: Windows WHPX preflight contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-windows-whpx-preflight.ps1
+
       - name: Clippy
         shell: pwsh
         run: |

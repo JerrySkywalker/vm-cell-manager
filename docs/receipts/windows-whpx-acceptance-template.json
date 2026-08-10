@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.windows-whpx-acceptance.v1",
+  "authorizing": false,
+  "real_platform_acceptance": "pending",
+  "repository": {
+    "slug": "JerrySkywalker/vm-cell-manager",
+    "candidate_sha": "REQUIRED_EXACT_40_HEX_SHA"
+  },
+  "host": {
+    "os": "windows",
+    "architecture": "x86_64",
+    "fingerprint_sha256": "REQUIRED_SHA256"
+  },
+  "provider_path": {
+    "provider": "qemu",
+    "accelerator": "whpx",
+    "guest_os": "linux",
+    "guest_architecture": "x86_64",
+    "guest_transport": "qga",
+    "support_status": "untested"
+  },
+  "preflight_receipt_sha256": "REQUIRED_SHA256",
+  "qemu_system": {
+    "canonical_path": "REQUIRED_ACCEPTANCE_HOST_PATH",
+    "version": "REQUIRED_VERSION",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "qemu_img": {
+    "canonical_path": "REQUIRED_ACCEPTANCE_HOST_PATH",
+    "version": "REQUIRED_VERSION",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "whpx": {
+    "advertised_preflight": true,
+    "functional_evidence": "REQUIRED_DEDICATED_HOST_EVIDENCE"
+  },
+  "state_root": {
+    "canonical_path": "REQUIRED_ORDINARY_ACL_EXCLUSIVE_PATH",
+    "identity_fingerprint": "REQUIRED_IDENTITY"
+  },
+  "immutable_base": {
+    "canonical_path": "REQUIRED_QCOW2_PATH",
+    "format": "qcow2",
+    "sha256_before": "REQUIRED_SHA256",
+    "sha256_after": "REQUIRED_SHA256",
+    "backing_parent": null
+  },
+  "qga": {
+    "guest_assumption": "prepared-linux-x86_64-qga-enabled",
+    "readiness_evidence": "REQUIRED_REAL_GUEST_EVIDENCE"
+  },
+  "foreign_qemu": {
+    "prestate_fingerprint_sha256": "REQUIRED_SHA256",
+    "poststate_fingerprint_sha256": "REQUIRED_SHA256",
+    "unchanged": "REQUIRED_BOOLEAN"
+  },
+  "writer_exclusivity": {
+    "evidence": "REQUIRED_ACCEPTANCE_WINDOW_EVIDENCE",
+    "violations": "REQUIRED_ZERO"
+  },
+  "ownership": {
+    "exact_owned_namespace": "REQUIRED_VM_CELL_NAMESPACE",
+    "process_identity": "REQUIRED_EXECUTABLE_HASH_PID_START_TOKEN_LAUNCH_DIGEST",
+    "overlay_identity": "REQUIRED_BASE_AND_OVERLAY_EVIDENCE",
+    "qmp_identity": "REQUIRED_UUID_NAME_CPU_MEMORY_DISK_NETWORK_EVIDENCE"
+  },
+  "cleanup": {
+    "policy": "exact-owned-only",
+    "rollback_evidence": "REQUIRED_STOP_DESTROY_ENDPOINT_PROCESS_OVERLAY_EVIDENCE",
+    "manual_review_retained": "REQUIRED_BOOLEAN"
+  },
+  "result": "PENDING_REAL_PLATFORM_GATE"
+}
