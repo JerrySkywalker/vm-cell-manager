@@ -139,13 +139,15 @@ vmcell --state-root "$state_root" stop "$cell_id"
 vmcell --state-root "$state_root" destroy "$cell_id"
 ```
 
-Unix process mutation requires the durable canonical executable hash, PID,
-`/proc` start token, launch digest, exact process instance, and matching QMP
-definition. QMP/QGA paths are length-bounded and an off-state launch refuses a
-pre-existing socket, file, or symlink as stale/foreign state. PID, path,
-socket, process name, or QEMU name alone never authorizes adoption, stop, kill,
-or deletion. Unix child containment uses an owned process group; cleanup stays
-inside the exact pinned state-root/CellId runtime tree.
+Unix process mutation requires the durable canonical executable path, hash of
+the opened `/proc/<pid>/exe` object, PID, `/proc` start token, launch digest,
+exact process instance, and matching QMP definition. QMP/QGA paths are
+length-bounded and an off-state launch refuses a pre-existing socket, file, or
+symlink as stale/foreign state. PID, path, socket, process name, or QEMU name
+alone never authorizes adoption, stop, kill, or deletion. Unix child
+containment uses an owned process group and an owned waiter reaps confirmed
+child exits; cleanup stays inside the exact pinned state-root/CellId runtime
+tree.
 
 ## Diagnostics and operator response
 
@@ -172,11 +174,15 @@ or guest output.
 [`linux-kvm-preflight.sh`](../tools/linux-kvm-preflight.sh) validates an exact
 clean source SHA, native host proof, effective identity, private state root,
 canonical QEMU executable hashes/versions, KVM advertisement and read/write
-openability, immutable base identity, QMP/QGA namespace absence, foreign QEMU
-prestate, network prestate, and external writer-exclusivity evidence. It opens
+openability with matching pre-open/opened-FD/current-path identity, immutable
+base identity, a bounded fingerprint of the actual state-root runtime tree,
+the truthful future `<cell-id>/qemu/{qmp.sock,qga.sock}` production pattern,
+foreign QEMU prestate, network prestate, and external writer-exclusivity
+evidence. QEMU read-only probes have explicit time and output bounds. It opens
 `/dev/kvm` without ioctl, starts no QEMU process, creates no overlay, connects
-to no QMP/QGA endpoint, changes no host setting, and writes only the requested
-`0600` receipt:
+to no QMP/QGA endpoint, changes no host setting, and atomically publishes one
+new `0600` receipt without replacing an existing path. The receipt parent must
+be effective-user-owned `0700`:
 
 ```sh
 tools/linux-kvm-preflight.sh \

@@ -60,7 +60,9 @@
   "foreign_prestate": {
     "qemu_process_fingerprint_before": "REQUIRED_SHA256",
     "qemu_process_fingerprint_after": "REQUIRED_SHA256",
-    "socket_prestate": "REQUIRED_EXACT_NAMESPACE_EVIDENCE",
+    "runtime_tree_fingerprint_before": "REQUIRED_SHA256",
+    "runtime_tree_fingerprint_after": "REQUIRED_SHA256",
+    "production_socket_pattern": "STATE_ROOT/runtime/<CELL_ID>/qemu/{qmp.sock,qga.sock}",
     "network_fingerprint_before": "REQUIRED_SHA256",
     "network_fingerprint_after": "REQUIRED_SHA256",
     "unchanged_except_exact_owned_resources": "REQUIRED_BOOLEAN"

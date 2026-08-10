@@ -128,6 +128,15 @@ function Assert-LinuxPreflightContract {
     'no real acceptance receipt' = '''  "real_platform_acceptance": false,'''
     'conservative support status' = '''    "support_status": "untested"'''
     'read-only KVM open' = 'exec 9<>/dev/kvm'
+    'opened KVM descriptor identity' = 'stat -Lc ''%d:%i:%t:%T'' -- "/proc/\$\$/fd/9"'
+    'current KVM path revalidation' = '\[ "\$kvm_before" = "\$kvm_opened" \] && \[ "\$kvm_before" = "\$kvm_current" \]'
+    'bounded probe timeout' = 'timeout -k 1s 10s "\$@"'
+    'bounded probe file limit' = 'ulimit -f 128'
+    'private receipt parent' = '\[ "\$receipt_parent_mode" = 700 \]'
+    'runtime prestate fingerprint' = '"runtime_prestate_fingerprint_sha256"'
+    'atomic no-clobber receipt publication' = 'ln -- "\$receipt_temp" "\$receipt_path"'
+    'final source drift check' = 'preflight\.candidate_drift: HEAD changed during preflight'
+    'final runtime drift check' = 'preflight\.runtime_drift: runtime tree changed during preflight'
     'QEMU version probe' = '"\$qemu_system_path" --version'
     'QEMU accelerator probe' = '"\$qemu_system_path" -accel help'
     'qemu-img version probe' = '"\$qemu_img_path" --version'
@@ -141,8 +150,8 @@ function Assert-LinuxPreflightContract {
     }
   }
 
-  if (@([regex]::Matches($Preflight, '\$\("\$qemu_system_path"')).Count -ne 2 -or
-      @([regex]::Matches($Preflight, '\$\("\$qemu_img_path"')).Count -ne 2) {
+  if (@([regex]::Matches($Preflight, 'run_bounded_probe ''[^'']+'' "\$qemu_system_path"')).Count -ne 2 -or
+      @([regex]::Matches($Preflight, 'run_bounded_probe ''[^'']+'' "\$qemu_img_path"')).Count -ne 2) {
     throw 'Linux KVM preflight may invoke each QEMU tool only through its two declared read-only probes'
   }
   if ($FixtureTest -match '--qemu-system|--qemu-img') {
@@ -159,6 +168,7 @@ function Assert-LinuxPreflightContract {
     'kernel module mutation' = '(?im)^\s*(?:modprobe|insmod|rmmod)\s+'
     'QEMU lifecycle option' = '(?i)"\$qemu_system_path"\s+(?:-S|-machine|-drive|-qmp|-chardev|-device|-daemonize)\b'
     'vmcell lifecycle' = '(?i)\bvmcell\s+(?:run|exec|copy-in|copy-out|destroy|gc)\b'
+    'receipt overwrite publication' = '(?m)^\s*mv\s+--\s+"\$receipt_temp"\s+"\$receipt_path"\s*$'
   }
   foreach ($entry in $forbidden.GetEnumerator()) {
     if ($combined -match $entry.Value) {
@@ -214,6 +224,8 @@ Assert-RejectedPreflightMutation -Name 'vmcell lifecycle' `
   -Preflight "$preflight`nvmcell run --image test -- true" -FixtureTest $preflightTest
 Assert-RejectedPreflightMutation -Name 'second KVM open' `
   -Preflight "$preflight`nexec 8<>/dev/kvm" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'receipt overwrite publication' `
+  -Preflight "$preflight`nmv -- `"`$receipt_temp`" `"`$receipt_path`"" -FixtureTest $preflightTest
 Assert-RejectedPreflightMutation -Name 'live fixture test invocation' `
   -Preflight $preflight -FixtureTest "$preflightTest`n--qemu-system /usr/bin/qemu-system-x86_64"
 

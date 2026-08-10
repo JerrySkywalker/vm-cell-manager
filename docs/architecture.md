@@ -188,11 +188,15 @@ and state/configuration files are `0600`. Authority-bearing file and directory
 opens use no-follow/close-on-exec flags and revalidate device/inode identity.
 Linux exposes KVM only when both QEMU advertises it and the current identity can
 open an ordinary `/dev/kvm` character device read/write with no-follow and a
-stable open-path device/inode identity; a compiled but inaccessible accelerator
-is not silently selected. Missing, permission-denied, non-device, and identity
-drift are fail-closed diagnostics and never trigger repair. Unix QMP/QGA paths
-are length-bounded; an off-state launch rejects any pre-existing endpoint path
-instead of unlinking or adopting it.
+stable pre-open, opened-file, and current-path device/inode/device-number
+identity; a compiled but inaccessible accelerator is not silently selected.
+Missing, permission-denied, non-device, and identity drift are fail-closed
+diagnostics and never trigger repair. Linux process receipts hash the opened
+`/proc/<pid>/exe` object and separately bind the expected canonical path and
+start token. Unix QMP/QGA paths are length-bounded; an off-state launch rejects
+any pre-existing endpoint path instead of unlinking or adopting it. An owned
+waiter reaps each launched QEMU child so a confirmed exit cannot remain a
+same-process zombie that blocks exact cleanup.
 
 The provider mutex coordinates `vmcell` processes; it cannot serialize unrelated Hyper-V tools. The Rust mutation guard also pins the state root and its `locks`, `images`, `cells`, and `runtime` children against replacement while an operation is active. Real-provider acceptance therefore requires an isolated host window with no concurrent external Hyper-V writer and exclusive, ACL-enforced control of the configured vmcell state root.
 

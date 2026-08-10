@@ -185,7 +185,7 @@ impl QemuCommandExecutor for SystemQemuExecutor {
                     .to_owned(),
             ));
         }
-        drop(child);
+        start_process_reaper(child)?;
         Ok(QemuSpawnReceipt {
             process_id,
             process_start_token,
@@ -1454,6 +1454,10 @@ fn ordinary_file_sha256(path: &Path) -> Result<String, ProviderError> {
     let mut file = File::open(&canonical).map_err(|_| {
         ProviderError::OwnershipChanged("QEMU executable could not be pinned".to_owned())
     })?;
+    opened_file_sha256(&mut file)
+}
+
+fn opened_file_sha256(file: &mut File) -> Result<String, ProviderError> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1549,15 +1553,15 @@ fn kvm_device_status() -> KvmDeviceStatus {
 
 #[cfg(target_os = "linux")]
 fn probe_kvm_device(path: &Path) -> KvmDeviceStatus {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => return classify_kvm_error(error.kind()),
     };
-    if before.file_type().is_symlink() || !before.file_type().is_char_device() {
+    let Some(before_identity) = kvm_device_identity(&before) else {
         return KvmDeviceStatus::NotCharacterDevice;
-    }
+    };
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -1567,17 +1571,50 @@ fn probe_kvm_device(path: &Path) -> KvmDeviceStatus {
         Ok(file) => file,
         Err(error) => return classify_kvm_error(error.kind()),
     };
-    let after = match file.metadata() {
+    let opened = match file.metadata() {
         Ok(metadata) => metadata,
         Err(_) => return KvmDeviceStatus::Unavailable,
     };
-    if !after.file_type().is_char_device()
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
-    {
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return KvmDeviceStatus::IdentityChanged,
+    };
+    let opened_identity = kvm_device_identity(&opened);
+    let current_identity = kvm_device_identity(&current);
+    if !kvm_device_identity_is_stable(before_identity, opened_identity, current_identity) {
         return KvmDeviceStatus::IdentityChanged;
     }
     KvmDeviceStatus::Usable
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KvmDeviceIdentity {
+    device: u64,
+    inode: u64,
+    raw_device: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn kvm_device_identity(metadata: &fs::Metadata) -> Option<KvmDeviceIdentity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    (!metadata.file_type().is_symlink() && metadata.file_type().is_char_device()).then_some(
+        KvmDeviceIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            raw_device: metadata.rdev(),
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn kvm_device_identity_is_stable(
+    before: KvmDeviceIdentity,
+    opened: Option<KvmDeviceIdentity>,
+    current: Option<KvmDeviceIdentity>,
+) -> bool {
+    opened == Some(before) && current == Some(before)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1674,6 +1711,31 @@ fn configure_detached_process(command: &mut Command) {
     command.process_group(0);
 }
 
+fn start_process_reaper(child: std::process::Child) -> Result<(), ProviderError> {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let waiter = std::sync::Arc::clone(&shared);
+    match std::thread::Builder::new()
+        .name("vmcell-qemu-reaper".to_owned())
+        .spawn(move || {
+            let child = waiter.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+        }) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let child = shared.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(ProviderError::Command(
+                "QEMU process reaper could not be started".to_owned(),
+            ))
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn configure_detached_process(command: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -1747,7 +1809,9 @@ fn process_matches(
     if !executable_matches {
         return false;
     }
-    if ordinary_file_sha256(&executable).ok().as_deref() != Some(executable_sha256) {
+    if process_executable_sha256(process_id).as_deref() != Some(executable_sha256)
+        || process_start_token(process_id) != Some(start_token)
+    {
         return false;
     }
     let command_line = match fs::read(format!("/proc/{process_id}/cmdline")) {
@@ -1761,6 +1825,16 @@ fn process_matches(
         .map(|value| OsString::from_vec(value.to_vec()))
         .collect::<Vec<_>>();
     argument_digest(&arguments) == command_sha256
+        && process_start_token(process_id) == Some(start_token)
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_sha256(process_id: u32) -> Option<String> {
+    let mut file = File::open(format!("/proc/{process_id}/exe")).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    opened_file_sha256(&mut file).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -2202,6 +2276,89 @@ mod tests {
             probe_kvm_device(&linked),
             KvmDeviceStatus::NotCharacterDevice
         );
+
+        let exact = KvmDeviceIdentity {
+            device: 1,
+            inode: 2,
+            raw_device: 3,
+        };
+        assert!(kvm_device_identity_is_stable(
+            exact,
+            Some(exact),
+            Some(exact)
+        ));
+        assert!(!kvm_device_identity_is_stable(
+            exact,
+            Some(exact),
+            Some(KvmDeviceIdentity { inode: 4, ..exact })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_reaper_makes_exited_child_absence_provable() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let start_token = process_start_token(process_id).unwrap();
+        start_process_reaper(child).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !process_absence_proven(process_id, start_token)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_absence_proven(process_id, start_token));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_executable_hash_uses_proc_handle_not_replaced_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let true_program = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("qemu-system-fixture");
+        let retired = directory.path().join("qemu-system-fixture.retired");
+        fs::copy(sleep, &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let launched_sha256 = ordinary_file_sha256(&program).unwrap();
+        let mut child = Command::new(&program)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let start_token = process_start_token(process_id).unwrap();
+
+        fs::rename(&program, &retired).unwrap();
+        fs::copy(true_program, &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_sha256 = ordinary_file_sha256(&program).unwrap();
+        let running_sha256 = process_executable_sha256(process_id).unwrap();
+
+        assert_eq!(running_sha256, launched_sha256);
+        assert_ne!(running_sha256, replacement_sha256);
+        assert_eq!(process_start_token(process_id), Some(start_token));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]

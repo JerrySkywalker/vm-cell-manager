@@ -11,6 +11,7 @@ receipts="$root/receipts"
 base="$root/linux-qga.qcow2"
 fixture="$root/evidence.txt"
 mkdir -m 700 "$repository" "$state" "$receipts"
+mkdir -m 700 "$state/runtime"
 printf 'fixture base\n' > "$base"
 chmod 400 "$base"
 
@@ -56,7 +57,24 @@ grep -F '"evidence_source": "fixture"' "$receipt" >/dev/null
 grep -F '"real_platform_acceptance": false' "$receipt" >/dev/null
 grep -F '"support_status": "untested"' "$receipt" >/dev/null
 grep -F '"status": "fixture-declared-usable"' "$receipt" >/dev/null
+grep -F '"production_runtime_pattern":' "$receipt" >/dev/null
+grep -F '"runtime_prestate_fingerprint_sha256":' "$receipt" >/dev/null
 python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$receipt"
+
+receipt_hash=$(sha256sum "$receipt" | awk '{print $1}')
+if sh "$preflight" \
+  --repository-root "$repository" \
+  --candidate-sha "$candidate" \
+  --state-root "$state" \
+  --base-image "$base" \
+  --owned-namespace vmcell-linux-kvm-acceptance-001 \
+  --writer-exclusivity-evidence fixture-window-001 \
+  --receipt "$receipt" \
+  --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'existing receipt path was replaced' >&2
+  exit 1
+fi
+[ "$(sha256sum "$receipt" | awk '{print $1}')" = "$receipt_hash" ]
 
 printf 'dirty\n' > "$repository/untracked.txt"
 dirty_receipt="$receipts/dirty.json"
@@ -108,5 +126,40 @@ if sh "$preflight" \
   exit 1
 fi
 [ ! -e "$link_receipt" ]
+
+control_base=$(printf '%s/control\nbase.qcow2' "$root")
+printf 'fixture base\n' > "$control_base"
+chmod 400 "$control_base"
+control_receipt="$receipts/control.json"
+if sh "$preflight" \
+  --repository-root "$repository" \
+  --candidate-sha "$candidate" \
+  --state-root "$state" \
+  --base-image "$control_base" \
+  --owned-namespace vmcell-linux-kvm-acceptance-005 \
+  --writer-exclusivity-evidence fixture-window-005 \
+  --receipt "$control_receipt" \
+  --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'control-character path was accepted into JSON' >&2
+  exit 1
+fi
+[ ! -e "$control_receipt" ]
+
+public_receipts="$root/public-receipts"
+mkdir -m 755 "$public_receipts"
+public_receipt="$public_receipts/preflight.json"
+if sh "$preflight" \
+  --repository-root "$repository" \
+  --candidate-sha "$candidate" \
+  --state-root "$state" \
+  --base-image "$base" \
+  --owned-namespace vmcell-linux-kvm-acceptance-006 \
+  --writer-exclusivity-evidence fixture-window-006 \
+  --receipt "$public_receipt" \
+  --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'non-private receipt parent was accepted' >&2
+  exit 1
+fi
+[ ! -e "$public_receipt" ]
 
 printf '%s\n' 'Linux KVM preflight fixture contract passed'

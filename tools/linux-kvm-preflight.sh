@@ -22,7 +22,9 @@ require_safe_text() {
   value=$1
   label=$2
   [ -n "$value" ] || fail "$label: value is empty"
-  if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+  original_bytes=$(printf '%s' "$value" | wc -c)
+  safe_bytes=$(printf '%s' "$value" | LC_ALL=C tr -d '\001-\037\177' | wc -c)
+  if [ "$original_bytes" -ne "$safe_bytes" ]; then
     fail "$label: control characters are not allowed"
   fi
 }
@@ -53,6 +55,41 @@ fixture_value() {
   count=$(grep -c "^${key}=" "$fixture_path" || true)
   [ "$count" -eq 1 ] || fail "preflight.fixture_invalid: $key must occur exactly once"
   sed -n "s/^${key}=//p" "$fixture_path"
+}
+
+collect_runtime_rows() {
+  if [ ! -e "$runtime_root" ] && [ ! -L "$runtime_root" ]; then
+    return 0
+  fi
+  runtime_path=$(canonical_directory "$runtime_root" 'preflight.runtime_invalid')
+  [ "$(stat -Lc '%u' -- "$runtime_path")" = "$effective_uid" ] || fail 'preflight.runtime_invalid: runtime root is not owned by the effective identity'
+  [ "$(stat -Lc '%a' -- "$runtime_path")" = 700 ] || fail 'preflight.runtime_invalid: runtime root mode must be 0700'
+  rows=$(find "$runtime_path" -xdev -printf '%P|%y|%D:%i|%u|%m\n' | LC_ALL=C sort) || fail 'preflight.runtime_invalid: runtime prestate could not be enumerated'
+  [ "$(printf '%s' "$rows" | wc -c)" -le 65536 ] || fail 'preflight.runtime_invalid: runtime prestate exceeded 65536 bytes'
+  [ "$(printf '%s\n' "$rows" | awk 'NF {count++} END {print count+0}')" -le 4096 ] || fail 'preflight.runtime_invalid: runtime prestate exceeded 4096 entries'
+  if printf '%s\n' "$rows" | grep -F '|l|' >/dev/null; then
+    fail 'preflight.runtime_invalid: runtime prestate contains a symlink'
+  fi
+  printf '%s' "$rows"
+}
+
+cleanup_temporary_paths() {
+  [ -z "${probe_temp:-}" ] || [ ! -e "$probe_temp" ] || rm -f -- "$probe_temp"
+  [ -z "${receipt_temp:-}" ] || [ ! -e "$receipt_temp" ] || rm -f -- "$receipt_temp"
+}
+
+run_bounded_probe() {
+  label=$1
+  shift
+  probe_temp=$(mktemp "$receipt_parent/.vmcell-linux-probe.XXXXXX") || fail "$label: probe file could not be created"
+  if ! (ulimit -f 128; timeout -k 1s 10s "$@" > "$probe_temp" 2>/dev/null); then
+    fail "$label: bounded probe failed or timed out"
+  fi
+  [ "$(stat -Lc '%s' -- "$probe_temp")" -le 65536 ] || fail "$label: output exceeded 65536 bytes"
+  probe_output=$(cat -- "$probe_temp")
+  rm -f -- "$probe_temp"
+  probe_temp=
+  bounded_probe_output=$probe_output
 }
 
 repository_root=
@@ -92,6 +129,7 @@ done
 case "$candidate_sha" in *[!0-9a-f]*) fail 'preflight.candidate_invalid: expected one lowercase 40-hex SHA' ;; esac
 case "$owned_namespace" in vmcell-*) namespace_suffix=${owned_namespace#vmcell-} ;; *) namespace_suffix= ;; esac
 case "$namespace_suffix" in ''|*[!a-z0-9-]*|*-) fail 'preflight.namespace_invalid: expected vmcell- followed by lowercase letters, digits, or internal hyphens' ;; esac
+case "$namespace_suffix" in [a-z0-9]*) ;; *) fail 'preflight.namespace_invalid: namespace must begin with a lowercase letter or digit' ;; esac
 [ "${#owned_namespace}" -le 64 ] || fail 'preflight.namespace_invalid: namespace exceeds 64 characters'
 case "$writer_evidence" in
   *[!A-Za-z0-9._:-]*|'') fail 'preflight.writer_evidence_invalid: use 1-128 safe identifier characters' ;;
@@ -130,6 +168,14 @@ case "$receipt_parent/" in "$repository_path/"*) fail 'preflight.receipt_invalid
 
 effective_uid=$(id -u)
 effective_gid=$(id -g)
+receipt_parent_uid=$(stat -Lc '%u' -- "$receipt_parent")
+receipt_parent_mode=$(stat -Lc '%a' -- "$receipt_parent")
+receipt_parent_identity=$(stat -Lc '%d:%i' -- "$receipt_parent")
+[ "$receipt_parent_uid" = "$effective_uid" ] || fail 'preflight.receipt_parent_invalid: receipt parent is not owned by the effective identity'
+[ "$receipt_parent_mode" = 700 ] || fail 'preflight.receipt_parent_invalid: receipt parent mode must be 0700'
+probe_temp=
+receipt_temp=
+trap cleanup_temporary_paths EXIT HUP INT TERM
 state_uid=$(stat -Lc '%u' -- "$state_path")
 state_mode=$(stat -Lc '%a' -- "$state_path")
 [ "$state_uid" = "$effective_uid" ] || fail 'preflight.state_root_invalid: state root is not owned by the effective identity'
@@ -141,13 +187,13 @@ case "$base_path" in *.qcow2) ;; *) fail 'preflight.image_variant_incompatible: 
 base_sha256=$(sha256sum -- "$base_path" | awk '{print $1}')
 base_size=$(stat -Lc '%s' -- "$base_path")
 base_mode=$(stat -Lc '%a' -- "$base_path")
+base_identity=$(stat -Lc '%d:%i' -- "$base_path")
 
-qmp_path="$state_path/runtime/$owned_namespace/qemu/qmp.sock"
-qga_path="$state_path/runtime/$owned_namespace/qemu/qga.sock"
-[ "$(printf '%s' "$qmp_path" | wc -c)" -le 96 ] && [ "$(printf '%s' "$qga_path" | wc -c)" -le 96 ] || fail 'preflight.qmp_namespace_invalid: Unix control socket path exceeds 96 bytes'
-for endpoint in "$qmp_path" "$qga_path"; do
-  [ ! -e "$endpoint" ] && [ ! -L "$endpoint" ] || fail 'preflight.runtime_collision: exact-owned QMP/QGA path already exists'
-done
+runtime_root="$state_path/runtime"
+runtime_rows=$(collect_runtime_rows) || fail 'preflight.runtime_invalid: runtime prestate could not be collected'
+runtime_entry_count=$(printf '%s\n' "$runtime_rows" | awk 'NF {count++} END {print count+0}')
+runtime_fingerprint=$(sha256_text "$runtime_rows")
+production_runtime_pattern="$state_path/runtime/<cell-id>/qemu"
 
 if [ "$evidence_source" = fixture ]; then
   fixture_path=$(canonical_file "$fixture_evidence" 'preflight.fixture_invalid')
@@ -183,6 +229,7 @@ else
   host_material="$(hostname)\n$(uname -srvm)\n$(cat /etc/machine-id 2>/dev/null || true)"
   host_fingerprint=$(sha256_text "$host_material")
   host_proof=native-linux-x86_64
+  command -v timeout >/dev/null 2>&1 || fail 'preflight.host_invalid: bounded timeout command is unavailable'
 
   qemu_system_path=$(canonical_file "$qemu_system" 'preflight.qemu_system_absent')
   qemu_img_path=$(canonical_file "$qemu_img" 'preflight.qemu_img_absent')
@@ -192,18 +239,19 @@ else
   qemu_img_sha256=$(sha256sum -- "$qemu_img_path" | awk '{print $1}')
   qemu_system_identity=$(stat -Lc '%d:%i:%s' -- "$qemu_system_path")
   qemu_img_identity=$(stat -Lc '%d:%i:%s' -- "$qemu_img_path")
-  qemu_system_output=$("$qemu_system_path" --version 2>/dev/null) || fail 'preflight.qemu_system_probe_failed: version probe failed'
-  qemu_img_output=$("$qemu_img_path" --version 2>/dev/null) || fail 'preflight.qemu_img_probe_failed: version probe failed'
-  [ "$(printf '%s' "$qemu_system_output" | wc -c)" -le 65536 ] || fail 'preflight.qemu_system_probe_failed: output exceeded 65536 bytes'
-  [ "$(printf '%s' "$qemu_img_output" | wc -c)" -le 65536 ] || fail 'preflight.qemu_img_probe_failed: output exceeded 65536 bytes'
+  run_bounded_probe 'preflight.qemu_system_probe_failed' "$qemu_system_path" --version
+  qemu_system_output=$bounded_probe_output
+  run_bounded_probe 'preflight.qemu_img_probe_failed' "$qemu_img_path" --version
+  qemu_img_output=$bounded_probe_output
   qemu_system_version=$(printf '%s\n' "$qemu_system_output" | sed -n '1p')
   qemu_img_version=$(printf '%s\n' "$qemu_img_output" | sed -n '1p')
   case "$qemu_system_version" in 'QEMU emulator version '*) ;; *) fail 'preflight.qemu_system_probe_failed: unrecognized version' ;; esac
   case "$qemu_img_version" in 'qemu-img version '*) ;; *) fail 'preflight.qemu_img_probe_failed: unrecognized version' ;; esac
-  accel_output=$("$qemu_system_path" -accel help 2>/dev/null) || fail 'preflight.kvm_unavailable: accelerator probe failed'
+  run_bounded_probe 'preflight.kvm_unavailable' "$qemu_system_path" -accel help
+  accel_output=$bounded_probe_output
   printf '%s\n' "$accel_output" | grep -Eq '^[[:space:]]*kvm[[:space:]]*$' || fail 'preflight.kvm_unavailable: QEMU did not advertise KVM'
-  image_info=$("$qemu_img_path" info --output=json "$base_path" 2>/dev/null) || fail 'preflight.image_variant_incompatible: qemu-img info failed'
-  [ "$(printf '%s' "$image_info" | wc -c)" -le 65536 ] || fail 'preflight.image_variant_incompatible: qemu-img output exceeded 65536 bytes'
+  run_bounded_probe 'preflight.image_variant_incompatible' "$qemu_img_path" info --output=json "$base_path"
+  image_info=$bounded_probe_output
   printf '%s' "$image_info" | grep -Eq '"format"[[:space:]]*:[[:space:]]*"qcow2"' || fail 'preflight.image_variant_incompatible: image format was not qcow2'
   if printf '%s' "$image_info" | grep -Eq '"(full-)?backing-filename"[[:space:]]*:[[:space:]]*"'; then
     fail 'preflight.image_variant_incompatible: immutable base already has a backing parent'
@@ -211,12 +259,15 @@ else
 
   [ -c /dev/kvm ] && [ ! -L /dev/kvm ] || fail 'preflight.kvm_missing: /dev/kvm is missing or not an ordinary character device'
   kvm_before=$(stat -Lc '%d:%i:%t:%T' -- /dev/kvm)
-  if ! (exec 9<>/dev/kvm) 2>/dev/null; then
+  if ! exec 9<>/dev/kvm 2>/dev/null; then
     fail 'preflight.kvm_permission_denied: /dev/kvm is not read-write usable by the current identity'
   fi
-  kvm_after=$(stat -Lc '%d:%i:%t:%T' -- /dev/kvm)
-  [ "$kvm_before" = "$kvm_after" ] || fail 'preflight.kvm_identity_drift: /dev/kvm identity changed during admission'
-  kvm_identity=$kvm_after
+  kvm_opened=$(stat -Lc '%d:%i:%t:%T' -- "/proc/$$/fd/9") || { exec 9>&-; fail 'preflight.kvm_identity_drift: opened /dev/kvm identity was unavailable'; }
+  [ -c /dev/kvm ] && [ ! -L /dev/kvm ] || { exec 9>&-; fail 'preflight.kvm_identity_drift: current /dev/kvm path changed during admission'; }
+  kvm_current=$(stat -Lc '%d:%i:%t:%T' -- /dev/kvm) || { exec 9>&-; fail 'preflight.kvm_identity_drift: current /dev/kvm identity was unavailable'; }
+  exec 9>&-
+  [ "$kvm_before" = "$kvm_opened" ] && [ "$kvm_before" = "$kvm_current" ] || fail 'preflight.kvm_identity_drift: /dev/kvm pre-open, opened-FD, and current-path identities differed'
+  kvm_identity=$kvm_opened
   kvm_status=read-write-usable
 
   [ "$(sha256sum -- "$qemu_system_path" | awk '{print $1}')" = "$qemu_system_sha256" ] || fail 'preflight.executable_drift: qemu-system changed during preflight'
@@ -234,44 +285,55 @@ else
   network_fingerprint=$(sha256_text "$network_rows")
 fi
 
-for value_and_label in \
-  "$host_fingerprint|preflight.host_fingerprint_invalid" \
-  "$qemu_system_sha256|preflight.qemu_system_hash_invalid" \
-  "$qemu_img_sha256|preflight.qemu_img_hash_invalid" \
-  "$foreign_qemu_fingerprint|preflight.foreign_prestate_invalid" \
-  "$network_fingerprint|preflight.network_prestate_invalid"; do
-  value=${value_and_label%%|*}
-  label=${value_and_label#*|}
-  require_sha256 "$value" "$label"
-done
-for count in "$foreign_qemu_count" "$network_count"; do
+require_sha256 "$host_fingerprint" 'preflight.host_fingerprint_invalid'
+require_sha256 "$qemu_system_sha256" 'preflight.qemu_system_hash_invalid'
+require_sha256 "$qemu_img_sha256" 'preflight.qemu_img_hash_invalid'
+require_sha256 "$foreign_qemu_fingerprint" 'preflight.foreign_prestate_invalid'
+require_sha256 "$network_fingerprint" 'preflight.network_prestate_invalid'
+require_sha256 "$runtime_fingerprint" 'preflight.runtime_prestate_invalid'
+for count in "$foreign_qemu_count" "$network_count" "$runtime_entry_count"; do
   case "$count" in ''|*[!0-9]*) fail 'preflight.fixture_invalid: counts must be non-negative integers' ;; esac
 done
-for text_and_label in \
-  "$qemu_system_version|preflight.qemu_system_version_invalid" \
-  "$qemu_img_version|preflight.qemu_img_version_invalid" \
-  "$kvm_identity|preflight.kvm_identity_invalid"; do
-  value=${text_and_label%%|*}
-  label=${text_and_label#*|}
-  require_safe_text "$value" "$label"
-  [ "${#value}" -le 512 ] || fail "$label: value exceeded 512 characters"
-done
+require_safe_text "$repository_path" 'preflight.repository_path_invalid'
+require_safe_text "$state_path" 'preflight.state_path_invalid'
+require_safe_text "$base_path" 'preflight.base_path_invalid'
+require_safe_text "$receipt_parent" 'preflight.receipt_parent_invalid'
+require_safe_text "$receipt_path" 'preflight.receipt_invalid'
+require_safe_text "$qemu_system_path" 'preflight.qemu_system_path_invalid'
+require_safe_text "$qemu_img_path" 'preflight.qemu_img_path_invalid'
+require_safe_text "$production_runtime_pattern" 'preflight.runtime_pattern_invalid'
+require_safe_text "$host_proof" 'preflight.host_proof_invalid'
+require_safe_text "$qemu_system_version" 'preflight.qemu_system_version_invalid'
+require_safe_text "$qemu_img_version" 'preflight.qemu_img_version_invalid'
+require_safe_text "$kvm_identity" 'preflight.kvm_identity_invalid'
+[ "${#qemu_system_version}" -le 512 ] || fail 'preflight.qemu_system_version_invalid: value exceeded 512 characters'
+[ "${#qemu_img_version}" -le 512 ] || fail 'preflight.qemu_img_version_invalid: value exceeded 512 characters'
+[ "${#kvm_identity}" -le 512 ] || fail 'preflight.kvm_identity_invalid: value exceeded 512 characters'
+
+[ "$(git -C "$repository_path" rev-parse HEAD 2>/dev/null)" = "$candidate_sha" ] || fail 'preflight.candidate_drift: HEAD changed during preflight'
+[ -z "$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all 2>/dev/null)" ] || fail 'preflight.candidate_drift: worktree changed during preflight'
+[ "$(stat -Lc '%u:%a:%d:%i' -- "$state_path")" = "$state_uid:$state_mode:$state_identity" ] || fail 'preflight.state_root_drift: state root identity changed during preflight'
+[ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed during preflight'
+[ "$(stat -Lc '%d:%i:%s:%a' -- "$base_path")" = "$base_identity:$base_size:$base_mode" ] || fail 'preflight.image_drift: immutable base identity changed during preflight'
+[ "$(sha256sum -- "$base_path" | awk '{print $1}')" = "$base_sha256" ] || fail 'preflight.image_drift: immutable base contents changed during preflight'
+runtime_rows_final=$(collect_runtime_rows) || fail 'preflight.runtime_drift: runtime prestate could not be recollected'
+[ "$runtime_rows_final" = "$runtime_rows" ] || fail 'preflight.runtime_drift: runtime tree changed during preflight'
+[ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_exists: refusing to replace an existing path'
 
 umask 077
 receipt_temp=$(mktemp "$receipt_parent/.vmcell-linux-kvm-preflight.XXXXXX") || fail 'preflight.receipt_write_failed: temporary receipt could not be created'
-cleanup_temp() { [ ! -e "$receipt_temp" ] || rm -f -- "$receipt_temp"; }
-trap cleanup_temp EXIT HUP INT TERM
 
 repository_json=$(json_escape "$repository_path")
 state_json=$(json_escape "$state_path")
 base_json=$(json_escape "$base_path")
+receipt_parent_json=$(json_escape "$receipt_parent")
+receipt_path_json=$(json_escape "$receipt_path")
 system_path_json=$(json_escape "$qemu_system_path")
 image_path_json=$(json_escape "$qemu_img_path")
 system_version_json=$(json_escape "$qemu_system_version")
 image_version_json=$(json_escape "$qemu_img_version")
 kvm_identity_json=$(json_escape "$kvm_identity")
-qmp_json=$(json_escape "$qmp_path")
-qga_json=$(json_escape "$qga_path")
+runtime_pattern_json=$(json_escape "$production_runtime_pattern")
 namespace_json=$(json_escape "$owned_namespace")
 writer_json=$(json_escape "$writer_evidence")
 
@@ -308,9 +370,10 @@ printf '%s\n' \
   "  \"qemu_img\": {\"canonical_path\": \"$image_path_json\", \"version\": \"$image_version_json\", \"sha256\": \"$qemu_img_sha256\"}," \
   "  \"kvm\": {\"path\": \"/dev/kvm\", \"status\": \"$kvm_status\", \"open_mode\": \"read-write-no-ioctl\", \"identity\": \"$kvm_identity_json\"}," \
   "  \"state_root\": {\"canonical_path\": \"$state_json\", \"owner_uid\": $state_uid, \"mode\": \"$state_mode\", \"device_inode\": \"$state_identity\"}," \
+  "  \"receipt_target\": {\"path\": \"$receipt_path_json\", \"canonical_parent\": \"$receipt_parent_json\", \"parent_owner_uid\": $receipt_parent_uid, \"parent_mode\": \"$receipt_parent_mode\", \"parent_device_inode\": \"$receipt_parent_identity\"}," \
   "  \"immutable_base\": {\"canonical_path\": \"$base_json\", \"format\": \"qcow2\", \"size\": $base_size, \"mode\": \"$base_mode\", \"sha256\": \"$base_sha256\", \"backing_parent\": null}," \
   '  "qga": {"guest_assumption": "prepared-linux-x86_64-qga-enabled", "readiness": "not-exercised"},' \
-  "  \"control_namespace\": {\"owned_namespace\": \"$namespace_json\", \"qmp_path\": \"$qmp_json\", \"qga_path\": \"$qga_json\", \"prestate_absent\": true}," \
+  "  \"control_namespace\": {\"acceptance_window_namespace\": \"$namespace_json\", \"production_runtime_pattern\": \"$runtime_pattern_json\", \"qmp_filename\": \"qmp.sock\", \"qga_filename\": \"qga.sock\", \"runtime_prestate_entry_count\": $runtime_entry_count, \"runtime_prestate_fingerprint_sha256\": \"$runtime_fingerprint\"}," \
   "  \"foreign_qemu_prestate\": {\"count\": $foreign_qemu_count, \"fingerprint_sha256\": \"$foreign_qemu_fingerprint\"}," \
   "  \"network_prestate\": {\"count\": $network_count, \"fingerprint_sha256\": \"$network_fingerprint\"}," \
   "  \"writer_exclusivity\": {\"evidence_id\": \"$writer_json\", \"proof_kind\": \"external-attestation\"}," \
@@ -319,6 +382,10 @@ printf '%s\n' \
   '}' > "$receipt_temp"
 
 [ "$(stat -Lc '%a' -- "$receipt_temp")" = 600 ] || fail 'preflight.receipt_write_failed: temporary receipt mode was not 0600'
-mv -- "$receipt_temp" "$receipt_path"
+[ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed before publication'
+[ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_exists: refusing to replace an existing path'
+ln -- "$receipt_temp" "$receipt_path" || fail 'preflight.receipt_exists: atomic no-clobber publication failed'
+rm -f -- "$receipt_temp"
+receipt_temp=
 trap - EXIT HUP INT TERM
 printf 'Linux KVM preflight receipt written: %s\n' "$receipt_path"
