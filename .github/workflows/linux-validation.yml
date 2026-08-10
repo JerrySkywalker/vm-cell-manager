@@ -23,6 +23,7 @@ jobs:
 
     env:
       RUSTUP_TOOLCHAIN: 1.85.0
+      CARGO_TARGET_DIR: ${{ runner.temp }}/vmcell-cargo-target
       EXPECTED_RUSTC: rustc 1.85.0 (4d91de4e4 2025-02-17)
       EXPECTED_CARGO_PREFIX: cargo 1.85.0
 
@@ -61,6 +62,9 @@ jobs:
           . /etc/os-release
           test "$ID" = 'ubuntu'
           test "$VERSION_ID" = '24.04'
+          test "$CARGO_TARGET_DIR" = "$RUNNER_TEMP/vmcell-cargo-target"
+          mkdir -p "$CARGO_TARGET_DIR"
+          test "$(realpath "$CARGO_TARGET_DIR")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           printf 'source_sha=%s\nrunner_environment=%s\nos=%s\narchitecture=%s\nbaseline=%s-%s\n' \
             "$actual_sha" "$RUNNER_ENVIRONMENT" "$RUNNER_OS" "$RUNNER_ARCH" "$ID" "$VERSION_ID"
@@ -108,4 +112,5 @@ jobs:
         run: |
           set -euo pipefail
           git diff --exit-code
+          test ! -e "$GITHUB_WORKSPACE/target"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"

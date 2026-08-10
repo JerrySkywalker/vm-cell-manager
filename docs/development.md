@@ -87,9 +87,11 @@ GitHub-hosted `ubuntu-24.04` x86_64 baseline. The ephemeral job installs exactly
 Rust 1.85.0 with rustfmt and Clippy, then runs locked metadata, format, check,
 Clippy, all-target tests, doc-tests, and Linux shell parsing. It has read-only
 repository permission, persists no checkout credentials, and has no `push` or
-`pull_request` trigger. It never opens `/dev/kvm` or runs provider lifecycle
-commands. Hosted Linux evidence is native repository compile/test evidence,
-not real KVM/QGA acceptance.
+`pull_request` trigger. Repository tests may perform the existing non-mutating
+KVM usability probe, which can open `/dev/kvm` read/write but issues no KVM
+ioctl and creates no VM. The lane never repairs device permissions, loads
+modules, or runs provider lifecycle commands. Hosted Linux evidence is native
+repository compile/test evidence, not real KVM/QGA acceptance.
 
 ## Provider safety rule
 
