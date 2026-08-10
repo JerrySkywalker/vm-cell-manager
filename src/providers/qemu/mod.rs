@@ -791,6 +791,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             process_executable_sha256: None,
         };
         config.command_sha256 = launch_digest(&config);
+        config.validate(&config_path)?;
         write_config_new(&config_path, &config)?;
         Ok(ProviderVmIdentity {
             id,
@@ -2877,6 +2878,60 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_vm_rejects_overlong_control_endpoints_before_persisting_config() {
+        let (_directory, state, installation, runtime, mut record) =
+            crate::providers::test_mutation_fixture_for(
+                "qemu",
+                "qcow2",
+                crate::core::image::GuestOs::Linux,
+            );
+        drop(runtime);
+        let configuration_path = state
+            .cell_runtime_root(record.id)
+            .join("q".repeat(UNIX_CONTROL_ENDPOINT_LIMIT + 1));
+        record.ownership.configuration_path = configuration_path.clone();
+        let runtime = state
+            .prepare_cell_runtime_for(
+                record.id,
+                configuration_path.clone(),
+                record.ownership.overlay_path.clone(),
+            )
+            .unwrap();
+        let mutation = state.acquire_mutation_lock().unwrap();
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: Some(record.image.path.clone()),
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+            },
+            state.root().join("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+        let request = CreateVmRequest {
+            name: record.ownership.provider_object_name.clone(),
+            configuration_path: configuration_path.clone(),
+            overlay_path: record.ownership.overlay_path.clone(),
+            parent_path: record.image.path.clone(),
+            memory_mib: record.spec.memory_mib,
+            cpu_count: record.spec.cpu_count,
+            accelerator: Some("tcg".to_owned()),
+            allow_tcg: true,
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+
+        assert!(matches!(
+            provider.create_vm(&authority, &request),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(!configuration_path.join("vm.json").exists());
     }
 
     #[cfg(unix)]

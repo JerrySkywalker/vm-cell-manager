@@ -25,6 +25,22 @@ sha256_file() {
   printf '%s' "$hash_value"
 }
 
+publish_receipt_noreplace() {
+  python3 -c '
+import ctypes
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = libc.renameat2
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+if renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 1) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+' "$1" "$2"
+}
+
 require_safe_text() {
   value=$1
   label=$2
@@ -401,11 +417,9 @@ python3 -c 'import json,sys; value=json.load(open(sys.argv[1], "r", encoding="ut
 [ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed before publication'
 [ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_exists: refusing to replace an existing path'
 receipt_temp_identity=$(stat -Lc '%u:%a:%d:%i' -- "$receipt_temp") || fail 'preflight.receipt_write_failed: temporary receipt identity was unavailable'
-ln -T -- "$receipt_temp" "$receipt_path" || fail 'preflight.receipt_exists: atomic exact-target no-clobber publication failed'
-[ -f "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_write_failed: published receipt was not an ordinary file'
-[ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_path")" = "$receipt_temp_identity" ] || fail 'preflight.receipt_write_failed: published receipt identity did not match its pinned temporary file'
-[ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed during publication'
-rm -f -- "$receipt_temp"
+case "$receipt_temp_identity" in "$effective_uid:600:"*) ;; *) fail 'preflight.receipt_write_failed: temporary receipt identity was invalid' ;; esac
+publish_receipt_noreplace "$receipt_temp" "$receipt_path" || fail 'preflight.receipt_exists: atomic exact-target no-clobber publication failed'
 receipt_temp=
 trap - EXIT HUP INT TERM
-printf 'Linux KVM preflight receipt written: %s\n' "$receipt_path"
+printf 'Linux KVM preflight receipt written: %s\n' "$receipt_path" || :
+exit 0

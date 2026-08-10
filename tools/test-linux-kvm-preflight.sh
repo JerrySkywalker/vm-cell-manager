@@ -179,27 +179,28 @@ fi
 
 wrapper_dir="$root/wrappers"
 mkdir -m 700 "$wrapper_dir"
-cat > "$wrapper_dir/ln" <<'EOF'
+cat > "$wrapper_dir/python3" <<'EOF'
 #!/usr/bin/env sh
 set -eu
-destination=
-for argument in "$@"; do destination=$argument; done
-case "$VMCELL_TEST_LN_RACE" in
-  directory) mkdir -m 700 -- "$destination" ;;
-  symlink)
-    mkdir -m 700 -- "$destination.target"
-    /bin/ln -s -- "$destination.target" "$destination"
-    ;;
-  *) exit 97 ;;
-esac
-exec "$VMCELL_REAL_LN" "$@"
+if [ "${1:-}" = -c ] && printf '%s' "${2:-}" | grep -F renameat2 >/dev/null; then
+  destination=${4:?}
+  case "$VMCELL_TEST_PUBLISH_RACE" in
+    directory) mkdir -m 700 -- "$destination" ;;
+    symlink)
+      mkdir -m 700 -- "$destination.target"
+      /bin/ln -s -- "$destination.target" "$destination"
+      ;;
+    *) exit 97 ;;
+  esac
+fi
+exec "$VMCELL_REAL_PYTHON3" "$@"
 EOF
-chmod 700 "$wrapper_dir/ln"
-real_ln=$(command -v ln)
+chmod 700 "$wrapper_dir/python3"
+real_python3=$(command -v python3)
 
 for race in directory symlink; do
   raced_receipt="$receipts/raced-$race.json"
-  if PATH="$wrapper_dir:$PATH" VMCELL_REAL_LN="$real_ln" VMCELL_TEST_LN_RACE="$race" \
+  if PATH="$wrapper_dir:$PATH" VMCELL_REAL_PYTHON3="$real_python3" VMCELL_TEST_PUBLISH_RACE="$race" \
     sh "$preflight" \
       --repository-root "$repository" \
       --candidate-sha "$candidate" \
