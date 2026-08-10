@@ -68,10 +68,11 @@ short-retention artifact; it does not tag, promote, or create a release. See
 `candidate_only`; it is input for a future reviewed Scoop/WinGet submission,
 not a package-manager publication action.
 
-Public-facing Windows usage follows `docs/quickstart-windows.md`. Keep its
-command spelling synchronized with CLI help and the portable archive layout.
-The quick start must continue to distinguish repository-local evidence and a
-ready capability probe from dedicated-host Hyper-V/PowerShell Direct release
+Public-facing Windows usage follows `docs/quickstart-windows.md` for the frozen
+v0.1 candidate and `docs/windows-daily-driver.md` for the repository-local v0.2
+workflow. Keep command spelling synchronized with CLI help and the portable
+archive layout. Both documents must distinguish repository-local evidence and
+a ready capability probe from dedicated-host Hyper-V/PowerShell Direct release
 acceptance.
 
 On a native Linux development host, `tools/check-linux.sh` runs the locked

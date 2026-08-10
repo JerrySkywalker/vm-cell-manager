@@ -2,12 +2,10 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha. The repository-local M1-M5 foundations are merged to
-> `main`: ownership-checked Hyper-V and QEMU lifecycles, PowerShell Direct and
-> QGA guest contracts, artifacts/TTL/GC, Unix portability, and versioned
-> automation contracts. Real Hyper-V,
-> guest, QEMU, KVM, WHPX, and HVF acceptance remains separately gated and is
-> not run by core CI.
+> **Status:** pre-alpha. The repository-local v0.2 Windows Daily Driver
+> candidate is implemented on `dev` over the M1-M5 foundations. It is not a
+> public release. Real Hyper-V, PowerShell Direct, guest, QEMU, KVM, WHPX, and
+> HVF acceptance remains separately gated and is not run by core CI.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -18,6 +16,14 @@ run` → cleanup-verification workflow is documented in the
 [Windows Human MVP Quick Start](docs/quickstart-windows.md). Real Hyper-V and
 PowerShell Direct execution remains release-gated; repository-local CI and a
 ready doctor probe do not authorize or establish platform acceptance.
+
+## Windows Daily Driver
+
+The canonical v0.2 install → doctor → image lifecycle → run/retain →
+status/inspect → shell → reconcile/cleanup → upgrade workflow is
+[Windows Daily Driver](docs/windows-daily-driver.md). It describes implemented
+repository-local behavior while preserving the same separate real-platform
+release gate.
 
 ## Why this project
 
@@ -175,9 +181,11 @@ vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
-All commands support global `--json`, `--config PATH`, `--state-root PATH`,
-bounded `--lock-timeout-ms N`, and `--human-output normal|quiet` options. The
-timeout applies to each state-lock
+State/provider commands support global `--json`, `--config PATH`, `--state-root
+PATH`, bounded `--lock-timeout-ms N`, and `--human-output normal|quiet`
+options. `completion powershell` is deliberately human-only and rejects
+`--json`; it accesses neither configuration, state, nor providers. The timeout
+applies to each state-lock
 acquisition; artifact dry runs leave records untouched but may initialize lock
 infrastructure on a new state root. Guest
 credentials are accepted only through bounded stdin and are never written to
