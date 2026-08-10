@@ -76,6 +76,7 @@ def observed_glibc_floor(binary: Path) -> str:
 
 def validate_members(members: list[tarfile.TarInfo], root: str) -> None:
     names: set[str] = set()
+    expected_directories = {root, f"{root}/completions"}
     for member in members:
         path = PurePosixPath(member.name)
         if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != root:
@@ -85,6 +86,10 @@ def validate_members(members: list[tarfile.TarInfo], root: str) -> None:
         names.add(member.name)
         if not (member.isfile() or member.isdir()):
             raise ContractError(f"archive contains a link or special entry: {member.name}")
+        if (member.name in expected_directories and not member.isdir()) or (
+            member.name not in expected_directories and not member.isfile()
+        ):
+            raise ContractError(f"archive entry type was invalid: {member.name}")
         if member.pax_headers:
             raise ContractError(f"archive contains unbounded PAX metadata: {member.name}")
 
@@ -113,6 +118,8 @@ def archive_contract(archive_path: Path, version: str, source: str, epoch: int, 
         if [member.name for member in members] != expected:
             raise ContractError("portable archive layout or deterministic ordering changed")
         for index, member in enumerate(members):
+            if (index < 2 and not member.isdir()) or (index >= 2 and not member.isfile()):
+                raise ContractError(f"archive entry type changed unexpectedly: {member.name}")
             if member.uid != 0 or member.gid != 0 or member.uname or member.gname:
                 raise ContractError(f"archive ownership metadata was not normalized: {member.name}")
             if member.mtime != epoch:
@@ -196,6 +203,7 @@ def negative_archive_regressions(root: str, epoch: int) -> None:
     fixtures: list[list[tuple[str, bytes, bytes | None]]] = [
         [("../escape", tarfile.REGTYPE, b"x")],
         [(f"/{root}/absolute", tarfile.REGTYPE, b"x")],
+        [(root, tarfile.REGTYPE, b"not-a-directory")],
         [(root, tarfile.DIRTYPE, None), (root, tarfile.DIRTYPE, None)],
         [(root, tarfile.DIRTYPE, None), (f"{root}/vmcell", tarfile.SYMTYPE, b"target")],
     ]
@@ -226,23 +234,76 @@ def negative_archive_regressions(root: str, epoch: int) -> None:
         raise ContractError("unsafe archive regression was accepted")
 
 
+def install_layout_new(contents: dict[str, bytes], install_root: Path) -> None:
+    try:
+        install_root.mkdir(mode=0o700)
+        (install_root / "completions").mkdir(mode=0o755)
+    except FileExistsError as error:
+        raise ContractError("fresh installation root already exists") from error
+    for relative, content in sorted(contents.items()):
+        path = install_root / relative
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o700 if relative == "vmcell" else 0o600)
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise ContractError("installed file write did not progress")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o755 if relative == "vmcell" else 0o644)
+        finally:
+            os.close(descriptor)
+
+
+def validate_installed_layout(contents: dict[str, bytes], install_root: Path) -> None:
+    expected_root = {Path(name).parts[0] for name in contents}
+    expected_root.add("completions")
+    actual_root = {entry.name for entry in os.scandir(install_root)}
+    if actual_root != expected_root:
+        raise ContractError("installed layout contains missing or foreign root entries")
+    actual_completions = {entry.name for entry in os.scandir(install_root / "completions")}
+    expected_completions = {
+        Path(name).name for name in contents if Path(name).parts[0] == "completions"
+    }
+    if actual_completions != expected_completions:
+        raise ContractError("installed layout contains missing or foreign completion entries")
+    for directory, expected_mode in ((install_root, 0o700), (install_root / "completions", 0o755)):
+        status = os.lstat(directory)
+        if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode) or status.st_uid != os.geteuid():
+            raise ContractError("installed directory identity was not exact current-user ownership")
+        if stat.S_IMODE(status.st_mode) != expected_mode:
+            raise ContractError("installed directory mode drifted")
+    for relative, expected in contents.items():
+        path = install_root / relative
+        status = os.lstat(path)
+        if not stat.S_ISREG(status.st_mode) or stat.S_ISLNK(status.st_mode) or status.st_uid != os.geteuid():
+            raise ContractError(f"installed file identity drifted: {relative}")
+        if path.read_bytes() != expected:
+            raise ContractError(f"installed file content drifted: {relative}")
+        expected_mode = 0o755 if relative == "vmcell" else 0o644
+        if stat.S_IMODE(status.st_mode) != expected_mode:
+            raise ContractError(f"installed file mode drifted: {relative}")
+
+
+def remove_layout_exact(contents: dict[str, bytes], install_root: Path) -> None:
+    validate_installed_layout(contents, install_root)
+    for relative in sorted(contents, reverse=True):
+        (install_root / relative).unlink()
+    (install_root / "completions").rmdir()
+    install_root.rmdir()
+
+
 def install_smoke(contents: dict[str, bytes], version: str, test_root: Path) -> None:
     prefix_parent = test_root / "prefix-parent"
-    prefix = prefix_parent / "prefix"
-    binary_path = prefix / "bin/vmcell"
-    bash_path = prefix / "share/bash-completion/completions/vmcell"
-    zsh_path = prefix / "share/zsh/site-functions/_vmcell"
     prefix_parent.mkdir(mode=0o700)
+    install_root = prefix_parent / f"vmcell-v{version}-linux-x86_64"
     sentinel = prefix_parent / "owner-sentinel"
     sentinel.write_text("retain\n", encoding="utf-8")
-    for parent in (binary_path.parent, bash_path.parent, zsh_path.parent):
-        parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    binary_path.write_bytes(contents["vmcell"])
-    os.chmod(binary_path, 0o755)
-    bash_path.write_bytes(contents["completions/vmcell.bash"])
-    zsh_path.write_bytes(contents["completions/_vmcell"])
-    os.chmod(bash_path, 0o644)
-    os.chmod(zsh_path, 0o644)
+    install_layout_new(contents, install_root)
+    validate_installed_layout(contents, install_root)
+    binary_path = install_root / "vmcell"
     if stat.S_IMODE(binary_path.stat().st_mode) != 0o755:
         raise ContractError("installed binary mode was not executable")
     deterministic_env = os.environ.copy()
@@ -261,12 +322,34 @@ def install_smoke(contents: dict[str, bytes], version: str, test_root: Path) -> 
     if state_root.exists():
         raise ContractError("read-only doctor/status smoke created the isolated state root")
 
-    binary_path.unlink()
-    bash_path.unlink()
-    zsh_path.unlink()
-    for directory in sorted((path for path in prefix.rglob("*") if path.is_dir()), reverse=True):
-        directory.rmdir()
-    prefix.rmdir()
+    collision_root = prefix_parent / "collision"
+    collision_root.mkdir(mode=0o700)
+    collision_sentinel = collision_root / "vmcell"
+    collision_sentinel.write_text("foreign\n", encoding="utf-8")
+    try:
+        install_layout_new(contents, collision_root)
+    except ContractError:
+        pass
+    else:
+        raise ContractError("fresh installation overwrote an existing target")
+    if collision_sentinel.read_text(encoding="utf-8") != "foreign\n":
+        raise ContractError("fresh installation modified a foreign collision target")
+
+    drift_root = prefix_parent / "drifted"
+    install_layout_new(contents, drift_root)
+    drifted_binary = drift_root / "vmcell"
+    drifted_binary.write_text("foreign replacement\n", encoding="utf-8")
+    os.chmod(drifted_binary, 0o755)
+    try:
+        remove_layout_exact(contents, drift_root)
+    except ContractError:
+        pass
+    else:
+        raise ContractError("removal accepted a replaced installed binary")
+    if drifted_binary.read_text(encoding="utf-8") != "foreign replacement\n":
+        raise ContractError("failed removal deleted a foreign replacement")
+
+    remove_layout_exact(contents, install_root)
     if not sentinel.is_file() or sentinel.read_text(encoding="utf-8") != "retain\n":
         raise ContractError("package removal touched an unrelated owner file")
 
@@ -355,6 +438,16 @@ def main() -> int:
         if result.returncode == 0 or source_mismatch.exists():
             raise ContractError("package creation did not bind the declared source commit")
 
+        epoch_mismatch = test_root / "epoch-mismatch"
+        epoch_mismatch_command = [
+            str(epoch + 1) if value == str(epoch) else value for value in common
+        ]
+        result = run(
+            epoch_mismatch_command + ["--output-directory", str(epoch_mismatch)], timeout=60
+        )
+        if result.returncode == 0 or epoch_mismatch.exists():
+            raise ContractError("package creation accepted a false source commit timestamp")
+
         floor_mismatch = test_root / "floor-mismatch"
         floor_mismatch_command = [
             "GLIBC_999.0" if value == floor else value for value in common
@@ -406,6 +499,14 @@ def main() -> int:
         result = run(common + ["--output-directory", str(linked_parent_output)], timeout=60)
         if result.returncode == 0 or linked_parent_output.exists():
             raise ContractError("package assembly accepted a symlink output parent")
+
+        insecure_parent = test_root / "insecure-output-parent"
+        insecure_parent.mkdir(mode=0o777)
+        os.chmod(insecure_parent, 0o777)
+        insecure_output = insecure_parent / "candidate"
+        result = run(common + ["--output-directory", str(insecure_output)], timeout=60)
+        if result.returncode == 0 or insecure_output.exists():
+            raise ContractError("package assembly accepted a group/world-writable output parent")
         install_smoke(contents, version, test_root)
 
     print(

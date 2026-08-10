@@ -71,7 +71,10 @@ function Assert-LinuxValidationContract {
     'locked release package build' = 'cargo build --locked --release --bin vmcell'
     'Linux package validation' = 'python3 tools/test-linux-package\.py --binary "\$CARGO_TARGET_DIR/release/vmcell"'
     'package assembly entry point' = 'tools/package-linux\.py'
-    'package atomic no-replace publication' = 'renameat2\(-100, os\.fsencode\(stage\), -100, os\.fsencode\(output\), 1\)'
+    'package atomic no-replace publication' = '(?s)renameat2\(\s*parent_descriptor,\s*os\.fsencode\(stage\.name\),\s*parent_descriptor,\s*os\.fsencode\(output\.name\),\s*1,'
+    'package private output parent' = 'output parent must be current-user-owned and not group/world writable'
+    'package source epoch binding' = 'source date epoch must equal the declared commit timestamp'
+    'package source version binding' = 'package version must equal the exact Cargo source identity'
     'post-gate clean-tree proof' = 'git diff --exit-code'
     'no ignored checkout target proof' = 'test ! -e "\$GITHUB_WORKSPACE/target"'
   }

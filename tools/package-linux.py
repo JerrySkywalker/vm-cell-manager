@@ -182,6 +182,46 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
     )
     if repository_head != args.source_commit or repository_status:
         raise PackageError("repository must be clean and exactly at the declared source commit")
+    committed_epoch = run_bounded(
+        [
+            "git",
+            "-C",
+            str(repository_root),
+            "show",
+            "-s",
+            "--format=%ct",
+            args.source_commit,
+        ],
+        "committed source timestamp",
+    ).strip()
+    if not committed_epoch.isdigit() or int(committed_epoch) != args.source_date_epoch:
+        raise PackageError("source date epoch must equal the declared commit timestamp")
+    try:
+        cargo_metadata = json.loads(
+            run_bounded(
+                [
+                    "cargo",
+                    "metadata",
+                    "--locked",
+                    "--offline",
+                    "--no-deps",
+                    "--format-version",
+                    "1",
+                    "--manifest-path",
+                    str(repository_root / "Cargo.toml"),
+                ],
+                "Cargo package identity",
+            )
+        )
+    except json.JSONDecodeError as error:
+        raise PackageError("Cargo package identity was not strict JSON") from error
+    packages = [
+        package
+        for package in cargo_metadata.get("packages", [])
+        if package.get("name") == "vm-cell-manager"
+    ]
+    if len(packages) != 1 or packages[0].get("version") != args.version:
+        raise PackageError("package version must equal the exact Cargo source identity")
     binary_bytes = read_regular(Path(args.binary), "binary", MAX_BINARY_BYTES)
     source_inputs = {
         "README.txt": ("packaging/linux/README.txt", "README"),
@@ -360,9 +400,22 @@ def publish(args: argparse.Namespace) -> dict[str, object]:
         raise PackageError("output parent must be an ordinary non-symlink directory")
     if parent_absolute != parent_canonical:
         raise PackageError("output parent must not traverse a symlink")
+    if parent_status.st_uid != os.geteuid() or stat.S_IMODE(parent_status.st_mode) & 0o022:
+        raise PackageError("output parent must be current-user-owned and not group/world writable")
     output = parent_canonical / requested.name
     checksum_name = "SHA256SUMS.txt"
-    stage = Path(tempfile.mkdtemp(prefix=".vmcell-linux-package-", dir=parent_canonical))
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = os.open(parent_canonical, parent_flags)
+    pinned_parent = os.fstat(parent_descriptor)
+    if (pinned_parent.st_dev, pinned_parent.st_ino) != (parent_status.st_dev, parent_status.st_ino):
+        os.close(parent_descriptor)
+        raise PackageError("output parent identity changed before staging")
+    try:
+        stage = Path(tempfile.mkdtemp(prefix=".vmcell-linux-package-", dir=parent_canonical))
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+    stage_status = os.lstat(stage)
     archive_path = stage / archive_name
     checksum_path = stage / checksum_name
     stage_committed = False
@@ -382,29 +435,60 @@ def publish(args: argparse.Namespace) -> dict[str, object]:
             raise PackageError("staged archive identity changed before publication")
         if checksum_path.read_text(encoding="ascii") != f"{archive_sha}  {archive_name}\n":
             raise PackageError("staged checksum identity changed before publication")
+        current_parent = os.lstat(parent_canonical)
+        current_stage = os.lstat(stage)
+        if (current_parent.st_dev, current_parent.st_ino) != (
+            pinned_parent.st_dev,
+            pinned_parent.st_ino,
+        ) or (current_stage.st_dev, current_stage.st_ino) != (
+            stage_status.st_dev,
+            stage_status.st_ino,
+        ):
+            raise PackageError("output staging identity changed before publication")
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = getattr(libc, "renameat2", None)
         if renameat2 is None:
             raise PackageError("atomic no-replace directory publication is unavailable")
         renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         renameat2.restype = ctypes.c_int
-        if renameat2(-100, os.fsencode(stage), -100, os.fsencode(output), 1) != 0:
+        if renameat2(
+            parent_descriptor,
+            os.fsencode(stage.name),
+            parent_descriptor,
+            os.fsencode(output.name),
+            1,
+        ) != 0:
             error = ctypes.get_errno()
             raise PackageError(f"atomic no-replace directory publication failed with errno {error}")
         stage_committed = True
-    except Exception:
+    except BaseException:
         if not stage_committed:
-            for name in (archive_name, checksum_name):
-                path = stage / name
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
             try:
-                stage.rmdir()
+                current_parent = os.lstat(parent_canonical)
+                current_stage = os.lstat(stage)
+                cleanup_exact = (current_parent.st_dev, current_parent.st_ino) == (
+                    pinned_parent.st_dev,
+                    pinned_parent.st_ino,
+                ) and (current_stage.st_dev, current_stage.st_ino) == (
+                    stage_status.st_dev,
+                    stage_status.st_ino,
+                )
             except OSError:
-                pass
+                cleanup_exact = False
+            if cleanup_exact:
+                for name in (archive_name, checksum_name):
+                    path = stage / name
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                try:
+                    stage.rmdir()
+                except OSError:
+                    pass
         raise
+    finally:
+        os.close(parent_descriptor)
     archive_path = output / archive_name
     checksum_path = output / checksum_name
     return {

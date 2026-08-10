@@ -5,15 +5,17 @@ Install
 -------
 
 1. Verify the adjacent SHA256SUMS.txt before extraction.
-2. Extract the archive into a user-owned staging directory. The archive keeps
-   its versioned vmcell-vX.Y.Z-linux-x86_64 top-level directory.
-3. Copy `vmcell` to a user-owned prefix such as `$HOME/.local/bin/vmcell` and
-   keep mode 0755. Do not use sudo for the repository-local smoke path.
-4. Optionally copy `completions/vmcell.bash` to
-   `$PREFIX/share/bash-completion/completions/vmcell` and
-   `completions/_vmcell` to `$PREFIX/share/zsh/site-functions/_vmcell`.
-5. Run `vmcell --version`, `vmcell --help`, and `vmcell doctor` before any
-   provider operation.
+2. Extract into a user-owned staging directory and verify
+   PACKAGE-CONTENTS.sha256 before copying any payload.
+3. Choose a current-user-owned private parent with ordinary non-symlink
+   ancestors. Create one new versioned vmcell-vX.Y.Z-linux-x86_64 directory;
+   stop if that exact target already exists.
+4. Copy the complete fixed archive layout into that new directory. Do not
+   overwrite a shared binary or completion path. Keep vmcell mode 0755 and
+   other files mode 0644.
+5. Verify PACKAGE-CONTENTS.sha256 again inside the installed directory. Run
+   `vmcell --version`, `vmcell --help`, and `vmcell doctor` through that exact
+   path before adding it to PATH or selecting its Bash/Zsh completion.
 
 The package does not install QEMU, repair /dev/kvm, load modules, configure
 networking, start services, or grant provider authority. Real KVM/QGA execution
@@ -24,24 +26,28 @@ Upgrade
 
 1. Stop other vmcell commands using the same state root. Do not stop or remove
    provider objects merely to replace the program.
-2. Keep the old binary and a recoverable copy of the state root. Registered
-   immutable base images remain outside this package and must stay in place.
-3. Verify and extract the new version beside the old one.
+2. Keep the old versioned program directory and a recoverable copy of the state
+   root. Registered immutable base images remain in place.
+3. Verify and install the new archive into a different, previously absent
+   versioned directory. Never install over the previous directory.
 4. Run `vmcell --state-root PATH state check` with the new binary before the
    first mutating command. Stop on upgrade-required, integrity, or ambiguity.
-5. Switch the user PATH and completion files only after version/help/doctor
-   checks pass. Rollback selects the preserved old binary; it is not a state
-   downgrade.
+5. Switch PATH/completion selection only after version/help/doctor checks pass.
+   Rollback selects the preserved old directory; it is not a state downgrade.
 
 Remove
 ------
 
 1. Inspect retained cells and operations through vmcell before deciding on any
    provider cleanup. Never delete a VM by name or PID alone.
-2. Remove only the installed vmcell binary, completion files, and now-empty
-   versioned program directory.
-3. Leave state roots, registered images, cells, and artifacts unchanged unless
-   separately reviewed operator action authorizes their cleanup.
+2. Quiesce the program directory. Prove its root/completions directories and
+   every fixed payload are ordinary non-symlink entries owned by the effective
+   user. Compare the installed content manifest to the retained verified
+   package copy and require every hash, mode, and exact entry name to match.
+3. Stop without deleting anything on a missing, additional, replaced, linked,
+   ownership-drifted, mode-drifted, or hash-drifted entry.
+4. Remove only the fixed verified payload list, then its two empty directories,
+   and remove that exact versioned directory from PATH/completion selection.
 
 Removing this portable package is intentionally not a data or provider cleanup
 operation.

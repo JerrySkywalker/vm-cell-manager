@@ -34,8 +34,10 @@ completions are generated from the exact packaged binary's Clap command graph.
 The canonical package gate runs only through the manual exact-SHA Linux
 validation lane. Its declared baseline is GitHub-hosted Ubuntu 24.04 x86_64,
 Rust and Cargo 1.85.0, the `x86_64-unknown-linux-gnu` target, and the glibc
-userspace supplied by that pinned runner image. The lane prints the host glibc
-identity and uses `readelf --version-info` to determine the highest `GLIBC_X.Y`
+userspace supplied by that declared hosted OS label. GitHub's `ubuntu-24.04`
+label is rolling rather than an immutable image revision, so the exact `ldd`
+identity is recorded in each provenance document. The lane uses
+`readelf --version-info` to determine the highest `GLIBC_X.Y`
 symbol version required by the exact binary. That observed floor is recorded in
 both package metadata and build provenance. No older glibc compatibility is
 claimed.
@@ -67,6 +69,16 @@ isolated nonexistent state root. Doctor may perform the existing non-mutating
 KVM usability probe, including a read/write open of `/dev/kvm`; it issues no KVM
 ioctl, creates no VM, and repairs no host condition.
 
+The assembler requires an existing current-user-owned output parent that is
+not group/world writable, pins that directory identity, stages under a private
+hidden directory, and commits the two-file output with Linux
+`renameat2(RENAME_NOREPLACE)`. Ordinary pre-commit failures clean only the
+identity-matched private stage. A process kill can retain a hidden staging
+directory, and an interruption at the terminal publication boundary can leave
+a complete visible candidate; inspect the exact parent and verify both checksum
+layers before deciding whether to retain or remove either artifact. No output
+path is overwritten.
+
 Install, upgrade, rollback, and removal guidance is in
 [`linux-install-upgrade-remove.md`](linux-install-upgrade-remove.md) and the
 archive's `INSTALL.txt`.
@@ -78,4 +90,3 @@ manager submission, or automatic public-fork build. The manual Linux lane has
 read-only repository permission and validates one explicitly supplied exact
 source SHA. Ephemeral toolchain setup and portable package assembly are
 repository evidence only; they do not establish real QEMU/KVM/QGA acceptance.
-
