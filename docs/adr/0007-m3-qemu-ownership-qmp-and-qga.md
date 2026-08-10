@@ -19,7 +19,9 @@ its immutable registered parent, CPU and memory, an explicit accelerator
 policy, a canonical executable-content hash, and a hash of the complete launch
 argument vector. The versioned QEMU
 runtime receipt additionally records QMP/QGA endpoints and, after spawn, the
-process id plus platform process-start token.
+process id plus platform process-start token. On Unix that process id is also
+the owned process-group id: the leader binding is revalidated while live and
+the group must be empty before lifecycle completion or runtime removal.
 
 Any live QMP inspection and every `cont` or `quit` mutation first revalidate
 that durable PID, start token, launch digest, canonical executable, and
@@ -34,9 +36,12 @@ overlay. QMP/QGA messages, host child output, and host protocol waits are
 bounded. Unknown protocol or process identity fails closed.
 
 Registered QEMU images are ordinary immutable QCOW2 files with no backing
-image. Creation produces exactly one QCOW2 overlay whose full backing path is
-the registered base. Rust pins and re-verifies the base while `qemu-img` or
-QEMU consumes it. The parent is never converted, flattened, or mutated.
+image. Unix opens reject symbolic links and bind the opened device/inode to the
+current registered pathname before and after provider use. Creation produces a
+private uniquely named QCOW2 overlay, validates its full backing path, and
+publishes it to the exact CellId destination with a no-clobber hard link. Rust
+pins and re-verifies the base while `qemu-img` or QEMU consumes it. The parent
+is never converted, flattened, or mutated.
 
 Acceleration is explicit. The native mapping is KVM on Linux, HVF on macOS,
 and WHPX on Windows. TCG is accepted only when both the persisted cell policy
@@ -67,7 +72,9 @@ security boundary.
 - QEMU option-bearing host paths reject comma and control-character ambiguity
   before launch rather than relying on post-launch drift detection.
 - A QMP failure after spawn can require manual recovery, but cannot authorize a
-  broad host process kill or base-image deletion.
+  broad host process kill or base-image deletion. Stale or foreign QMP/QGA
+  endpoint paths and surviving owned-process-group members are retained rather
+  than inferred safe for deletion.
 - QEMU/KVM, WHPX, and HVF real acceptance remain separate host gates. Missing
   QEMU is not a reason to weaken repository-local validation.
 - No daemon, host-network mutation, virtualization installation, driver

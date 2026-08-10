@@ -193,10 +193,15 @@ identity; a compiled but inaccessible accelerator is not silently selected.
 Missing, permission-denied, non-device, and identity drift are fail-closed
 diagnostics and never trigger repair. Linux process receipts hash the opened
 `/proc/<pid>/exe` object and separately bind the expected canonical path and
-start token. Unix QMP/QGA paths are length-bounded; an off-state launch rejects
-any pre-existing endpoint path instead of unlinking or adopting it. An owned
+start token. The durable leader PID is also the owned Unix process-group id;
+live receipt validation proves that binding, and lifecycle completion requires
+the exact group to be empty. Unix QMP/QGA paths are length-bounded; launch,
+off-state inspection, stop completion, and removal reject any pre-existing
+stale or foreign endpoint path instead of unlinking or adopting it. An owned
 waiter reaps each launched QEMU child so a confirmed exit cannot remain a
-same-process zombie that blocks exact cleanup.
+same-process zombie that blocks exact cleanup. Nested CellId/configuration and
+artifact directory handles are revalidated immediately before pathname-based
+writes or exact-owned deletion.
 
 The provider mutex coordinates `vmcell` processes; it cannot serialize unrelated Hyper-V tools. The Rust mutation guard also pins the state root and its `locks`, `images`, `cells`, and `runtime` children against replacement while an operation is active. Real-provider acceptance therefore requires an isolated host window with no concurrent external Hyper-V writer and exclusive, ACL-enforced control of the configured vmcell state root.
 

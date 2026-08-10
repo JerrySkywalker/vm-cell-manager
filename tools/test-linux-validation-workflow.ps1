@@ -134,7 +134,14 @@ function Assert-LinuxPreflightContract {
     'bounded probe file limit' = 'ulimit -f 128'
     'private receipt parent' = '\[ "\$receipt_parent_mode" = 700 \]'
     'runtime prestate fingerprint' = '"runtime_prestate_fingerprint_sha256"'
-    'atomic no-clobber receipt publication' = 'ln -- "\$receipt_temp" "\$receipt_path"'
+    'atomic exact-target receipt publication' = 'ln -T -- "\$receipt_temp" "\$receipt_path"'
+    'published receipt identity proof' = 'published receipt identity did not match its pinned temporary file'
+    'strict receipt JSON validation' = 'json\.load\(open\(sys\.argv\[1\], "r", encoding="utf-8"\)\)'
+    'state-root receipt exclusion' = 'receipt must be outside the vmcell state root'
+    'strict qemu-img JSON validation' = 'json\.loads\(sys\.argv\[1\]\)'
+    'captured initial Git status' = 'repository_status=\$\(git -C "\$repository_path" status'
+    'captured final Git status' = 'final_status=\$\(git -C "\$repository_path" status'
+    'captured runtime enumeration' = 'unsorted_rows=\$\(find "\$runtime_path"'
     'final source drift check' = 'preflight\.candidate_drift: HEAD changed during preflight'
     'final runtime drift check' = 'preflight\.runtime_drift: runtime tree changed during preflight'
     'QEMU version probe' = '"\$qemu_system_path" --version'
@@ -168,7 +175,7 @@ function Assert-LinuxPreflightContract {
     'kernel module mutation' = '(?im)^\s*(?:modprobe|insmod|rmmod)\s+'
     'QEMU lifecycle option' = '(?i)"\$qemu_system_path"\s+(?:-S|-machine|-drive|-qmp|-chardev|-device|-daemonize)\b'
     'vmcell lifecycle' = '(?i)\bvmcell\s+(?:run|exec|copy-in|copy-out|destroy|gc)\b'
-    'receipt overwrite publication' = '(?m)^\s*mv\s+--\s+"\$receipt_temp"\s+"\$receipt_path"\s*$'
+    'receipt overwrite publication' = '(?m)^\s*(?:mv\s+--|ln\s+--)\s+"\$receipt_temp"\s+"\$receipt_path"\s*$'
   }
   foreach ($entry in $forbidden.GetEnumerator()) {
     if ($combined -match $entry.Value) {
@@ -226,6 +233,8 @@ Assert-RejectedPreflightMutation -Name 'second KVM open' `
   -Preflight "$preflight`nexec 8<>/dev/kvm" -FixtureTest $preflightTest
 Assert-RejectedPreflightMutation -Name 'receipt overwrite publication' `
   -Preflight "$preflight`nmv -- `"`$receipt_temp`" `"`$receipt_path`"" -FixtureTest $preflightTest
+Assert-RejectedPreflightMutation -Name 'directory-following receipt link' `
+  -Preflight "$preflight`nln -- `"`$receipt_temp`" `"`$receipt_path`"" -FixtureTest $preflightTest
 Assert-RejectedPreflightMutation -Name 'live fixture test invocation' `
   -Preflight $preflight -FixtureTest "$preflightTest`n--qemu-system /usr/bin/qemu-system-x86_64"
 

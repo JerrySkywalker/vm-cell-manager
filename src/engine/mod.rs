@@ -1139,10 +1139,16 @@ impl<P: LocalVmProvider> CellEngine<P> {
             &runtime_authority,
             &mutation,
         );
+        if let Err(error) = parent_handle.validate_path_identity(&record.image.path) {
+            return self.fail_record(record, error);
+        }
         let overlay = match self.provider.create_overlay(&authority, &overlay_request) {
             Ok(overlay) => overlay,
             Err(error) => return self.fail_record(record, error.into()),
         };
+        if let Err(error) = parent_handle.validate_path_identity(&record.image.path) {
+            return self.fail_record(record, error);
+        }
         if let Err(error) = validate_overlay(&record, &overlay) {
             return self.fail_record(record, error);
         }
@@ -2355,6 +2361,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         let mut handle = open_immutable_parent(&canonical).map_err(as_image_integrity)?;
+        handle.validate_path_identity(&canonical)?;
         let file_size = handle
             .file
             .metadata()
@@ -2366,9 +2373,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         let provider_info = self.provider.inspect_image(canonical.clone())?;
+        handle.validate_path_identity(&canonical)?;
         validate_base_image(self.provider.name(), &canonical, file_size, &provider_info)
             .map_err(as_image_integrity)?;
         let sha256 = sha256_file(&mut handle.file).map_err(as_image_integrity)?;
+        handle.validate_path_identity(&canonical)?;
         if sha256 != variant.sha256 {
             return Err(EngineError::ImageIntegrity(
                 "registered image SHA-256 changed".to_owned(),
@@ -3037,6 +3046,12 @@ fn read_ordinary_copy_source(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Eng
     let _ancestor_handles = pin_ordinary_copy_source_ancestors(&canonical)?;
     let mut options = OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -3056,6 +3071,7 @@ fn read_ordinary_copy_source(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Eng
     if !metadata.is_file() || is_reparse_point(&metadata) || metadata.len() > max_bytes {
         return Err(GuestIoError::PathViolation.into());
     }
+    validate_copy_source_identity(&canonical, &file)?;
     if path
         .canonicalize()
         .map(|rechecked| !paths_equal(&rechecked, &canonical))
@@ -3073,7 +3089,36 @@ fn read_ordinary_copy_source(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Eng
     {
         return Err(GuestIoError::PartialCopy.into());
     }
+    validate_copy_source_identity(&canonical, &file)?;
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn validate_copy_source_identity(path: &Path, file: &File) -> Result<(), EngineError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file.metadata().map_err(|_| GuestIoError::PathViolation)?;
+    let current = fs::symlink_metadata(path).map_err(|_| GuestIoError::PartialCopy)?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+    {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_copy_source_identity(path: &Path, _file: &File) -> Result<(), EngineError> {
+    if path
+        .canonicalize()
+        .map(|current| !paths_equal(&current, path))
+        .unwrap_or(true)
+    {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -3247,6 +3292,42 @@ struct ImmutableParentGuard {
     _ancestor_handles: Vec<File>,
 }
 
+impl ImmutableParentGuard {
+    fn validate_path_identity(&self, path: &Path) -> Result<(), EngineError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let opened = self
+                .file
+                .metadata()
+                .map_err(|error| EngineError::ImageIntegrity(error.to_string()))?;
+            let current = fs::symlink_metadata(path)
+                .map_err(|error| EngineError::ImageIntegrity(error.to_string()))?;
+            if current.file_type().is_symlink()
+                || !current.is_file()
+                || opened.dev() != current.dev()
+                || opened.ino() != current.ino()
+            {
+                return Err(EngineError::ImageIntegrity(
+                    "immutable base open/current identity changed".to_owned(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        if path
+            .canonicalize()
+            .map(|current| !paths_equal(&current, path))
+            .unwrap_or(true)
+        {
+            return Err(EngineError::ImageIntegrity(
+                "immutable base path identity changed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineError> {
     #[cfg(windows)]
     let ancestor_handles = pin_ordinary_copy_source_ancestors(path).map_err(|_| {
@@ -3258,6 +3339,12 @@ fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineErro
     let ancestor_handles = Vec::new();
     let mut options = OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -3279,19 +3366,12 @@ fn open_immutable_parent(path: &Path) -> Result<ImmutableParentGuard, EngineErro
             "base image handle is not an ordinary file".to_owned(),
         ));
     }
-    if path
-        .canonicalize()
-        .map(|rechecked| !paths_equal(&rechecked, path))
-        .unwrap_or(true)
-    {
-        return Err(EngineError::InvalidImage(
-            "base image identity changed while acquiring its immutable handle".to_owned(),
-        ));
-    }
-    Ok(ImmutableParentGuard {
+    let guard = ImmutableParentGuard {
         file,
         _ancestor_handles: ancestor_handles,
-    })
+    };
+    guard.validate_path_identity(path)?;
+    Ok(guard)
 }
 
 fn sha256_file(file: &mut File) -> Result<String, EngineError> {
@@ -5363,6 +5443,33 @@ mod tests {
             calls_before
         );
         assert!(engine.state.cell_runtime_root(cell.id).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_immutable_parent_and_copy_source_reject_open_path_replacement() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("base.qcow2");
+        let retired_parent = directory.path().join("base-retired.qcow2");
+        fs::write(&parent, b"registered-parent").unwrap();
+        let guard = open_immutable_parent(&parent).unwrap();
+        fs::rename(&parent, &retired_parent).unwrap();
+        fs::write(&parent, b"replacement-parent").unwrap();
+        assert!(matches!(
+            guard.validate_path_identity(&parent),
+            Err(EngineError::ImageIntegrity(_))
+        ));
+
+        let source = directory.path().join("copy-source.bin");
+        let retired_source = directory.path().join("copy-source-retired.bin");
+        fs::write(&source, b"copy-source").unwrap();
+        let file = File::open(&source).unwrap();
+        fs::rename(&source, &retired_source).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        assert!(matches!(
+            validate_copy_source_identity(&source, &file),
+            Err(EngineError::Guest(GuestIoError::PartialCopy))
+        ));
     }
 
     #[test]

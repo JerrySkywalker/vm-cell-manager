@@ -18,6 +18,13 @@ sha256_text() {
   printf '%s' "$1" | sha256sum | awk '{print $1}'
 }
 
+sha256_file() {
+  hash_output=$(sha256sum -- "$1") || fail "$2: SHA-256 could not be computed"
+  hash_value=${hash_output%% *}
+  require_sha256 "$hash_value" "$2"
+  printf '%s' "$hash_value"
+}
+
 require_safe_text() {
   value=$1
   label=$2
@@ -64,7 +71,8 @@ collect_runtime_rows() {
   runtime_path=$(canonical_directory "$runtime_root" 'preflight.runtime_invalid')
   [ "$(stat -Lc '%u' -- "$runtime_path")" = "$effective_uid" ] || fail 'preflight.runtime_invalid: runtime root is not owned by the effective identity'
   [ "$(stat -Lc '%a' -- "$runtime_path")" = 700 ] || fail 'preflight.runtime_invalid: runtime root mode must be 0700'
-  rows=$(find "$runtime_path" -xdev -printf '%P|%y|%D:%i|%u|%m\n' | LC_ALL=C sort) || fail 'preflight.runtime_invalid: runtime prestate could not be enumerated'
+  unsorted_rows=$(find "$runtime_path" -xdev -printf '%P|%y|%D:%i|%u|%m\n') || fail 'preflight.runtime_invalid: runtime prestate could not be enumerated'
+  rows=$(printf '%s' "$unsorted_rows" | LC_ALL=C sort) || fail 'preflight.runtime_invalid: runtime prestate could not be sorted'
   [ "$(printf '%s' "$rows" | wc -c)" -le 65536 ] || fail 'preflight.runtime_invalid: runtime prestate exceeded 65536 bytes'
   [ "$(printf '%s\n' "$rows" | awk 'NF {count++} END {print count+0}')" -le 4096 ] || fail 'preflight.runtime_invalid: runtime prestate exceeded 4096 entries'
   if printf '%s\n' "$rows" | grep -F '|l|' >/dev/null; then
@@ -143,6 +151,7 @@ else
   [ -n "$qemu_system" ] && [ -n "$qemu_img" ] || fail 'preflight.arguments_invalid: live mode requires qemu-system and qemu-img'
   evidence_source=live-read-only
 fi
+command -v python3 >/dev/null 2>&1 || fail 'preflight.host_invalid: python3 is required for strict JSON validation'
 
 repository_path=$(canonical_directory "$repository_root" 'preflight.repository_invalid')
 state_path=$(canonical_directory "$state_root" 'preflight.state_root_invalid')
@@ -163,8 +172,10 @@ case "$origin" in
   https://github.com/JerrySkywalker/vm-cell-manager|https://github.com/JerrySkywalker/vm-cell-manager.git|git@github.com:JerrySkywalker/vm-cell-manager|git@github.com:JerrySkywalker/vm-cell-manager.git|ssh://git@github.com/JerrySkywalker/vm-cell-manager|ssh://git@github.com/JerrySkywalker/vm-cell-manager.git) ;;
   *) fail 'preflight.repository_invalid: origin was not JerrySkywalker/vm-cell-manager' ;;
 esac
-[ -z "$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all 2>/dev/null)" ] || fail 'preflight.candidate_dirty: tracked or untracked changes were present'
+repository_status=$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all 2>/dev/null) || fail 'preflight.repository_invalid: worktree status was unavailable'
+[ -z "$repository_status" ] || fail 'preflight.candidate_dirty: tracked or untracked changes were present'
 case "$receipt_parent/" in "$repository_path/"*) fail 'preflight.receipt_invalid: receipt must be outside the source worktree' ;; esac
+case "$receipt_parent/" in "$state_path/"*) fail 'preflight.receipt_invalid: receipt must be outside the vmcell state root' ;; esac
 
 effective_uid=$(id -u)
 effective_gid=$(id -g)
@@ -183,8 +194,9 @@ state_mode=$(stat -Lc '%a' -- "$state_path")
 state_identity=$(stat -Lc '%d:%i' -- "$state_path")
 
 case "$base_path" in *.qcow2) ;; *) fail 'preflight.image_variant_incompatible: prepared base must use .qcow2' ;; esac
-[ -z "$(find "$base_path" -maxdepth 0 -perm /222 -print)" ] || fail 'preflight.image_not_immutable: base image has a write bit set'
-base_sha256=$(sha256sum -- "$base_path" | awk '{print $1}')
+base_writable=$(find "$base_path" -maxdepth 0 -perm /222 -print) || fail 'preflight.image_not_immutable: base image mode could not be checked'
+[ -z "$base_writable" ] || fail 'preflight.image_not_immutable: base image has a write bit set'
+base_sha256=$(sha256_file "$base_path" 'preflight.image_hash_invalid')
 base_size=$(stat -Lc '%s' -- "$base_path")
 base_mode=$(stat -Lc '%a' -- "$base_path")
 base_identity=$(stat -Lc '%d:%i' -- "$base_path")
@@ -235,8 +247,8 @@ else
   qemu_img_path=$(canonical_file "$qemu_img" 'preflight.qemu_img_absent')
   [ -x "$qemu_system_path" ] || fail 'preflight.qemu_system_absent: executable bit is missing'
   [ -x "$qemu_img_path" ] || fail 'preflight.qemu_img_absent: executable bit is missing'
-  qemu_system_sha256=$(sha256sum -- "$qemu_system_path" | awk '{print $1}')
-  qemu_img_sha256=$(sha256sum -- "$qemu_img_path" | awk '{print $1}')
+  qemu_system_sha256=$(sha256_file "$qemu_system_path" 'preflight.qemu_system_hash_invalid')
+  qemu_img_sha256=$(sha256_file "$qemu_img_path" 'preflight.qemu_img_hash_invalid')
   qemu_system_identity=$(stat -Lc '%d:%i:%s' -- "$qemu_system_path")
   qemu_img_identity=$(stat -Lc '%d:%i:%s' -- "$qemu_img_path")
   run_bounded_probe 'preflight.qemu_system_probe_failed' "$qemu_system_path" --version
@@ -252,10 +264,7 @@ else
   printf '%s\n' "$accel_output" | grep -Eq '^[[:space:]]*kvm[[:space:]]*$' || fail 'preflight.kvm_unavailable: QEMU did not advertise KVM'
   run_bounded_probe 'preflight.image_variant_incompatible' "$qemu_img_path" info --output=json "$base_path"
   image_info=$bounded_probe_output
-  printf '%s' "$image_info" | grep -Eq '"format"[[:space:]]*:[[:space:]]*"qcow2"' || fail 'preflight.image_variant_incompatible: image format was not qcow2'
-  if printf '%s' "$image_info" | grep -Eq '"(full-)?backing-filename"[[:space:]]*:[[:space:]]*"'; then
-    fail 'preflight.image_variant_incompatible: immutable base already has a backing parent'
-  fi
+  python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert isinstance(value,dict); assert value.get("format")=="qcow2"; assert value.get("backing-filename") in (None, ""); assert value.get("full-backing-filename") in (None, "")' "$image_info" >/dev/null 2>&1 || fail 'preflight.image_variant_incompatible: qemu-img JSON did not describe one parentless qcow2 base'
 
   [ -c /dev/kvm ] && [ ! -L /dev/kvm ] || fail 'preflight.kvm_missing: /dev/kvm is missing or not an ordinary character device'
   kvm_before=$(stat -Lc '%d:%i:%t:%T' -- /dev/kvm)
@@ -270,17 +279,20 @@ else
   kvm_identity=$kvm_opened
   kvm_status=read-write-usable
 
-  [ "$(sha256sum -- "$qemu_system_path" | awk '{print $1}')" = "$qemu_system_sha256" ] || fail 'preflight.executable_drift: qemu-system changed during preflight'
-  [ "$(sha256sum -- "$qemu_img_path" | awk '{print $1}')" = "$qemu_img_sha256" ] || fail 'preflight.executable_drift: qemu-img changed during preflight'
+  [ "$(sha256_file "$qemu_system_path" 'preflight.executable_drift')" = "$qemu_system_sha256" ] || fail 'preflight.executable_drift: qemu-system changed during preflight'
+  [ "$(sha256_file "$qemu_img_path" 'preflight.executable_drift')" = "$qemu_img_sha256" ] || fail 'preflight.executable_drift: qemu-img changed during preflight'
   [ "$(stat -Lc '%d:%i:%s' -- "$qemu_system_path")" = "$qemu_system_identity" ] || fail 'preflight.executable_drift: qemu-system identity changed during preflight'
   [ "$(stat -Lc '%d:%i:%s' -- "$qemu_img_path")" = "$qemu_img_identity" ] || fail 'preflight.executable_drift: qemu-img identity changed during preflight'
-  [ "$(sha256sum -- "$base_path" | awk '{print $1}')" = "$base_sha256" ] || fail 'preflight.image_drift: immutable base changed during preflight'
+  [ "$(sha256_file "$base_path" 'preflight.image_drift')" = "$base_sha256" ] || fail 'preflight.image_drift: immutable base changed during preflight'
   [ "$(stat -Lc '%s' -- "$base_path")" = "$base_size" ] || fail 'preflight.image_drift: immutable base size changed during preflight'
 
-  foreign_rows=$(ps -eo pid=,uid=,comm= | awk '$3 ~ /^qemu-system-/ {print $1 "|" $2 "|" $3}' | sort)
+  process_rows=$(ps -eo pid=,uid=,comm=) || fail 'preflight.foreign_prestate_invalid: process prestate could not be enumerated'
+  foreign_unsorted=$(printf '%s\n' "$process_rows" | awk '$3 ~ /^qemu-system-/ {print $1 "|" $2 "|" $3}') || fail 'preflight.foreign_prestate_invalid: process prestate could not be filtered'
+  foreign_rows=$(printf '%s\n' "$foreign_unsorted" | LC_ALL=C sort) || fail 'preflight.foreign_prestate_invalid: process prestate could not be sorted'
   foreign_qemu_count=$(printf '%s\n' "$foreign_rows" | awk 'NF {count++} END {print count+0}')
   foreign_qemu_fingerprint=$(sha256_text "$foreign_rows")
-  network_rows=$(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort)
+  network_unsorted=$(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n') || fail 'preflight.network_prestate_invalid: network prestate could not be enumerated'
+  network_rows=$(printf '%s\n' "$network_unsorted" | LC_ALL=C sort) || fail 'preflight.network_prestate_invalid: network prestate could not be sorted'
   network_count=$(printf '%s\n' "$network_rows" | awk 'NF {count++} END {print count+0}')
   network_fingerprint=$(sha256_text "$network_rows")
 fi
@@ -291,6 +303,7 @@ require_sha256 "$qemu_img_sha256" 'preflight.qemu_img_hash_invalid'
 require_sha256 "$foreign_qemu_fingerprint" 'preflight.foreign_prestate_invalid'
 require_sha256 "$network_fingerprint" 'preflight.network_prestate_invalid'
 require_sha256 "$runtime_fingerprint" 'preflight.runtime_prestate_invalid'
+require_sha256 "$base_sha256" 'preflight.image_hash_invalid'
 for count in "$foreign_qemu_count" "$network_count" "$runtime_entry_count"; do
   case "$count" in ''|*[!0-9]*) fail 'preflight.fixture_invalid: counts must be non-negative integers' ;; esac
 done
@@ -310,12 +323,14 @@ require_safe_text "$kvm_identity" 'preflight.kvm_identity_invalid'
 [ "${#qemu_img_version}" -le 512 ] || fail 'preflight.qemu_img_version_invalid: value exceeded 512 characters'
 [ "${#kvm_identity}" -le 512 ] || fail 'preflight.kvm_identity_invalid: value exceeded 512 characters'
 
-[ "$(git -C "$repository_path" rev-parse HEAD 2>/dev/null)" = "$candidate_sha" ] || fail 'preflight.candidate_drift: HEAD changed during preflight'
-[ -z "$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all 2>/dev/null)" ] || fail 'preflight.candidate_drift: worktree changed during preflight'
+final_head=$(git -C "$repository_path" rev-parse HEAD 2>/dev/null) || fail 'preflight.candidate_drift: HEAD could not be re-read'
+[ "$final_head" = "$candidate_sha" ] || fail 'preflight.candidate_drift: HEAD changed during preflight'
+final_status=$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all 2>/dev/null) || fail 'preflight.candidate_drift: worktree status could not be re-read'
+[ -z "$final_status" ] || fail 'preflight.candidate_drift: worktree changed during preflight'
 [ "$(stat -Lc '%u:%a:%d:%i' -- "$state_path")" = "$state_uid:$state_mode:$state_identity" ] || fail 'preflight.state_root_drift: state root identity changed during preflight'
 [ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed during preflight'
 [ "$(stat -Lc '%d:%i:%s:%a' -- "$base_path")" = "$base_identity:$base_size:$base_mode" ] || fail 'preflight.image_drift: immutable base identity changed during preflight'
-[ "$(sha256sum -- "$base_path" | awk '{print $1}')" = "$base_sha256" ] || fail 'preflight.image_drift: immutable base contents changed during preflight'
+[ "$(sha256_file "$base_path" 'preflight.image_drift')" = "$base_sha256" ] || fail 'preflight.image_drift: immutable base contents changed during preflight'
 runtime_rows_final=$(collect_runtime_rows) || fail 'preflight.runtime_drift: runtime prestate could not be recollected'
 [ "$runtime_rows_final" = "$runtime_rows" ] || fail 'preflight.runtime_drift: runtime tree changed during preflight'
 [ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_exists: refusing to replace an existing path'
@@ -382,9 +397,14 @@ printf '%s\n' \
   '}' > "$receipt_temp"
 
 [ "$(stat -Lc '%a' -- "$receipt_temp")" = 600 ] || fail 'preflight.receipt_write_failed: temporary receipt mode was not 0600'
+python3 -c 'import json,sys; value=json.load(open(sys.argv[1], "r", encoding="utf-8")); assert value.get("contract")=="vmcell.linux-kvm-preflight.v1"; assert value.get("authorizing") is False' "$receipt_temp" >/dev/null 2>&1 || fail 'preflight.receipt_write_failed: temporary receipt was not strict UTF-8 contract JSON'
 [ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed before publication'
 [ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_exists: refusing to replace an existing path'
-ln -- "$receipt_temp" "$receipt_path" || fail 'preflight.receipt_exists: atomic no-clobber publication failed'
+receipt_temp_identity=$(stat -Lc '%u:%a:%d:%i' -- "$receipt_temp") || fail 'preflight.receipt_write_failed: temporary receipt identity was unavailable'
+ln -T -- "$receipt_temp" "$receipt_path" || fail 'preflight.receipt_exists: atomic exact-target no-clobber publication failed'
+[ -f "$receipt_path" ] && [ ! -L "$receipt_path" ] || fail 'preflight.receipt_write_failed: published receipt was not an ordinary file'
+[ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_path")" = "$receipt_temp_identity" ] || fail 'preflight.receipt_write_failed: published receipt identity did not match its pinned temporary file'
+[ "$(stat -Lc '%u:%a:%d:%i' -- "$receipt_parent")" = "$receipt_parent_uid:$receipt_parent_mode:$receipt_parent_identity" ] || fail 'preflight.receipt_parent_drift: receipt parent identity changed during publication'
 rm -f -- "$receipt_temp"
 receipt_temp=
 trap - EXIT HUP INT TERM

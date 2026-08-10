@@ -162,4 +162,136 @@ if sh "$preflight" \
 fi
 [ ! -e "$public_receipt" ]
 
+state_receipt="$state/runtime/preflight.json"
+if sh "$preflight" \
+  --repository-root "$repository" \
+  --candidate-sha "$candidate" \
+  --state-root "$state" \
+  --base-image "$base" \
+  --owned-namespace vmcell-linux-kvm-acceptance-007 \
+  --writer-exclusivity-evidence fixture-window-007 \
+  --receipt "$state_receipt" \
+  --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'receipt inside the vmcell state root was accepted' >&2
+  exit 1
+fi
+[ ! -e "$state_receipt" ]
+
+wrapper_dir="$root/wrappers"
+mkdir -m 700 "$wrapper_dir"
+cat > "$wrapper_dir/ln" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+destination=
+for argument in "$@"; do destination=$argument; done
+case "$VMCELL_TEST_LN_RACE" in
+  directory) mkdir -m 700 -- "$destination" ;;
+  symlink)
+    mkdir -m 700 -- "$destination.target"
+    /bin/ln -s -- "$destination.target" "$destination"
+    ;;
+  *) exit 97 ;;
+esac
+exec "$VMCELL_REAL_LN" "$@"
+EOF
+chmod 700 "$wrapper_dir/ln"
+real_ln=$(command -v ln)
+
+for race in directory symlink; do
+  raced_receipt="$receipts/raced-$race.json"
+  if PATH="$wrapper_dir:$PATH" VMCELL_REAL_LN="$real_ln" VMCELL_TEST_LN_RACE="$race" \
+    sh "$preflight" \
+      --repository-root "$repository" \
+      --candidate-sha "$candidate" \
+      --state-root "$state" \
+      --base-image "$base" \
+      --owned-namespace "vmcell-linux-kvm-race-$race" \
+      --writer-exclusivity-evidence "fixture-window-race-$race" \
+      --receipt "$raced_receipt" \
+      --fixture-evidence "$fixture" >/dev/null 2>&1; then
+    printf '%s\n' "receipt publication followed a raced $race target" >&2
+    exit 1
+  fi
+  [ ! -f "$raced_receipt" ]
+  if [ -L "$raced_receipt" ]; then
+    target="$raced_receipt.target"
+    [ -z "$(find "$target" -mindepth 1 -print -quit)" ]
+    rm "$raced_receipt"
+    rmdir "$target"
+  elif [ -d "$raced_receipt" ]; then
+    [ -z "$(find "$raced_receipt" -mindepth 1 -print -quit)" ]
+    rmdir "$raced_receipt"
+  fi
+done
+
+cat > "$wrapper_dir/git" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+for argument in "$@"; do
+  [ "$argument" != status ] || exit 96
+done
+exec "$VMCELL_REAL_GIT" "$@"
+EOF
+chmod 700 "$wrapper_dir/git"
+real_git=$(command -v git)
+status_receipt="$receipts/status-failure.json"
+if PATH="$wrapper_dir:$PATH" VMCELL_REAL_GIT="$real_git" \
+  sh "$preflight" \
+    --repository-root "$repository" \
+    --candidate-sha "$candidate" \
+    --state-root "$state" \
+    --base-image "$base" \
+    --owned-namespace vmcell-linux-kvm-status-failure \
+    --writer-exclusivity-evidence fixture-window-status-failure \
+    --receipt "$status_receipt" \
+    --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'failed Git status was accepted as a clean worktree' >&2
+  exit 1
+fi
+[ ! -e "$status_receipt" ]
+rm "$wrapper_dir/git"
+
+cat > "$wrapper_dir/find" <<'EOF'
+#!/usr/bin/env sh
+exit 95
+EOF
+chmod 700 "$wrapper_dir/find"
+enumeration_receipt="$receipts/enumeration-failure.json"
+if PATH="$wrapper_dir:$PATH" \
+  sh "$preflight" \
+    --repository-root "$repository" \
+    --candidate-sha "$candidate" \
+    --state-root "$state" \
+    --base-image "$base" \
+    --owned-namespace vmcell-linux-kvm-enumeration-failure \
+    --writer-exclusivity-evidence fixture-window-enumeration-failure \
+    --receipt "$enumeration_receipt" \
+    --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'failed evidence enumeration was accepted' >&2
+  exit 1
+fi
+[ ! -e "$enumeration_receipt" ]
+rm "$wrapper_dir/find"
+
+cat > "$wrapper_dir/sha256sum" <<'EOF'
+#!/usr/bin/env sh
+exit 94
+EOF
+chmod 700 "$wrapper_dir/sha256sum"
+hash_receipt="$receipts/hash-failure.json"
+if PATH="$wrapper_dir:$PATH" \
+  sh "$preflight" \
+    --repository-root "$repository" \
+    --candidate-sha "$candidate" \
+    --state-root "$state" \
+    --base-image "$base" \
+    --owned-namespace vmcell-linux-kvm-hash-failure \
+    --writer-exclusivity-evidence fixture-window-hash-failure \
+    --receipt "$hash_receipt" \
+    --fixture-evidence "$fixture" >/dev/null 2>&1; then
+  printf '%s\n' 'failed evidence hash was accepted' >&2
+  exit 1
+fi
+[ ! -e "$hash_receipt" ]
+
 printf '%s\n' 'Linux KVM preflight fixture contract passed'

@@ -118,6 +118,8 @@ pub trait QemuCommandExecutor: Send + Sync {
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool;
 
+    fn process_group_absence_proven(&self, process_group_id: u32) -> bool;
+
     fn connect_qmp(
         &self,
         endpoint: &ControlEndpoint,
@@ -212,6 +214,10 @@ impl QemuCommandExecutor for SystemQemuExecutor {
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool {
         process_absence_proven(process_id, start_token)
+    }
+
+    fn process_group_absence_proven(&self, process_group_id: u32) -> bool {
+        process_group_absence_proven(process_group_id)
     }
 
     fn connect_qmp(
@@ -418,7 +424,13 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
                             "recorded QEMU process absence cannot be proven".to_owned(),
                         ));
                     }
+                    if !self.executor.process_group_absence_proven(pid) {
+                        return Err(ProviderError::OwnershipChanged(
+                            "recorded QEMU process group is not empty".to_owned(),
+                        ));
+                    }
                 }
+                ensure_control_endpoints_absent(config)?;
                 ProviderPowerState::Off
             }
         };
@@ -661,12 +673,20 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         request: &CreateOverlayRequest,
     ) -> Result<ProviderImageInfo, ProviderError> {
         authority.validate_overlay_request(request)?;
-        if request.overlay_path.exists() {
-            return Err(ProviderError::Collision(
-                "QEMU overlay already exists".to_owned(),
-            ));
-        }
-        self.run_checked(
+        prove_path_absent(&request.overlay_path, "QEMU overlay")?;
+        let parent = request.overlay_path.parent().ok_or_else(|| {
+            ProviderError::Authority("QEMU overlay path has no runtime parent".to_owned())
+        })?;
+        let file_name = request
+            .overlay_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                ProviderError::Authority("QEMU overlay filename is invalid".to_owned())
+            })?;
+        let staged_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        prove_path_absent(&staged_path, "QEMU staged overlay")?;
+        let create_result = self.run_checked(
             &self.image_binary,
             &[
                 OsString::from("create"),
@@ -676,9 +696,56 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 OsString::from("qcow2"),
                 OsString::from("-b"),
                 request.parent_path.as_os_str().to_owned(),
-                request.overlay_path.as_os_str().to_owned(),
+                staged_path.as_os_str().to_owned(),
             ],
-        )?;
+        );
+        if let Err(error) = create_result {
+            cleanup_staged_overlay(&staged_path);
+            return Err(error);
+        }
+        authority.validate_overlay_request(request)?;
+        let staged_file = open_private_qemu_file(&staged_path)?;
+        let staged = match self.inspect_image(staged_path.clone()) {
+            Ok(staged) => staged,
+            Err(error) => {
+                cleanup_exact_staged_overlay(&staged_path, &staged_file);
+                return Err(error);
+            }
+        };
+        if staged.disk_format != "qcow2"
+            || staged.disk_type != "overlay"
+            || staged
+                .parent_path
+                .as_ref()
+                .is_none_or(|path| !provider_path_equal(path, &request.parent_path))
+        {
+            cleanup_exact_staged_overlay(&staged_path, &staged_file);
+            return Err(ProviderError::OwnershipChanged(
+                "staged QEMU overlay did not bind the exact immutable parent".to_owned(),
+            ));
+        }
+        ensure_private_qemu_file(&staged_path, &staged_file)?;
+        prove_path_absent(&request.overlay_path, "QEMU overlay")?;
+        fs::hard_link(&staged_path, &request.overlay_path).map_err(|error| {
+            cleanup_exact_staged_overlay(&staged_path, &staged_file);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ProviderError::Collision("QEMU overlay already exists".to_owned())
+            } else {
+                ProviderError::Command(format!(
+                    "failed to publish QEMU overlay without replacement: {error}"
+                ))
+            }
+        })?;
+        ensure_private_qemu_file(&request.overlay_path, &staged_file)?;
+        authority.validate_overlay_request(request)?;
+        fs::remove_file(&staged_path).map_err(|error| {
+            ProviderError::Command(format!("failed to retire staged QEMU overlay: {error}"))
+        })?;
+        sync_parent_directory(&request.overlay_path).map_err(|error| {
+            ProviderError::Command(format!(
+                "failed to persist QEMU overlay publication: {error}"
+            ))
+        })?;
         self.inspect_image(request.overlay_path.clone())
     }
 
@@ -849,6 +916,12 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                     .executor
                     .process_absence_proven(process_id, process_start_token)
             {
+                if !self.executor.process_group_absence_proven(process_id) {
+                    return Err(ProviderError::OwnershipChanged(
+                        "QEMU leader exited while its owned process group remained live".to_owned(),
+                    ));
+                }
+                ensure_control_endpoints_absent(&config)?;
                 config.process_id = None;
                 config.process_start_token = None;
                 config.process_executable_sha256 = None;
@@ -909,7 +982,13 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                     "QEMU process absence cannot be proven".to_owned(),
                 ));
             }
+            if !self.executor.process_group_absence_proven(pid) {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU process group is still live".to_owned(),
+                ));
+            }
         }
+        ensure_control_endpoints_absent(&config)?;
         fs::remove_file(&path).map_err(|error| {
             ProviderError::Command(format!("failed to remove QEMU configuration: {error}"))
         })?;
@@ -1007,6 +1086,72 @@ struct QemuImgInfo {
     backing_filename: Option<String>,
     #[serde(rename = "full-backing-filename")]
     full_backing_filename: Option<PathBuf>,
+}
+
+fn prove_path_absent(path: &Path, label: &str) -> Result<(), ProviderError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ProviderError::Collision(format!(
+            "{label} path already exists"
+        ))),
+        Err(_) => Err(ProviderError::OwnershipChanged(format!(
+            "{label} absence could not be proven"
+        ))),
+    }
+}
+
+fn open_private_qemu_file(path: &Path) -> Result<File, ProviderError> {
+    let current = fs::symlink_metadata(path).map_err(|_| {
+        ProviderError::OwnershipChanged(
+            "QEMU staged overlay path metadata could not be pinned".to_owned(),
+        )
+    })?;
+    if !metadata_is_ordinary_file(&current) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU staged overlay path is not an ordinary file".to_owned(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_qemu_file_options(&mut options, false);
+    let file = options.open(path).map_err(|error| {
+        ProviderError::OwnershipChanged(format!("QEMU staged overlay could not be pinned: {error}"))
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        ProviderError::OwnershipChanged(
+            "QEMU staged overlay metadata could not be pinned".to_owned(),
+        )
+    })?;
+    if !metadata_is_ordinary_file(&metadata) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU staged overlay is not an ordinary file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| {
+                ProviderError::OwnershipChanged(
+                    "QEMU staged overlay privacy could not be enforced".to_owned(),
+                )
+            })?;
+    }
+    ensure_private_qemu_file(path, &file)?;
+    Ok(file)
+}
+
+fn cleanup_staged_overlay(path: &Path) {
+    if let Ok(file) = open_private_qemu_file(path) {
+        cleanup_exact_staged_overlay(path, &file);
+    }
+}
+
+fn cleanup_exact_staged_overlay(path: &Path, file: &File) {
+    if ensure_private_qemu_file(path, file).is_ok() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn create_ordinary_directory(path: &Path) -> Result<(), ProviderError> {
@@ -1756,6 +1901,17 @@ fn process_start_token(process_id: u32) -> Option<u64> {
         .ok()
 }
 
+#[cfg(target_os = "linux")]
+fn process_group_id(process_id: u32) -> Option<u32> {
+    let text = fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    text.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
 #[cfg(target_os = "windows")]
 fn process_start_token(process_id: u32) -> Option<u64> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
@@ -1793,7 +1949,9 @@ fn process_matches(
 ) -> bool {
     use std::os::unix::ffi::OsStringExt;
 
-    if process_start_token(process_id) != Some(start_token) {
+    if process_start_token(process_id) != Some(start_token)
+        || process_group_id(process_id) != Some(process_id)
+    {
         return false;
     }
     let executable = match fs::read_link(format!("/proc/{process_id}/exe")) {
@@ -1848,6 +2006,52 @@ fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
         Err(_) => false,
         Ok(_) => process_start_token(process_id).is_some_and(|actual| actual != start_token),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn process_group_absence_proven(_process_group_id: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_absence_proven(process_group_id: u32) -> bool {
+    if process_group_id == 0 {
+        return false;
+    }
+    let entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return false,
+        };
+        let Some(_process_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match fs::read_to_string(entry.path().join("stat")) {
+            Ok(text) => {
+                let group = text
+                    .rsplit_once(')')
+                    .and_then(|(_, fields)| fields.split_whitespace().nth(2))
+                    .and_then(|value| value.parse::<u32>().ok());
+                if group == Some(process_group_id) {
+                    return false;
+                }
+                if group.is_none() {
+                    return false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -1936,6 +2140,11 @@ fn process_absence_proven(_process_id: u32, _start_token: u64) -> bool {
     false
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn process_group_absence_proven(_process_group_id: u32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -2020,8 +2229,10 @@ mod tests {
                 }
             } else if args.first() == Some(&OsString::from("info")) {
                 let path = PathBuf::from(args.last().unwrap());
-                let overlay =
-                    path.file_name().and_then(|value| value.to_str()) == Some("cell.qcow2");
+                let overlay = self
+                    .backing
+                    .as_ref()
+                    .is_some_and(|backing| !provider_path_equal(&path, backing));
                 serde_json::to_vec(&serde_json::json!({
                     "format": "qcow2",
                     "virtual-size": 1048576,
@@ -2029,6 +2240,9 @@ mod tests {
                     "full-backing-filename": overlay.then(|| self.backing.as_ref().unwrap())
                 }))
                 .unwrap()
+            } else if args.first() == Some(&OsString::from("create")) {
+                fs::write(PathBuf::from(args.last().unwrap()), b"overlay").unwrap();
+                Vec::new()
             } else {
                 Vec::new()
             };
@@ -2068,6 +2282,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push("process_absence_proven".to_owned());
+            true
+        }
+        fn process_group_absence_proven(&self, _process_group_id: u32) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("process_group_absence_proven".to_owned());
             true
         }
         fn connect_qmp(
@@ -2315,6 +2536,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(process_absence_proven(process_id, start_token));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_exit_does_not_prove_the_owned_process_group_empty() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & sleep 0.2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_detached_process(&mut command);
+        let child = command.spawn().unwrap();
+        let process_id = child.id();
+        let start_token = process_start_token(process_id).unwrap();
+        assert_eq!(process_group_id(process_id), Some(process_id));
+        start_process_reaper(child).unwrap();
+
+        let leader_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !process_absence_proven(process_id, start_token)
+            && std::time::Instant::now() < leader_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_absence_proven(process_id, start_token));
+        assert!(!process_group_absence_proven(process_id));
+
+        unsafe {
+            libc::kill(-(process_id as i32), libc::SIGTERM);
+        }
+        let group_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !process_group_absence_proven(process_id)
+            && std::time::Instant::now() < group_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_group_absence_proven(process_id));
     }
 
     #[cfg(target_os = "linux")]
@@ -2599,6 +2857,19 @@ mod tests {
         ))
         .unwrap();
         assert!(stopped_config.process_executable_sha256.is_none());
+        #[cfg(unix)]
+        {
+            let ControlEndpoint::Unix(qga_path) = &stopped_config.qga else {
+                unreachable!();
+            };
+            fs::write(qga_path, b"foreign").unwrap();
+            assert!(matches!(
+                provider.remove_vm(&authority, &stopped),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+            assert_eq!(fs::read(qga_path).unwrap(), b"foreign");
+            fs::remove_file(qga_path).unwrap();
+        }
         provider.remove_vm(&authority, &stopped).unwrap();
         assert!(
             provider
@@ -2606,6 +2877,61 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_creation_uses_staging_and_rejects_dangling_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, state, installation, runtime, record) =
+            crate::providers::test_mutation_fixture_for(
+                "qemu",
+                "qcow2",
+                crate::core::image::GuestOs::Linux,
+            );
+        let mutation = state.acquire_mutation_lock().unwrap();
+        fs::write(&record.image.path, b"base").unwrap();
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: Some(record.image.path.clone()),
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+            },
+            state.root().join("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+        let request = CreateOverlayRequest {
+            parent_path: record.image.path.clone(),
+            overlay_path: record.ownership.overlay_path.clone(),
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+        let overlay = provider.create_overlay(&authority, &request).unwrap();
+        assert_eq!(overlay.path, request.overlay_path);
+        assert!(request.overlay_path.is_file());
+        assert!(
+            fs::read_dir(request.overlay_path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+
+        fs::remove_file(&request.overlay_path).unwrap();
+        let external = state.root().join("external.qcow2");
+        fs::write(&external, b"retain").unwrap();
+        symlink(&external, &request.overlay_path).unwrap();
+        assert!(matches!(
+            provider.create_overlay(&authority, &request),
+            Err(ProviderError::Collision(_))
+        ));
+        assert_eq!(fs::read(&external).unwrap(), b"retain");
     }
 
     #[test]
