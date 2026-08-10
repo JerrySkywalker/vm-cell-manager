@@ -419,6 +419,12 @@ pub enum ImageCommand {
 
     /// Inspect one registered image manifest.
     Inspect { id: ImageId },
+
+    /// List durable cell references that permit or block metadata removal.
+    Dependencies { id: ImageId },
+
+    /// Remove only registered image metadata when no non-destroyed cell depends on it.
+    Unregister { id: ImageId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -941,6 +947,12 @@ fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
             CliExitCode::Conflict,
             false,
         ),
+        EngineError::ImageInUse { .. } => classification(
+            "vmcell.image.in_use",
+            CliErrorCategory::Conflict,
+            CliExitCode::Conflict,
+            false,
+        ),
         EngineError::OwnershipNotProven(_) => classification(
             "vmcell.ownership.not_proven",
             CliErrorCategory::Ownership,
@@ -1351,6 +1363,15 @@ mod tests {
                 false,
             ),
             (
+                Box::new(EngineError::ImageInUse {
+                    image_id: ImageId::parse("windows-dev").unwrap(),
+                    blocking_cells: 1,
+                }),
+                "vmcell.image.in_use",
+                CliExitCode::Conflict,
+                false,
+            ),
+            (
                 Box::new(EngineError::InvalidImage("missing image path".to_owned())),
                 "vmcell.invalid_input",
                 CliExitCode::InvalidInput,
@@ -1573,6 +1594,26 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_image_dependency_and_unregister_surfaces() {
+        let dependencies =
+            Cli::try_parse_from(["vmcell", "image", "dependencies", "windows-dev"]).unwrap();
+        assert!(matches!(
+            dependencies.command,
+            Command::Image {
+                command: ImageCommand::Dependencies { .. }
+            }
+        ));
+        let unregister =
+            Cli::try_parse_from(["vmcell", "image", "unregister", "windows-dev"]).unwrap();
+        assert!(matches!(
+            unregister.command,
+            Command::Image {
+                command: ImageCommand::Unregister { .. }
+            }
+        ));
     }
 
     #[test]

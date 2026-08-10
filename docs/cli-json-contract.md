@@ -23,6 +23,8 @@ vmcell image validate --path BASE.vhdx --guest-os windows [--provider hyperv]
 vmcell image validate --id IMAGE [--provider hyperv|qemu]
 vmcell image list
 vmcell image inspect IMAGE
+vmcell image dependencies IMAGE
+vmcell image unregister IMAGE
 vmcell create --image IMAGE [--provider hyperv|qemu] [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
               [--accelerator auto|whpx|kvm|hvf|tcg] [--allow-tcg]
 vmcell list
@@ -59,6 +61,29 @@ the command exits with the integrity code `9`. Issue values are stable
 snake-case identifiers. Human `image inspect` performs the registered proof;
 JSON `image inspect` keeps the existing `ImageRecord` response unchanged, and
 automation can request the proof explicitly with `image validate --id`.
+
+`image dependencies` is provider-neutral and read-only. It returns contract
+`vmcell.image-dependencies.v1`, the image ID, a deterministic CellId-sorted
+array of durable references (`cell_id`, `state`, `phase`, `blocking`), and
+`can_unregister`. A reference is nonblocking only when both durable cell state
+and phase are `destroyed`; any inconsistent cell/image binding is an integrity
+failure.
+The dependency report applies the same metadata-removal predicate as
+`unregister`: malformed, reparse, device-ambiguous, or same-file-alias variant
+metadata fails integrity and never yields `can_unregister: true`.
+
+`image unregister` rechecks that dependency set under the global mutation lock
+and atomically retires only the exact validated `images/IMAGE.json` entry to a
+non-JSON receipt in the same pinned directory. The active manifest name is
+removed from image lookup, but its bytes are not unlinked. Its
+`vmcell.image-unregister.v1` report contains `metadata_removed`, the invariant
+`bytes_deleted: false`, and any retained destroyed-cell references. The command
+does not require provider availability and never probes a provider or accesses
+registered base-image contents. It performs only a bounded read-only/no-follow
+file-identity check for existing variant paths; a missing variant does not
+block metadata removal. A non-destroyed dependency fails as
+`vmcell.image.in_use` / conflict exit `4`. Repeating a completed unregister is
+successful with `metadata_removed: false`.
 
 PowerShell Direct guest commands require an exact-owned, running Windows cell.
 Its password is read as one bounded line from stdin; there is deliberately no

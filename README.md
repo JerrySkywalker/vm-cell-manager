@@ -150,6 +150,8 @@ vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv
 vmcell image validate --id IMAGE --provider hyperv
 vmcell image list
 vmcell image inspect IMAGE
+vmcell image dependencies IMAGE
+vmcell image unregister IMAGE
 vmcell create --image IMAGE --provider PROVIDER --cpu-count 2 --memory-mib 4096 [--accelerator POLICY] [--allow-tcg] [--ttl-seconds N]
 vmcell run --image IMAGE --provider PROVIDER [--cpu 2] [--memory 4096] [--ttl N] [--keep | --keep-on-failure] -- PROGRAM [ARG...]
 vmcell list
@@ -212,7 +214,15 @@ backing parent, and can be hashed. Registered-image mode repeats those checks
 and compares canonical path, size, format, and SHA-256 with the durable image
 record. Human `image add`, `list`, and `inspect` output includes guest/provider
 identity and immutable content identity; `--json` retains versioned records and
-validation reports. vmcell does not build, mount, or modify guest images.
+validation reports. `image dependencies` lists every durable cell reference;
+all non-destroyed references block `image unregister`. Unregistering is a
+provider-neutral metadata-only operation: it never probes a provider or reads,
+hashes, modifies, or deletes registered base-image contents. Existing
+variant files are opened read-only/no-follow only long enough to reject a
+reparse or same-file alias to the manifest. Destroyed cell
+tombstones retain their copied image binding and do not block metadata removal.
+The operation is idempotent and reports `bytes_deleted=false`. vmcell does not
+build, mount, or modify guest images.
 
 ## Windows portable distribution
 

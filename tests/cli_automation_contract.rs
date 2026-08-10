@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command;
 
 const MISSING_CELL_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -44,6 +45,107 @@ fn invalid_run(state_root: &std::path::Path, json: bool) -> std::process::Output
         ])
         .output()
         .expect("vmcell CLI should start")
+}
+
+fn write_image_fixture(state_root: &std::path::Path, base_path: &std::path::Path) {
+    let images = state_root.join("images");
+    fs::create_dir_all(&images).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(state_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&images, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let manifest = images.join("daily-image.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "id": "daily-image",
+            "guest_os": "windows",
+            "guest_arch": "x86_64",
+            "variants": [{
+                "provider": "hyperv",
+                "disk_format": "vhdx",
+                "path": base_path,
+                "sha256": "fixture-hash-never-read",
+                "file_size": 23
+            }],
+            "registered_at": "2026-08-10T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+fn write_active_cell_fixture(state_root: &std::path::Path, base_path: &std::path::Path) {
+    let cells = state_root.join("cells");
+    fs::create_dir_all(&cells).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&cells, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let cell_id = "00000000-0000-0000-0000-000000000123";
+    let manifest = cells.join(format!("{cell_id}.json"));
+    fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "id": cell_id,
+            "provider": "hyperv",
+            "spec": {
+                "image": "daily-image",
+                "provider": "hyperv",
+                "cpu_count": 2,
+                "memory_mib": 4096,
+                "ttl_seconds": null,
+                "accelerator": null,
+                "allow_tcg": false
+            },
+            "image": {
+                "image_id": "daily-image",
+                "guest_os": "windows",
+                "provider": "hyperv",
+                "disk_format": "vhdx",
+                "path": base_path,
+                "sha256": "fixture-hash-never-read",
+                "file_size": 23
+            },
+            "ownership": {
+                "schema_version": 1,
+                "install_id": "00000000-0000-0000-0000-000000000001",
+                "operation_id": "00000000-0000-0000-0000-000000000002",
+                "provider_object_name": "vmcell-fixture",
+                "provider_marker": "vmcell:v1:fixture",
+                "configuration_path": state_root.join("runtime").join("fixture.vmcell.json"),
+                "overlay_path": state_root.join("runtime").join("fixture.vhdx")
+            },
+            "provider_object": null,
+            "state": "running",
+            "phase": "ready",
+            "created_at": "2026-08-10T00:00:00Z",
+            "updated_at": "2026-08-10T00:00:00Z",
+            "expires_at": null,
+            "last_error": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 #[test]
@@ -146,4 +248,87 @@ fn run_failures_preserve_stage_cell_and_cleanup_in_json_and_human_modes() {
     assert!(human_stderr.contains("operation=none"));
     assert!(human_stderr.contains("cleanup=nothing_created"));
     assert!(human_stderr.contains("cleanup_error=none"));
+}
+
+#[test]
+fn image_dependency_and_unregister_cli_are_provider_neutral_and_metadata_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let base_path = directory.path().join("base.vhdx");
+    fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+    write_image_fixture(&state_root, &base_path);
+
+    let dependencies = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--state-root"])
+        .arg(&state_root)
+        .args(["image", "dependencies", "daily-image"])
+        .output()
+        .unwrap();
+    assert!(dependencies.status.success());
+    let dependencies_json: serde_json::Value =
+        serde_json::from_slice(&dependencies.stdout).unwrap();
+    assert_eq!(
+        dependencies_json["contract"],
+        "vmcell.image-dependencies.v1"
+    );
+    assert_eq!(dependencies_json["can_unregister"], true);
+    assert_eq!(dependencies_json["dependencies"], serde_json::json!([]));
+
+    let unregister = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--state-root"])
+        .arg(&state_root)
+        .args(["image", "unregister", "daily-image"])
+        .output()
+        .unwrap();
+    assert!(unregister.status.success());
+    let unregister_json: serde_json::Value = serde_json::from_slice(&unregister.stdout).unwrap();
+    assert_eq!(unregister_json["contract"], "vmcell.image-unregister.v1");
+    assert_eq!(unregister_json["metadata_removed"], true);
+    assert_eq!(unregister_json["bytes_deleted"], false);
+    assert!(!state_root.join("images").join("daily-image.json").exists());
+    assert_eq!(fs::read(&base_path).unwrap(), b"immutable-base-sentinel");
+
+    let repeated = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--state-root"])
+        .arg(&state_root)
+        .args(["image", "unregister", "daily-image"])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated_json: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_json["metadata_removed"], false);
+    assert_eq!(repeated_json["bytes_deleted"], false);
+    assert_eq!(fs::read(&base_path).unwrap(), b"immutable-base-sentinel");
+}
+
+#[test]
+fn image_unregister_conflict_is_stable_redacted_and_non_mutating() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let base_path = directory.path().join("credential-sentinel-base.vhdx");
+    fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+    write_image_fixture(&state_root, &base_path);
+    write_active_cell_fixture(&state_root, &base_path);
+
+    for json in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vmcell"));
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .arg("--state-root")
+            .arg(&state_root)
+            .args(["image", "unregister", "daily-image"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("vmcell.image.in_use"));
+        assert!(!stderr.contains("credential-sentinel"));
+        assert!(!stderr.contains(state_root.to_string_lossy().as_ref()));
+    }
+
+    assert!(state_root.join("images").join("daily-image.json").exists());
+    assert_eq!(fs::read(&base_path).unwrap(), b"immutable-base-sentinel");
 }
