@@ -17,15 +17,25 @@ use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateVmRequest, ProviderError, ProviderVm, VmLookup,
 };
 
+#[cfg(any(target_os = "windows", test))]
 const PROBE_SCRIPT: &str = include_str!("scripts/probe.ps1");
+#[cfg(any(target_os = "windows", test))]
 const INSPECT_VHD_SCRIPT: &str = include_str!("scripts/inspect_vhd.ps1");
+#[cfg(any(target_os = "windows", test))]
 const CREATE_DIFFERENCING_VHD_SCRIPT: &str = include_str!("scripts/create_differencing_vhd.ps1");
+#[cfg(any(target_os = "windows", test))]
 const CREATE_VM_SCRIPT: &str = include_str!("scripts/create_vm.ps1");
+#[cfg(any(target_os = "windows", test))]
 const CLAIM_VM_SCRIPT: &str = include_str!("scripts/claim_vm.ps1");
+#[cfg(any(target_os = "windows", test))]
 const CONFIGURE_VM_SCRIPT: &str = include_str!("scripts/configure_vm.ps1");
+#[cfg(any(target_os = "windows", test))]
 const INSPECT_VM_SCRIPT: &str = include_str!("scripts/inspect_vm.ps1");
+#[cfg(any(target_os = "windows", test))]
 const START_VM_SCRIPT: &str = include_str!("scripts/start_vm.ps1");
+#[cfg(any(target_os = "windows", test))]
 const STOP_VM_SCRIPT: &str = include_str!("scripts/stop_vm.ps1");
+#[cfg(any(target_os = "windows", test))]
 const REMOVE_VM_SCRIPT: &str = include_str!("scripts/remove_vm.ps1");
 #[cfg(target_os = "windows")]
 const PROVIDER_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);

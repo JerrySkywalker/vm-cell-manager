@@ -1068,6 +1068,8 @@ fn open_state_file_for_authority(path: &Path) -> Result<File, StateError> {
 
 fn open_state_file(path: &Path, pin_identity: bool) -> Result<File, StateError> {
     ensure_existing_ancestors_are_ordinary(path)?;
+    #[cfg(not(windows))]
+    let _ = pin_identity;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

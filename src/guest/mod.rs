@@ -27,6 +27,7 @@ pub const MAX_COPY_BYTES: u64 = 67_108_864;
 
 pub struct GuestCredentials {
     username: String,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     password: Zeroizing<String>,
 }
 
@@ -50,10 +51,12 @@ impl GuestCredentials {
         Ok(Self { username, password })
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn username(&self) -> &str {
         &self.username
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn password(&self) -> &str {
         self.password.as_str()
     }
