@@ -79,6 +79,12 @@ pub enum Command {
         command: StateCommand,
     },
 
+    /// Generate deterministic shell integration without accessing state or providers.
+    Completion {
+        #[command(subcommand)]
+        command: CompletionCommand,
+    },
+
     /// Inspect built-in local providers.
     Provider {
         #[command(subcommand)]
@@ -378,6 +384,12 @@ pub enum GuestOperationCommand {
 pub enum StateCommand {
     /// Validate every core durable record against the current supported format.
     Check,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum CompletionCommand {
+    /// Generate PowerShell argument completion for vmcell.
+    Powershell,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2017,6 +2029,18 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["vmcell", "state"]).is_err());
+    }
+
+    #[test]
+    fn powershell_completion_is_an_explicit_nested_command() {
+        let cli = Cli::try_parse_from(["vmcell", "completion", "powershell"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Completion {
+                command: CompletionCommand::Powershell
+            }
+        ));
+        assert!(Cli::try_parse_from(["vmcell", "completion"]).is_err());
     }
 
     #[test]

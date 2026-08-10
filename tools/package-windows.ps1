@@ -41,6 +41,12 @@ $binaryVersion = (& $binaryPathFull --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $binaryVersion -ne "vmcell $Version") {
   throw "binary version mismatch: expected vmcell $Version"
 }
+$completionText = (& $binaryPathFull completion powershell 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0 -or
+    -not $completionText.Contains('Register-ArgumentCompleter', [StringComparison]::Ordinal)) {
+  throw 'PowerShell completion generation failed'
+}
+$completionText = (($completionText -replace "`r`n", "`n").TrimEnd()) + "`n"
 
 $outputPath = [IO.Path]::GetFullPath($OutputDirectory)
 [IO.Directory]::CreateDirectory($outputPath) | Out-Null
@@ -73,11 +79,40 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($cargoVersion)) {
 }
 $entryNames = @(
   "$layoutRoot/vmcell.exe",
+  "$layoutRoot/completions/vmcell.ps1",
   "$layoutRoot/LICENSE.txt",
   "$layoutRoot/NOTICE.txt",
   "$layoutRoot/INSTALL.txt",
+  "$layoutRoot/PACKAGE-METADATA.json",
   "$layoutRoot/BUILD-PROVENANCE.json"
 )
+$packageMetadata = [ordered]@{
+  schema_version = 1
+  package_identifier = 'JerrySkywalker.vmcell'
+  package_name = 'VM Cell Manager'
+  package_version = $Version
+  publisher = 'JerrySkywalker'
+  license = 'Apache-2.0'
+  project_url = 'https://github.com/JerrySkywalker/vm-cell-manager'
+  archive_name = $archiveName
+  binary_relative_path = 'vmcell.exe'
+  completion_relative_path = 'completions/vmcell.ps1'
+  commands = @('vmcell')
+  portable = $true
+  scope = 'user'
+  scoop = [ordered]@{
+    bin = 'vmcell.exe'
+    hash_manifest = 'SHA256SUMS.txt'
+  }
+  winget = [ordered]@{
+    installer_type = 'zip'
+    nested_installer_type = 'portable'
+    nested_installer_file = 'vmcell.exe'
+    portable_command_alias = 'vmcell'
+  }
+  publication_status = 'candidate_only'
+}
+$packageMetadataJson = (($packageMetadata | ConvertTo-Json -Depth 6) -replace "`r`n", "`n") + "`n"
 $provenance = [ordered]@{
   schema_version = 1
   package = 'vmcell'
@@ -113,10 +148,12 @@ try {
     try {
       $inputs = [ordered]@{
         $entryNames[0] = [IO.File]::ReadAllBytes($binaryPathFull)
-        $entryNames[1] = [IO.File]::ReadAllBytes($licensePath)
-        $entryNames[2] = [IO.File]::ReadAllBytes($noticePath)
-        $entryNames[3] = [IO.File]::ReadAllBytes($installPath)
-        $entryNames[4] = $utf8.GetBytes($provenanceJson)
+        $entryNames[1] = $utf8.GetBytes($completionText)
+        $entryNames[2] = [IO.File]::ReadAllBytes($licensePath)
+        $entryNames[3] = [IO.File]::ReadAllBytes($noticePath)
+        $entryNames[4] = [IO.File]::ReadAllBytes($installPath)
+        $entryNames[5] = $utf8.GetBytes($packageMetadataJson)
+        $entryNames[6] = $utf8.GetBytes($provenanceJson)
       }
       foreach ($entryName in $entryNames) {
         $entry = $archive.CreateEntry(

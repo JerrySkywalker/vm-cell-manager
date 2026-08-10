@@ -20,9 +20,11 @@ $sourceDateEpoch = 1704067200
 $archiveName = "vmcell-v$Version-windows-x86_64.zip"
 $expectedEntries = @(
   "vmcell-v$Version-windows-x86_64/vmcell.exe",
+  "vmcell-v$Version-windows-x86_64/completions/vmcell.ps1",
   "vmcell-v$Version-windows-x86_64/LICENSE.txt",
   "vmcell-v$Version-windows-x86_64/NOTICE.txt",
   "vmcell-v$Version-windows-x86_64/INSTALL.txt",
+  "vmcell-v$Version-windows-x86_64/PACKAGE-METADATA.json",
   "vmcell-v$Version-windows-x86_64/BUILD-PROVENANCE.json"
 )
 
@@ -95,7 +97,38 @@ try {
         throw "archive timestamp was not normalized: $($entry.FullName)"
       }
     }
-    $provenanceEntry = $archive.GetEntry($expectedEntries[4])
+    $completionEntry = $archive.GetEntry($expectedEntries[1])
+    $reader = [IO.StreamReader]::new($completionEntry.Open(), [Text.Encoding]::UTF8)
+    try {
+      $completionText = $reader.ReadToEnd()
+    } finally {
+      $reader.Dispose()
+    }
+    if (-not $completionText.Contains('Register-ArgumentCompleter', [StringComparison]::Ordinal) -or
+        $completionText.Contains("`r", [StringComparison]::Ordinal)) {
+      throw 'PowerShell completion was absent or not normalized'
+    }
+
+    $metadataEntry = $archive.GetEntry($expectedEntries[5])
+    $reader = [IO.StreamReader]::new($metadataEntry.Open(), [Text.Encoding]::UTF8)
+    try {
+      $packageMetadata = $reader.ReadToEnd() | ConvertFrom-Json
+    } finally {
+      $reader.Dispose()
+    }
+    if ($packageMetadata.schema_version -ne 1 -or
+        $packageMetadata.package_identifier -ne 'JerrySkywalker.vmcell' -or
+        $packageMetadata.package_version -ne $Version -or
+        $packageMetadata.binary_relative_path -ne 'vmcell.exe' -or
+        $packageMetadata.completion_relative_path -ne 'completions/vmcell.ps1' -or
+        $packageMetadata.scoop.bin -ne 'vmcell.exe' -or
+        $packageMetadata.winget.installer_type -ne 'zip' -or
+        $packageMetadata.winget.nested_installer_type -ne 'portable' -or
+        $packageMetadata.publication_status -ne 'candidate_only') {
+      throw 'package-manager metadata contract changed unexpectedly'
+    }
+
+    $provenanceEntry = $archive.GetEntry($expectedEntries[6])
     $reader = [IO.StreamReader]::new($provenanceEntry.Open(), [Text.Encoding]::UTF8)
     try {
       $provenance = $reader.ReadToEnd() | ConvertFrom-Json
@@ -115,14 +148,14 @@ try {
     if ($provenance.binary_sha256 -ne $expectedBinaryHash) {
       throw 'package provenance binary hash mismatch'
     }
-    $installEntry = $archive.GetEntry($expectedEntries[3])
+    $installEntry = $archive.GetEntry($expectedEntries[4])
     $reader = [IO.StreamReader]::new($installEntry.Open(), [Text.Encoding]::UTF8)
     try {
       $installText = $reader.ReadToEnd()
     } finally {
       $reader.Dispose()
     }
-    foreach ($required in @('Install', 'vmcell.exe doctor', 'Remove')) {
+    foreach ($required in @('Install', 'vmcell.exe doctor', 'Upgrade', 'state check', 'Remove')) {
       if (-not $installText.Contains($required, [StringComparison]::Ordinal)) {
         throw "portable package instructions omitted: $required"
       }

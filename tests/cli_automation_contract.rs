@@ -24,6 +24,48 @@ fn run_vmcell(arguments: &[&str]) -> std::process::Output {
         .expect("vmcell CLI should start")
 }
 
+#[test]
+fn version_help_and_powershell_completion_are_stable_and_state_free() {
+    let version = run_vmcell(&["--version"]);
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap(),
+        format!("vmcell {}\n", env!("CARGO_PKG_VERSION"))
+    );
+
+    let help = run_vmcell(&["--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    for command in ["doctor", "status", "state", "completion", "run", "shell"] {
+        assert!(help.contains(command), "root help omitted {command}");
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let absent_state = directory.path().join("must-not-exist");
+    let state = absent_state.to_string_lossy().into_owned();
+    let first = run_vmcell(&["--state-root", state.as_str(), "completion", "powershell"]);
+    let second = run_vmcell(&["--state-root", state.as_str(), "completion", "powershell"]);
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert!(first.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&first.stdout).contains("Register-ArgumentCompleter"));
+    assert!(!absent_state.exists());
+
+    let json = run_vmcell(&[
+        "--json",
+        "--state-root",
+        state.as_str(),
+        "completion",
+        "powershell",
+    ]);
+    assert_eq!(json.status.code(), Some(2));
+    assert!(json.stdout.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(envelope["error"]["code"], "vmcell.invalid_input");
+    assert!(!absent_state.exists());
+}
+
 fn write_config(path: &std::path::Path, value: &serde_json::Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
     #[cfg(unix)]
