@@ -95,6 +95,30 @@ def open_exact_directory_at(directory: int, name: str, mode: int) -> int:
     return descriptor
 
 
+def create_exact_directory_at(directory: int, name: str, mode: int) -> int:
+    os.mkdir(name, 0o700, dir_fd=directory)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory)
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or opened.st_uid != os.geteuid()
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise LayoutError(f"created directory identity was invalid: {name}")
+        os.fchmod(descriptor, mode)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise LayoutError(f"created directory mode could not be normalized: {name}")
+        os.fsync(descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def exact_names(directory: int) -> set[str]:
     return {entry.name for entry in os.scandir(directory)}
 
@@ -237,8 +261,7 @@ def install(parent: int, target: str, contents: dict[str, bytes]) -> None:
     stage_descriptor = open_exact_directory_at(parent, stage, 0o700)
     published = False
     try:
-        os.mkdir("completions", 0o755, dir_fd=stage_descriptor)
-        completions = open_exact_directory_at(stage_descriptor, "completions", 0o755)
+        completions = create_exact_directory_at(stage_descriptor, "completions", 0o755)
         try:
             for name, mode in FILE_MODES.items():
                 destination = completions if name.startswith("completions/") else stage_descriptor
@@ -265,9 +288,13 @@ def cleanup_layout(
     *,
     require_valid: bool,
     expected_contents: dict[str, bytes] | None = None,
+    forbidden_root_identity: tuple[int, int] | None = None,
 ) -> None:
     root = open_exact_directory_at(parent, target, 0o700)
     try:
+        opened_root = os.fstat(root)
+        if forbidden_root_identity == (opened_root.st_dev, opened_root.st_ino):
+            raise LayoutError("removal source must be independent of the installed target")
         if require_valid:
             installed_contents, _ = validate_layout(root, root_mode=0o700)
             if expected_contents is None or installed_contents != expected_contents:
@@ -301,6 +328,8 @@ def main() -> int:
     args = parser.parse_args()
     source_descriptor, source, contents = open_source()
     try:
+        source_status = os.fstat(source_descriptor)
+        source_identity = (source_status.st_dev, source_status.st_ino)
         target = source.name
         if not target.startswith("vmcell-v") or not target.endswith("-linux-x86_64"):
             raise LayoutError("source layout name was not a versioned vmcell package")
@@ -314,6 +343,7 @@ def main() -> int:
                     target,
                     require_valid=True,
                     expected_contents=contents,
+                    forbidden_root_identity=source_identity,
                 )
         finally:
             os.close(parent)

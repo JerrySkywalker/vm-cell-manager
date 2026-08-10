@@ -26,7 +26,7 @@ the retained manifest before publication. Stop on any mismatch.
 set -eu
 archive=vmcell-v0.2.0-linux-x86_64.tar.gz
 staging=$(mktemp -d)
-tar -xzf "$archive" -C "$staging"
+(umask 022; tar -xzf "$archive" -C "$staging")
 layout="$staging/vmcell-v0.2.0-linux-x86_64"
 install_parent="$HOME/.local/lib/vmcell"
 install_root="$install_parent/vmcell-v0.2.0-linux-x86_64"
@@ -81,7 +81,8 @@ and reject any missing, additional, replaced, or mode-drifted entry. Stop
 without deleting anything on any mismatch.
 
 Run removal from the retained, checksum-verified extracted package layout, not
-from the installed copy. The same packaged helper compares exact names,
+from the installed copy; the helper rejects a source directory that is the
+installed target. The same packaged helper compares exact names,
 ownership, modes, and contents to that retained source before it removes the
 fixed payload list and the two now-empty directories:
 

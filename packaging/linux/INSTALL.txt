@@ -5,7 +5,8 @@ Install
 -------
 
 1. Verify the adjacent SHA256SUMS.txt before extraction.
-2. Extract into a user-owned staging directory and verify
+2. Extract into a user-owned staging directory under an explicit umask 022 so
+   the normalized 0755/0644 archive modes are retained, then verify
    PACKAGE-CONTENTS.sha256 before copying any payload.
 3. Run the packaged vmcell-portable-layout.py helper from that verified layout.
    It admits/creates the private user-owned parent chain, creates one new
@@ -47,8 +48,9 @@ Remove
    package copy and require every hash, mode, and exact entry name to match.
 3. Stop without deleting anything on a missing, additional, replaced, linked,
    ownership-drifted, mode-drifted, or hash-drifted entry.
-4. Run the packaged helper from the retained verified extracted package. It
-   removes only the fixed verified payload list and its empty directories;
+4. Run the packaged helper from the retained verified extracted package, never
+   from the installed directory itself. It rejects a source that is the target
+   and removes only the fixed verified payload list and its empty directories;
    then remove that exact versioned directory from PATH/completion selection.
 
 Removing this portable package is intentionally not a data or provider cleanup

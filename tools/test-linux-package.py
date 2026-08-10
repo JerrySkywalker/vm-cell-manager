@@ -28,7 +28,13 @@ class ContractError(RuntimeError):
     pass
 
 
-def run(command: list[str], *, timeout: int = 30, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+def run(
+    command: list[str],
+    *,
+    timeout: int = 30,
+    environment: dict[str, str] | None = None,
+    process_umask: int | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     try:
         result = subprocess.run(
             command,
@@ -38,6 +44,7 @@ def run(command: list[str], *, timeout: int = 30, environment: dict[str, str] | 
             stderr=subprocess.PIPE,
             timeout=timeout,
             env=environment,
+            preexec_fn=(lambda: os.umask(process_umask)) if process_umask is not None else None,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ContractError(f"command unavailable or timed out: {command[0]}") from error
@@ -280,7 +287,16 @@ def install_smoke(
     home.mkdir(mode=0o700)
     extraction = test_root / "extraction"
     extraction.mkdir(mode=0o700)
-    extracted = run(["tar", "-xzf", str(archive), "-C", str(extraction)])
+    extracted = run(
+        [
+            "sh",
+            "-c",
+            'umask 077; (umask 022; exec tar -xzf "$1" -C "$2")',
+            "vmcell-package-extract",
+            str(archive),
+            str(extraction),
+        ]
+    )
     if extracted.returncode != 0:
         raise ContractError("validated archive could not be extracted for install smoke")
     layout = extraction / f"vmcell-v{version}-linux-x86_64"
@@ -292,6 +308,7 @@ def install_smoke(
     installed = run(
         [sys.executable, str(installer), "install", "--parent", str(prefix_parent)],
         environment=environment,
+        process_umask=0o077,
     )
     if installed.returncode != 0:
         raise ContractError(
@@ -358,6 +375,20 @@ def install_smoke(
     )
     if linked.returncode == 0:
         raise ContractError("portable installer accepted a symlink parent")
+
+    self_remove = run(
+        [
+            sys.executable,
+            str(install_root / "vmcell-portable-layout.py"),
+            "remove",
+            "--parent",
+            str(prefix_parent),
+        ],
+        environment=environment,
+    )
+    if self_remove.returncode == 0:
+        raise ContractError("installed helper authorized its own removal")
+    validate_installed_layout(contents, install_root)
 
     removed = run(
         [sys.executable, str(installer), "remove", "--parent", str(prefix_parent)],
