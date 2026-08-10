@@ -379,6 +379,13 @@ separate release gate.
 
 Introduce a small explicit user configuration mechanism for appropriate defaults such as provider policy, CPU/memory defaults, safe state-root defaults, and human-output preferences. Configuration never silently grants destructive authority; command-line arguments remain authoritative.
 
+**Repository-local implementation:** schema-v1 bounded JSON configuration now
+provides only non-authorizing defaults for new-work provider selection,
+CPU/memory, state root, lock/readiness/action timeouts, and human run progress.
+CLI values win, existing durable provider identity is unchanged, and unknown
+credential/accelerator/TCG/authority fields fail before state or provider
+access. Real provider behavior remains release-gated.
+
 ### Interruption and recovery UX
 
 Normal human interruption must be understandable across Ctrl-C, readiness/command timeout, process crash, retained `--keep-on-failure` cells, and expired cells awaiting GC.

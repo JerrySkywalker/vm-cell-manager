@@ -6,6 +6,9 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Added bounded schema-v1 user configuration for non-authorizing provider,
+  CPU/memory, state-root, timeout, and human run-progress defaults, with CLI
+  precedence and fail-closed rejection of secret/authority/TCG fields.
 - Added provider-neutral image dependency reports and an idempotent,
   dependency-gated `image unregister` command that removes metadata only and
   never reads or deletes registered base-image bytes; bounded file-identity

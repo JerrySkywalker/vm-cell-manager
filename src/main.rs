@@ -8,12 +8,13 @@ use std::time::Duration;
 use clap::{Parser, error::ErrorKind};
 use serde::Serialize;
 use vm_cell_manager::cli::{
-    ArtifactCommand, Cli, CliExitCode, CliInputError, CliProvider, Command, CredentialArgs,
-    DoctorReport, ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope,
+    ArtifactCommand, Cli, CliExitCode, CliHumanOutput, CliInputError, CliProvider, Command,
+    CredentialArgs, DoctorReport, ErrorEnvelope, GuestOperationCommand, ImageCommand, ListEnvelope,
     ProviderCommand, RunErrorEnvelope, StatusCellEntry, StatusCellObservation,
     StatusCleanupGuidance, StatusImageEntry, StatusImageObservation, StatusImageVariantObservation,
     StatusOperationEntry, StatusReport, StatusRetention, classify_cli_error, public_error_message,
 };
+use vm_cell_manager::config::{ConfigProvider, HumanOutputPreference, ResolvedConfig, load_config};
 use vm_cell_manager::core::automation::RequiredAction;
 use vm_cell_manager::core::cell::{CellPhase, CellRecord, CellSpec, CellState};
 use vm_cell_manager::core::guest::{
@@ -144,8 +145,19 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     if matches!(&cli.command, Command::Shell { .. }) {
         require_human_shell(cli.json)?;
     }
-    let state_root = cli.state_root.clone();
-    let lock_timeout = Duration::from_millis(cli.lock_timeout_ms);
+    let defaults = load_config(cli.config.as_deref())?;
+    let state_root = cli
+        .state_root
+        .clone()
+        .or_else(|| defaults.state_root.clone());
+    let lock_timeout =
+        Duration::from_millis(cli.lock_timeout_ms.unwrap_or(defaults.lock_timeout_ms));
+    let human_output = cli
+        .human_output
+        .map_or(defaults.human_output, |value| match value {
+            CliHumanOutput::Normal => HumanOutputPreference::Normal,
+            CliHumanOutput::Quiet => HumanOutputPreference::Quiet,
+        });
     match cli.command {
         Command::Doctor => {
             let report = DoctorReport::collect(state_root);
@@ -249,17 +261,21 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         command => {
             let root = state_root.unwrap_or_else(StateStore::default_root);
             let state = StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout);
-            let provider = provider_for_command(&command, &state)?;
+            let provider = provider_for_command(&command, &state, defaults.provider)?;
             return match provider.as_str() {
                 "hyperv" => run_m2(
                     command,
                     cli.json,
                     &CellEngine::new(state, HyperVProvider::system()),
+                    &defaults,
+                    human_output,
                 ),
                 "qemu" => run_m2(
                     command,
                     cli.json,
                     &CellEngine::new(state, QemuProvider::system(root)),
+                    &defaults,
+                    human_output,
                 ),
                 value => Err(EngineError::Integrity(format!(
                     "unsupported persisted provider: {value}"
@@ -275,6 +291,8 @@ fn run_m2<P: LocalVmProvider>(
     command: Command,
     json: bool,
     engine: &CellEngine<P>,
+    defaults: &ResolvedConfig,
+    human_output: HumanOutputPreference,
 ) -> Result<ExitCode, Box<dyn Error>> {
     match command {
         Command::Image { command } => match command {
@@ -364,8 +382,8 @@ fn run_m2<P: LocalVmProvider>(
             let cell = engine.create_cell(CellSpec {
                 image,
                 provider: Some(engine.provider_name().to_owned()),
-                cpu_count,
-                memory_mib,
+                cpu_count: cpu_count.unwrap_or(defaults.cpu_count),
+                memory_mib: memory_mib.unwrap_or(defaults.memory_mib),
                 ttl_seconds,
                 accelerator: accelerator.map(|value| value.as_str().to_owned()),
                 allow_tcg,
@@ -395,8 +413,8 @@ fn run_m2<P: LocalVmProvider>(
                 spec: CellSpec {
                     image,
                     provider: Some(engine.provider_name().to_owned()),
-                    cpu_count,
-                    memory_mib,
+                    cpu_count: cpu_count.unwrap_or(defaults.cpu_count),
+                    memory_mib: memory_mib.unwrap_or(defaults.memory_mib),
                     ttl_seconds,
                     accelerator: accelerator.map(|value| value.as_str().to_owned()),
                     allow_tcg,
@@ -404,16 +422,20 @@ fn run_m2<P: LocalVmProvider>(
                 command: GuestCommand {
                     program,
                     args: command,
-                    timeout: Duration::from_secs(action_timeout_seconds),
+                    timeout: Duration::from_secs(
+                        action_timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
+                    ),
                     max_output_bytes,
                 },
-                readiness: readiness(readiness_timeout_seconds),
+                readiness: readiness(
+                    readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
+                ),
                 cleanup: RunCleanupPolicy {
                     keep,
                     keep_on_failure,
                 },
             };
-            let report = if json {
+            let report = if json || human_output == HumanOutputPreference::Quiet {
                 let mut observer = |_event: &RunProgressEvent| RunControl::Continue;
                 run_cell_guest(engine, credential, request, &mut observer)?
             } else {
@@ -526,10 +548,14 @@ fn run_m2<P: LocalVmProvider>(
                     command: GuestCommand {
                         program,
                         args: command,
-                        timeout: Duration::from_secs(timeout_seconds),
+                        timeout: Duration::from_secs(
+                            timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
+                        ),
                         max_output_bytes,
                     },
-                    readiness: readiness(readiness_timeout_seconds),
+                    readiness: readiness(
+                        readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
+                    ),
                 },
             )?;
             emit(&report, json, || {
@@ -589,8 +615,12 @@ fn run_m2<P: LocalVmProvider>(
                 engine,
                 credentials: &credentials,
                 cell_id,
-                readiness: readiness(readiness_timeout_seconds),
-                action_timeout: Duration::from_secs(action_timeout_seconds),
+                readiness: readiness(
+                    readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
+                ),
+                action_timeout: Duration::from_secs(
+                    action_timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
+                ),
                 max_output_bytes,
             };
             let mut input = BufReader::new(console);
@@ -628,9 +658,13 @@ fn run_m2<P: LocalVmProvider>(
                     source,
                     destination,
                     overwrite: overwrite.into(),
-                    timeout: Duration::from_secs(timeout_seconds),
+                    timeout: Duration::from_secs(
+                        timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
+                    ),
                     max_bytes,
-                    readiness: readiness(readiness_timeout_seconds),
+                    readiness: readiness(
+                        readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
+                    ),
                 },
             )?;
             emit(&report, json, || {
@@ -651,9 +685,13 @@ fn run_m2<P: LocalVmProvider>(
                 GuestCopyOutRequest {
                     cell_id,
                     source,
-                    timeout: Duration::from_secs(timeout_seconds),
+                    timeout: Duration::from_secs(
+                        timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
+                    ),
                     max_bytes,
-                    readiness: readiness(readiness_timeout_seconds),
+                    readiness: readiness(
+                        readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
+                    ),
                 },
             )?;
             emit(&report, json, || {
@@ -675,9 +713,13 @@ fn run_m2<P: LocalVmProvider>(
                     ArtifactCollectRequest {
                         cell_id,
                         sources: paths,
-                        timeout: Duration::from_secs(timeout_seconds),
+                        timeout: Duration::from_secs(
+                            timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
+                        ),
                         max_bytes_per_file,
-                        readiness: readiness(readiness_timeout_seconds),
+                        readiness: readiness(
+                            readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
+                        ),
                     },
                 )?;
                 emit(&report, json, || {
@@ -942,13 +984,62 @@ fn guest_operation_required_action(phase: GuestOperationPhase) -> RequiredAction
     }
 }
 
-fn provider_for_command(command: &Command, state: &StateStore) -> Result<String, Box<dyn Error>> {
+fn provider_for_command(
+    command: &Command,
+    state: &StateStore,
+    configured_provider: ConfigProvider,
+) -> Result<String, Box<dyn Error>> {
     let provider = match command {
         Command::Image {
-            command: ImageCommand::Add { provider, .. } | ImageCommand::Validate { provider, .. },
+            command: ImageCommand::Add { provider, .. },
         }
         | Command::Create { provider, .. }
-        | Command::Run { provider, .. } => provider.as_str().to_owned(),
+        | Command::Run { provider, .. } => provider
+            .map(CliProvider::as_str)
+            .unwrap_or_else(|| configured_provider.as_str())
+            .to_owned(),
+        Command::Image {
+            command: ImageCommand::Validate {
+                id: None, provider, ..
+            },
+        } => provider
+            .map(CliProvider::as_str)
+            .unwrap_or_else(|| configured_provider.as_str())
+            .to_owned(),
+        Command::Image {
+            command:
+                ImageCommand::Validate {
+                    id: Some(_),
+                    provider: Some(provider),
+                    ..
+                },
+        } => provider.as_str().to_owned(),
+        Command::Image {
+            command:
+                ImageCommand::Validate {
+                    id: Some(id),
+                    provider: None,
+                    ..
+                },
+        } => {
+            let image = state.load_image(id)?;
+            match image.variants.as_slice() {
+                [variant] => variant.provider.clone(),
+                [] => {
+                    return Err(EngineError::ImageIntegrity(
+                        "registered image does not contain a provider variant".to_owned(),
+                    )
+                    .into());
+                }
+                _ => {
+                    return Err(CliInputError(
+                        "--provider is required for a registered image with multiple variants"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+            }
+        }
         Command::Inspect { cell_id }
         | Command::Start { cell_id }
         | Command::Stop { cell_id }
@@ -2204,6 +2295,73 @@ fn emit<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_provider_overrides_configured_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let state = StateStore::new(state_root.clone());
+        let configured = Cli::try_parse_from(["vmcell", "create", "--image", "daily"])
+            .unwrap()
+            .command;
+        assert_eq!(
+            provider_for_command(&configured, &state, ConfigProvider::Qemu).unwrap(),
+            "qemu"
+        );
+
+        let explicit = Cli::try_parse_from([
+            "vmcell",
+            "create",
+            "--image",
+            "daily",
+            "--provider",
+            "hyperv",
+        ])
+        .unwrap()
+        .command;
+        assert_eq!(
+            provider_for_command(&explicit, &state, ConfigProvider::Qemu).unwrap(),
+            "hyperv"
+        );
+
+        let images = state_root.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let manifest = images.join("daily.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "id": "daily",
+                "guest_os": "windows",
+                "guest_arch": "x86_64",
+                "variants": [{
+                    "provider": "hyperv",
+                    "disk_format": "vhdx",
+                    "path": directory.path().join("base.vhdx"),
+                    "sha256": "a".repeat(64),
+                    "file_size": 1024
+                }],
+                "registered_at": "2026-08-10T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let registered = Cli::try_parse_from(["vmcell", "image", "validate", "--id", "daily"])
+            .unwrap()
+            .command;
+        assert_eq!(
+            provider_for_command(&registered, &state, ConfigProvider::Qemu).unwrap(),
+            "hyperv"
+        );
+    }
 
     fn test_cell(
         state: CellState,

@@ -10,6 +10,9 @@ use super::image::{ImageBinding, ImageId};
 use super::ownership::{CellOwnership, ProviderObjectIdentity};
 
 pub const CELL_SCHEMA_VERSION: u32 = 1;
+pub const MIN_MEMORY_MIB: u64 = 512;
+pub const MAX_MEMORY_MIB: u64 = 1_048_576;
+pub const MAX_CPU_COUNT: u16 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

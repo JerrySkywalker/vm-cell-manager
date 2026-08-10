@@ -24,6 +24,16 @@ fn run_vmcell(arguments: &[&str]) -> std::process::Output {
         .expect("vmcell CLI should start")
 }
 
+fn write_config(path: &std::path::Path, value: &serde_json::Value) {
+    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 fn invalid_run(state_root: &std::path::Path, json: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vmcell"));
     if json {
@@ -213,6 +223,99 @@ fn json_parse_failures_are_versioned_redacted_and_migrate_legacy_provider_list()
     ]);
     assert_eq!(guest_argument.status.code(), Some(2));
     assert!(serde_json::from_slice::<serde_json::Value>(&guest_argument.stderr).is_err());
+}
+
+#[test]
+fn config_state_root_is_used_and_cli_state_root_wins() {
+    let directory = tempfile::tempdir().unwrap();
+    let configured_root = directory.path().join("configured-state");
+    let override_root = directory.path().join("override-state");
+    let base_path = directory.path().join("base.vhdx");
+    fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+    write_image_fixture(&configured_root, &base_path);
+    let config = directory.path().join("config.json");
+    write_config(
+        &config,
+        &serde_json::json!({
+            "schema_version": 1,
+            "defaults": {
+                "state_root": configured_root,
+                "provider": "qemu",
+                "cpu_count": 4,
+                "memory_mib": 8192
+            }
+        }),
+    );
+
+    let configured = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .args(["image", "list"])
+        .output()
+        .unwrap();
+    assert!(configured.status.success());
+    let configured_json: serde_json::Value = serde_json::from_slice(&configured.stdout).unwrap();
+    assert_eq!(configured_json["items"].as_array().unwrap().len(), 1);
+
+    let overridden = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .arg("--state-root")
+        .arg(&override_root)
+        .args(["image", "list"])
+        .output()
+        .unwrap();
+    assert!(overridden.status.success());
+    let overridden_json: serde_json::Value = serde_json::from_slice(&overridden.stdout).unwrap();
+    assert_eq!(overridden_json["items"], serde_json::json!([]));
+}
+
+#[test]
+fn malformed_or_unsupported_config_fails_before_state_access_and_is_redacted() {
+    let directory = tempfile::tempdir().unwrap();
+    let forbidden_root = directory.path().join("must-not-exist");
+    let config = directory.path().join("credential-sentinel-config.json");
+    write_config(
+        &config,
+        &serde_json::json!({
+            "schema_version": 1,
+            "defaults": {
+                "state_root": forbidden_root,
+                "password": "credential-sentinel"
+            }
+        }),
+    );
+    let malformed = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(malformed.status.code(), Some(2));
+    assert!(malformed.stdout.is_empty());
+    let malformed_json: serde_json::Value = serde_json::from_slice(&malformed.stderr).unwrap();
+    assert_eq!(malformed_json["error"]["code"], "vmcell.config.invalid");
+    let serialized = String::from_utf8(malformed.stderr).unwrap();
+    assert!(!serialized.contains("credential-sentinel"));
+    assert!(!serialized.contains(directory.path().to_string_lossy().as_ref()));
+    assert!(!forbidden_root.exists());
+
+    write_config(
+        &config,
+        &serde_json::json!({"schema_version": 2, "defaults": {}}),
+    );
+    let unsupported = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(unsupported.status.code(), Some(9));
+    let unsupported_json: serde_json::Value = serde_json::from_slice(&unsupported.stderr).unwrap();
+    assert_eq!(
+        unsupported_json["error"]["code"],
+        "vmcell.config.unsupported_schema"
+    );
 }
 
 #[test]

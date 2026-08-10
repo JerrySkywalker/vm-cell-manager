@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use crate::config::ConfigError;
 use crate::core::automation::{
     AUTOMATION_SCHEMA_VERSION, DOCTOR_CONTRACT, RequiredAction, STATUS_CONTRACT,
 };
@@ -15,8 +16,7 @@ use crate::engine::{
     RunFailureReport, RunStage,
 };
 use crate::guest::{
-    DEFAULT_ACTION_TIMEOUT_SECONDS, DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_READINESS_TIMEOUT_SECONDS, GuestIoError, GuestPath, OverwritePolicy,
+    DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES, GuestIoError, GuestPath, OverwritePolicy,
 };
 use crate::providers::{
     ProviderError, ProviderProbe, ProviderProbeStatus, builtin_provider_probes,
@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Load versioned user defaults from this exact ordinary file.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     /// Override the local state root.
     #[arg(long, global = true, value_name = "PATH")]
     pub state_root: Option<PathBuf>,
@@ -49,10 +53,13 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        default_value_t = 0,
         value_parser = parse_lock_timeout_ms
     )]
-    pub lock_timeout_ms: u64,
+    pub lock_timeout_ms: Option<u64>,
+
+    /// Override the configured human progress preference.
+    #[arg(long, global = true, value_enum)]
+    pub human_output: Option<CliHumanOutput>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -83,17 +90,17 @@ pub enum Command {
         #[arg(long)]
         image: ImageId,
 
-        #[arg(long, default_value_t = 2)]
-        cpu_count: u16,
+        #[arg(long)]
+        cpu_count: Option<u16>,
 
-        #[arg(long, default_value_t = 4096)]
-        memory_mib: u64,
+        #[arg(long)]
+        memory_mib: Option<u64>,
 
         #[arg(long)]
         ttl_seconds: Option<u64>,
 
-        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
-        provider: CliProvider,
+        #[arg(long, value_enum)]
+        provider: Option<CliProvider>,
 
         #[arg(long, value_enum)]
         accelerator: Option<CliAccelerator>,
@@ -107,17 +114,17 @@ pub enum Command {
         #[arg(long)]
         image: ImageId,
 
-        #[arg(long = "cpu", visible_alias = "cpu-count", default_value_t = 2)]
-        cpu_count: u16,
+        #[arg(long = "cpu", visible_alias = "cpu-count")]
+        cpu_count: Option<u16>,
 
-        #[arg(long = "memory", visible_alias = "memory-mib", default_value_t = 4096)]
-        memory_mib: u64,
+        #[arg(long = "memory", visible_alias = "memory-mib")]
+        memory_mib: Option<u64>,
 
         #[arg(long = "ttl", visible_alias = "ttl-seconds")]
         ttl_seconds: Option<u64>,
 
-        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
-        provider: CliProvider,
+        #[arg(long, value_enum)]
+        provider: Option<CliProvider>,
 
         #[arg(long, value_enum)]
         accelerator: Option<CliAccelerator>,
@@ -134,11 +141,11 @@ pub enum Command {
         #[command(flatten)]
         credential: CredentialArgs,
 
-        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
-        readiness_timeout_seconds: u64,
+        #[arg(long)]
+        readiness_timeout_seconds: Option<u64>,
 
-        #[arg(long = "action-timeout-seconds", default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
-        action_timeout_seconds: u64,
+        #[arg(long = "action-timeout-seconds")]
+        action_timeout_seconds: Option<u64>,
 
         #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
         max_output_bytes: u64,
@@ -172,11 +179,11 @@ pub enum Command {
         #[command(flatten)]
         credential: CredentialArgs,
 
-        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
-        readiness_timeout_seconds: u64,
+        #[arg(long)]
+        readiness_timeout_seconds: Option<u64>,
 
-        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
-        timeout_seconds: u64,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
 
         #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
         max_output_bytes: u64,
@@ -196,11 +203,11 @@ pub enum Command {
         #[command(flatten)]
         credential: CredentialArgs,
 
-        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
-        readiness_timeout_seconds: u64,
+        #[arg(long)]
+        readiness_timeout_seconds: Option<u64>,
 
-        #[arg(long = "action-timeout-seconds", default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
-        action_timeout_seconds: u64,
+        #[arg(long = "action-timeout-seconds")]
+        action_timeout_seconds: Option<u64>,
 
         #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
         max_output_bytes: u64,
@@ -222,11 +229,11 @@ pub enum Command {
         #[command(flatten)]
         credential: CredentialArgs,
 
-        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
-        readiness_timeout_seconds: u64,
+        #[arg(long)]
+        readiness_timeout_seconds: Option<u64>,
 
-        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
-        timeout_seconds: u64,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
 
         #[arg(long, default_value_t = DEFAULT_MAX_COPY_BYTES)]
         max_bytes: u64,
@@ -242,11 +249,11 @@ pub enum Command {
         #[command(flatten)]
         credential: CredentialArgs,
 
-        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
-        readiness_timeout_seconds: u64,
+        #[arg(long)]
+        readiness_timeout_seconds: Option<u64>,
 
-        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
-        timeout_seconds: u64,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
 
         #[arg(long, default_value_t = DEFAULT_MAX_COPY_BYTES)]
         max_bytes: u64,
@@ -320,11 +327,11 @@ pub enum ArtifactCommand {
         #[command(flatten)]
         credential: CredentialArgs,
 
-        #[arg(long, default_value_t = DEFAULT_READINESS_TIMEOUT_SECONDS)]
-        readiness_timeout_seconds: u64,
+        #[arg(long)]
+        readiness_timeout_seconds: Option<u64>,
 
-        #[arg(long, default_value_t = DEFAULT_ACTION_TIMEOUT_SECONDS)]
-        timeout_seconds: u64,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
 
         #[arg(long, default_value_t = DEFAULT_MAX_COPY_BYTES)]
         max_bytes_per_file: u64,
@@ -392,8 +399,8 @@ pub enum ImageCommand {
         #[arg(long, value_enum, default_value_t = CliArchitecture::X86_64)]
         guest_arch: CliArchitecture,
 
-        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
-        provider: CliProvider,
+        #[arg(long, value_enum)]
+        provider: Option<CliProvider>,
     },
 
     /// Validate a prepared base or revalidate one registered image without mutation.
@@ -410,8 +417,8 @@ pub enum ImageCommand {
         #[arg(long, value_enum, default_value_t = CliArchitecture::X86_64)]
         guest_arch: CliArchitecture,
 
-        #[arg(long, value_enum, default_value_t = CliProvider::Hyperv)]
-        provider: CliProvider,
+        #[arg(long, value_enum)]
+        provider: Option<CliProvider>,
     },
 
     /// List registered images.
@@ -458,6 +465,12 @@ pub enum CliArchitecture {
 pub enum CliProvider {
     Hyperv,
     Qemu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliHumanOutput {
+    Normal,
+    Quiet,
 }
 
 impl CliProvider {
@@ -867,6 +880,9 @@ pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassificati
     if let Some(error) = error.downcast_ref::<GuestIoError>() {
         return classify_guest_error(error);
     }
+    if let Some(error) = error.downcast_ref::<ConfigError>() {
+        return classify_config_error(error);
+    }
     if error.downcast_ref::<CliInputError>().is_some() {
         return classification(
             "vmcell.invalid_input",
@@ -892,6 +908,38 @@ pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassificati
         CliExitCode::Internal,
         false,
     )
+}
+
+fn classify_config_error(error: &ConfigError) -> CliErrorClassification {
+    match error {
+        ConfigError::NotFound => classification(
+            "vmcell.config.not_found",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        ConfigError::UnsupportedSchema { .. } => classification(
+            "vmcell.config.unsupported_schema",
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        ConfigError::UnsafePath
+        | ConfigError::TooLarge
+        | ConfigError::Json(_)
+        | ConfigError::InvalidValue(_) => classification(
+            "vmcell.config.invalid",
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        ConfigError::Io(_) => classification(
+            "vmcell.config.io",
+            CliErrorCategory::Internal,
+            CliExitCode::Internal,
+            false,
+        ),
+    }
 }
 
 fn classify_engine_error(error: &EngineError) -> CliErrorClassification {
@@ -1404,6 +1452,27 @@ mod tests {
                 CliExitCode::Integrity,
                 false,
             ),
+            (
+                Box::new(ConfigError::InvalidValue("invalid default")),
+                "vmcell.config.invalid",
+                CliExitCode::InvalidInput,
+                false,
+            ),
+            (
+                Box::new(ConfigError::UnsupportedSchema {
+                    expected: 1,
+                    actual: 2,
+                }),
+                "vmcell.config.unsupported_schema",
+                CliExitCode::Integrity,
+                false,
+            ),
+            (
+                Box::new(ConfigError::NotFound),
+                "vmcell.config.not_found",
+                CliExitCode::InvalidInput,
+                false,
+            ),
         ];
 
         for (error, code, exit_code, retryable) in cases {
@@ -1522,8 +1591,35 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Create {
-                cpu_count: 4,
-                memory_mib: 8192,
+                cpu_count: Some(4),
+                memory_mib: Some(8192),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_backed_fields_remain_absent_until_explicitly_overridden() {
+        let cli = Cli::try_parse_from([
+            "vmcell",
+            "--config",
+            "user-config.json",
+            "--human-output",
+            "quiet",
+            "create",
+            "--image",
+            "windows-dev",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.config, Some(PathBuf::from("user-config.json")));
+        assert_eq!(cli.human_output, Some(CliHumanOutput::Quiet));
+        assert!(matches!(
+            cli.command,
+            Command::Create {
+                cpu_count: None,
+                memory_mib: None,
+                provider: None,
                 ..
             }
         ));
@@ -1556,8 +1652,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Run {
-                cpu_count: 4,
-                memory_mib: 8192,
+                cpu_count: Some(4),
+                memory_mib: Some(8192),
                 ttl_seconds: Some(3600),
                 keep_on_failure: true,
                 ..
@@ -1658,7 +1754,7 @@ mod tests {
             "--dry-run",
         ])
         .unwrap();
-        assert_eq!(prune.lock_timeout_ms, 250);
+        assert_eq!(prune.lock_timeout_ms, Some(250));
         assert!(matches!(
             prune.command,
             Command::Artifact {
@@ -1738,7 +1834,7 @@ mod tests {
             image.command,
             Command::Image {
                 command: ImageCommand::Add {
-                    provider: CliProvider::Qemu,
+                    provider: Some(CliProvider::Qemu),
                     ..
                 }
             }
@@ -1758,7 +1854,7 @@ mod tests {
         assert!(matches!(
             create.command,
             Command::Create {
-                provider: CliProvider::Qemu,
+                provider: Some(CliProvider::Qemu),
                 accelerator: Some(CliAccelerator::Tcg),
                 allow_tcg: true,
                 ..

@@ -173,8 +173,9 @@ vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
-All commands support global `--json`, `--state-root PATH`, and bounded
-`--lock-timeout-ms N` options. The timeout applies to each state-lock
+All commands support global `--json`, `--config PATH`, `--state-root PATH`,
+bounded `--lock-timeout-ms N`, and `--human-output normal|quiet` options. The
+timeout applies to each state-lock
 acquisition; artifact dry runs leave records untouched but may initialize lock
 infrastructure on a new state root. Guest
 credentials are accepted only through bounded stdin and are never written to
@@ -182,6 +183,12 @@ state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses
 PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM, WHPX, and
 HVF acceptance remain separate host gates.
+
+The optional [user configuration](docs/user-configuration.md) is bounded,
+versioned, and non-authorizing. CLI values win. Configuration may supply safe
+defaults for new work and state selection, but never credentials, accelerator
+or TCG permission, lifecycle intent, ownership exceptions, or provider-object
+identity.
 
 `vmcell shell` is a deliberately line-oriented PowerShell Direct console for an
 already running, ready, exact-owned Hyper-V Windows cell. It is not a local or
