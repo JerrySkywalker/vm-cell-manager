@@ -1,13 +1,21 @@
-use std::io::{Read, Write};
+#[cfg(any(target_os = "windows", test))]
+use std::io::Read;
+#[cfg(target_os = "windows")]
+use std::io::Write;
+#[cfg(target_os = "windows")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawHandle;
 
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(target_os = "windows")]
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::core::cell::CellId;
@@ -15,12 +23,19 @@ use crate::core::guest::GuestOperationId;
 use crate::guest::{GuestCredentials, GuestIoError, OverwritePolicy};
 use crate::providers::ProviderVm;
 
+#[cfg(any(target_os = "windows", test))]
 const COMMON_SCRIPT: &str = include_str!("scripts/common.ps1");
+#[cfg(any(target_os = "windows", test))]
 const PROBE_READY_SCRIPT: &str = include_str!("scripts/probe_ready.ps1");
+#[cfg(any(target_os = "windows", test))]
 const EXEC_SCRIPT: &str = include_str!("scripts/exec.ps1");
+#[cfg(any(target_os = "windows", test))]
 const COPY_IN_SCRIPT: &str = include_str!("scripts/copy_in.ps1");
+#[cfg(any(target_os = "windows", test))]
 const COPY_OUT_SCRIPT: &str = include_str!("scripts/copy_out.ps1");
+#[cfg(target_os = "windows")]
 const SMALL_RESPONSE_LIMIT: u64 = 65_536;
+#[cfg(target_os = "windows")]
 const STDERR_LIMIT: usize = 65_536;
 
 #[derive(Serialize)]
@@ -248,7 +263,7 @@ fn append_frame(target: &mut Vec<u8>, bytes: &[u8]) -> Result<(), GuestIoError> 
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn read_pipe_limited(mut pipe: impl Read, limit: usize) -> Result<Vec<u8>, GuestIoError> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -314,6 +329,7 @@ fn classify_stderr(stderr: &[u8]) -> GuestIoError {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn script_for(action: &PowerShellDirectAction) -> &'static str {
     match action {
         PowerShellDirectAction::ProbeReady { .. } => PROBE_READY_SCRIPT,

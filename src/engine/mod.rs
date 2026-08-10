@@ -3743,7 +3743,9 @@ mod tests {
         fail_remove: bool,
         malformed_create_identity: bool,
         noncanonical_create_identity: bool,
+        #[cfg(windows)]
         installation_rotation_path: Option<PathBuf>,
+        #[cfg(windows)]
         installation_rotation_blocked: bool,
     }
 
@@ -5390,21 +5392,7 @@ mod tests {
         );
         let second_installation = second.state.installation().unwrap();
         assert_ne!(second_installation.install_id, cell.ownership.install_id);
-        let second_manifest = second
-            .state
-            .root()
-            .join("cells")
-            .join(format!("{}.json", cell.id));
-        fs::create_dir_all(second_manifest.parent().unwrap()).unwrap();
-        fs::copy(
-            first
-                .state
-                .root()
-                .join("cells")
-                .join(format!("{}.json", cell.id)),
-            second_manifest,
-        )
-        .unwrap();
+        second.state.save_cell(&cell).unwrap();
         let calls_before = second.provider.state.lock().unwrap().calls.len();
 
         assert!(matches!(
@@ -5426,22 +5414,15 @@ mod tests {
         assert!(second.provider.state.lock().unwrap().vm.is_some());
 
         let cloned_root = directory.path().join("state-cloned");
-        fs::create_dir_all(cloned_root.join("cells")).unwrap();
-        fs::copy(
-            first.state.root().join("installation.json"),
-            cloned_root.join("installation.json"),
+        let cloned_state = StateStore::new(cloned_root);
+        cloned_state.installation().unwrap();
+        fs::write(
+            cloned_state.root().join("installation.json"),
+            fs::read(first.state.root().join("installation.json")).unwrap(),
         )
         .unwrap();
-        fs::copy(
-            first
-                .state
-                .root()
-                .join("cells")
-                .join(format!("{}.json", cell.id)),
-            cloned_root.join("cells").join(format!("{}.json", cell.id)),
-        )
-        .unwrap();
-        let cloned = CellEngine::new(StateStore::new(cloned_root), provider);
+        cloned_state.save_cell(&cell).unwrap();
+        let cloned = CellEngine::new(cloned_state, provider);
         assert_eq!(
             cloned.state.load_installation().unwrap().install_id,
             cell.ownership.install_id
@@ -5761,6 +5742,12 @@ mod tests {
             .join("cells")
             .join(format!("{forged_id}.json"));
         fs::write(&forged_path, serde_json::to_vec(&cell).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&forged_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let calls_before = engine.provider.state.lock().unwrap().calls.len();
 
         assert!(matches!(

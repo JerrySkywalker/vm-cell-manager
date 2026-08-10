@@ -193,6 +193,7 @@ impl<E: HyperVCommandExecutor> LocalVmProvider for HyperVProvider<E> {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg(target_os = "windows")]
 struct ProbeResponse {
     available: bool,
     detail: String,
