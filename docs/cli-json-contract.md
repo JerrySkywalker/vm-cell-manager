@@ -16,6 +16,7 @@ echoed. Help and version output remain human-readable discovery surfaces.
 ```text
 vmcell doctor
 vmcell status
+vmcell state check
 vmcell provider list
 vmcell image add --id IMAGE --path BASE.vhdx --guest-os windows [--provider hyperv]
 vmcell image add --id IMAGE --path BASE.qcow2 --guest-os linux --provider qemu
@@ -52,6 +53,15 @@ bounded to 30 seconds per state-lock acquisition, defaults to fail-fast, and
 never authorizes lock stealing. Commands that dispatch serially to multiple
 provider engines may consume one bounded interval per acquisition.
 Changing the state root does not authorize adoption of provider objects.
+
+`state check` is read-only and provider-free. It emits
+`vmcell.state-compatibility.v1` with schema version 1, one `checked_at`, durable
+format version 1, status `empty|compatible`, and counts for active installation,
+image, cell, guest-operation, and operation-bound artifact records. It does not
+create a missing root or rewrite compatible v0.1 JSON. Unsupported durable
+schemas use `vmcell.state.upgrade_required`, integrity exit 9, and require the
+operator to stop mutation and follow
+[`state-compatibility.md`](state-compatibility.md).
 
 Config selection and precedence are defined in
 [`user-configuration.md`](user-configuration.md). Malformed/unsafe config uses
@@ -244,6 +254,13 @@ run-specific success-path rule can numerically overlap the vmcell error table,
 so automation that needs to distinguish guest failure from orchestration
 failure must use `--json` and inspect `outcome` or `error`. Orchestration
 failures always use the stable taxonomy below.
+
+On Windows, Ctrl-C during `run` is sampled cooperatively at durable stage
+boundaries. A bounded readiness probe or guest action is allowed to return its
+known result/timeout rather than being asynchronously replayed or abandoned.
+Cancellation after transport becomes active remains nonterminal and refuses
+automatic cleanup; cancellation after a completed command preserves result and
+operation metadata and applies the requested cleanup policy.
 
 ## Error output
 

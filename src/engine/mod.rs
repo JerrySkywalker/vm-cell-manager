@@ -1508,10 +1508,26 @@ impl<P: LocalVmProvider> CellEngine<P> {
         } else {
             RunOutcome::GuestNonZero
         };
-        let _ = observer.observe(&RunProgressEvent::CommandCompleted {
+        if observer.observe(&RunProgressEvent::CommandCompleted {
             cell_id,
             exit_code: execution.result.exit_code,
-        });
+        }) == RunControl::Cancel
+        {
+            let error = EngineError::LifecycleConflict(
+                "run interruption was observed after the guest command completed".to_owned(),
+            );
+            let (cleanup, cleanup_error) =
+                self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
+            return Err(run_cell_error(
+                Some(cell_id),
+                Some(execution.operation_id),
+                RunStage::Interrupted,
+                cleanup,
+                error,
+                cleanup_error.as_ref(),
+                Some(execution.result),
+            ));
+        }
 
         let cleanup = if request.cleanup.keep {
             let disposition = RunCleanupDisposition::RetainedByRequest;
@@ -4912,6 +4928,27 @@ mod tests {
             ambiguous.report().cleanup,
             RunCleanupDisposition::RefusedAmbiguous
         );
+
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        let mut cancel_after_command = |event: &RunProgressEvent| {
+            if matches!(event, RunProgressEvent::CommandCompleted { .. }) {
+                RunControl::Cancel
+            } else {
+                RunControl::Continue
+            }
+        };
+        let completed = engine
+            .run_cell_observed(
+                &guest,
+                &credentials,
+                run_request(image_id),
+                &mut cancel_after_command,
+            )
+            .unwrap_err();
+        assert_eq!(completed.report().stage, RunStage::Interrupted);
+        assert_eq!(completed.report().cleanup, RunCleanupDisposition::Destroyed);
+        assert!(completed.report().operation_id.is_some());
+        assert!(completed.report().result.is_some());
     }
 
     #[test]

@@ -6,6 +6,12 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Added a provider-free, read-only `vmcell state check` format-v1 compatibility
+  report for v0.1 state, stable upgrade-required rejection, and explicit
+  no-rewrite/no-silent-migration guidance.
+- Added cooperative Windows `vmcell run` interruption at durable stage
+  boundaries, known-completion cleanup handling, bounded one-line password
+  stdin, and a fail-closed interruption/recovery matrix.
 - Added bounded schema-v1 user configuration for non-authorizing provider,
   CPU/memory, state-root, timeout, and human run-progress defaults, with CLI
   precedence and fail-closed rejection of secret/authority/TCG fields.
