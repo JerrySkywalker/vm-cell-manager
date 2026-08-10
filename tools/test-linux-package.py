@@ -355,6 +355,16 @@ def main() -> int:
         if result.returncode == 0 or source_mismatch.exists():
             raise ContractError("package creation did not bind the declared source commit")
 
+        floor_mismatch = test_root / "floor-mismatch"
+        floor_mismatch_command = [
+            "GLIBC_999.0" if value == floor else value for value in common
+        ]
+        result = run(
+            floor_mismatch_command + ["--output-directory", str(floor_mismatch)], timeout=60
+        )
+        if result.returncode == 0 or floor_mismatch.exists():
+            raise ContractError("package creation accepted an inaccurate GLIBC floor")
+
         collision = test_root / "existing-output"
         collision.mkdir()
         sentinel = collision / "owner-sentinel"
@@ -370,6 +380,23 @@ def main() -> int:
         result = run(linked_command + ["--output-directory", str(linked_output)], timeout=60)
         if result.returncode == 0 or linked_output.exists():
             raise ContractError("package assembly accepted a symlink binary input")
+
+        wrong_arch_binary = test_root / "wrong-architecture-vmcell"
+        wrong_arch_bytes = bytearray(binary.read_bytes())
+        if wrong_arch_bytes[:4] != b"\x7fELF" or len(wrong_arch_bytes) < 20:
+            raise ContractError("candidate binary was not a bounded ELF test input")
+        wrong_arch_bytes[18:20] = (183).to_bytes(2, byteorder="little")
+        wrong_arch_binary.write_bytes(wrong_arch_bytes)
+        os.chmod(wrong_arch_binary, 0o755)
+        wrong_arch_output = test_root / "wrong-architecture-output"
+        wrong_arch_command = [
+            str(wrong_arch_binary) if value == str(binary) else value for value in common
+        ]
+        result = run(
+            wrong_arch_command + ["--output-directory", str(wrong_arch_output)], timeout=60
+        )
+        if result.returncode == 0 or wrong_arch_output.exists():
+            raise ContractError("package assembly accepted a non-x86_64 ELF identity")
 
         parent_link = test_root / "output-parent-link"
         real_parent = test_root / "real-output-parent"

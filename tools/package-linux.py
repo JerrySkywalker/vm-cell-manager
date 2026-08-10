@@ -25,6 +25,7 @@ MAX_TEXT_BYTES = 4 * 1024 * 1024
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 GLIBC_RE = re.compile(r"^GLIBC_[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+GLIBC_SYMBOL_RE = re.compile(r"\bGLIBC_([0-9]+)\.([0-9]+)(?:\.([0-9]+))?\b")
 TARGET = "x86_64-unknown-linux-gnu"
 BASELINE = "ubuntu-24.04-x86_64-glibc"
 
@@ -107,6 +108,17 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def glibc_symbol_floor(version_output: str) -> str:
+    versions = {
+        (int(major), int(minor), int(patch or "0"))
+        for major, minor, patch in GLIBC_SYMBOL_RE.findall(version_output)
+    }
+    if not versions:
+        raise PackageError("binary declared no measurable GLIBC symbol requirement")
+    major, minor, patch = max(versions)
+    return f"GLIBC_{major}.{minor}" + (f".{patch}" if patch else "")
+
+
 def add_tar_directory(archive: tarfile.TarFile, name: str, epoch: int) -> None:
     entry = tarfile.TarInfo(name=name)
     entry.type = tarfile.DIRTYPE
@@ -148,6 +160,12 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
         raise PackageError("glibc floor must be an observed GLIBC_X.Y symbol version")
 
     repository_root = Path(__file__).resolve(strict=True).parent.parent
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as error:
+        raise PackageError("declared build OS identity was unavailable") from error
+    if '\nID=ubuntu\n' not in f"\n{os_release}" or '\nVERSION_ID="24.04"\n' not in f"\n{os_release}":
+        raise PackageError("declared build baseline requires Ubuntu 24.04")
     repository_head = run_bounded(
         ["git", "-C", str(repository_root), "rev-parse", "HEAD"], "repository source identity"
     ).strip()
@@ -198,6 +216,18 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
         os.chmod(staged_binary, 0o755)
         deterministic_env = os.environ.copy()
         deterministic_env.update({"LC_ALL": "C", "LANG": "C", "TZ": "UTC"})
+        elf_header = run_bounded(
+            ["readelf", "--file-header", str(staged_binary)], "binary ELF identity", deterministic_env
+        )
+        if "Machine:" not in elf_header or "X86-64" not in elf_header:
+            raise PackageError("binary must be an x86_64 ELF executable")
+        version_info = run_bounded(
+            ["readelf", "--version-info", str(staged_binary)],
+            "binary GLIBC symbol identity",
+            deterministic_env,
+        )
+        if glibc_symbol_floor(version_info) != args.glibc_floor:
+            raise PackageError("declared GLIBC floor did not match the exact binary")
         version_output = run_bounded([str(staged_binary), "--version"], "binary version", deterministic_env).strip()
         if version_output != f"vmcell {args.version}":
             raise PackageError(f"binary version mismatch: expected vmcell {args.version}")
@@ -215,8 +245,14 @@ def build_archive(args: argparse.Namespace) -> tuple[str, bytes, str, str]:
     rustc_version = run_bounded(["rustc", "--version"], "rustc version").strip()
     cargo_version = run_bounded(["cargo", "--version"], "cargo version").strip()
     build_glibc_version = run_bounded(["ldd", "--version"], "build glibc version").splitlines()[0]
-    if not rustc_version.startswith("rustc ") or not cargo_version.startswith("cargo "):
-        raise PackageError("Rust build provenance was unavailable")
+    rust_host = run_bounded(["rustc", "-vV"], "Rust host identity")
+    if (
+        not rustc_version.startswith("rustc 1.85.0 (")
+        or not cargo_version.startswith("cargo 1.85.0 (")
+        or "release: 1.85.0" not in rust_host
+        or f"host: {TARGET}" not in rust_host
+    ):
+        raise PackageError("build provenance requires Rust/Cargo 1.85.0 for the declared target")
 
     layout_root = f"vmcell-v{args.version}-linux-x86_64"
     archive_name = f"{layout_root}.tar.gz"
