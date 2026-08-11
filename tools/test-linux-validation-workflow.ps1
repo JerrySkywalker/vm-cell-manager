@@ -5,6 +5,10 @@ $workflowPath = Join-Path $repositoryRoot '.github\workflows\linux-validation.ym
 $gatePath = Join-Path $repositoryRoot 'tools\check-linux.sh'
 $preflightPath = Join-Path $repositoryRoot 'tools\linux-kvm-preflight.sh'
 $preflightTestPath = Join-Path $repositoryRoot 'tools\test-linux-kvm-preflight.sh'
+$packageGatePath = Join-Path $repositoryRoot 'tools\check-linux-package.sh'
+$packageScriptPath = Join-Path $repositoryRoot 'tools\package-linux.py'
+$packageTestPath = Join-Path $repositoryRoot 'tools\test-linux-package.py'
+$packageLayoutPath = Join-Path $repositoryRoot 'packaging\linux\vmcell-portable-layout.py'
 
 if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
   throw 'Linux validation workflow is missing'
@@ -18,19 +22,30 @@ if (-not (Test-Path -LiteralPath $preflightPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $preflightTestPath -PathType Leaf)) {
   throw 'Linux KVM preflight fixture test is missing'
 }
+foreach ($path in @($packageGatePath, $packageScriptPath, $packageTestPath, $packageLayoutPath)) {
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw "Linux package validation surface is missing: $path"
+  }
+}
 
 $workflow = [IO.File]::ReadAllText($workflowPath)
 $gate = [IO.File]::ReadAllText($gatePath)
 $preflight = [IO.File]::ReadAllText($preflightPath)
 $preflightTest = [IO.File]::ReadAllText($preflightTestPath)
+$packageGate = [IO.File]::ReadAllText($packageGatePath)
+$packageScript = [IO.File]::ReadAllText($packageScriptPath)
+$packageTest = [IO.File]::ReadAllText($packageTestPath)
+$packageLayout = [IO.File]::ReadAllText($packageLayoutPath)
+$packageSurface = "$packageGate`n$packageScript`n$packageTest`n$packageLayout"
 
 function Assert-LinuxValidationContract {
   param(
     [Parameter(Mandatory)] [string] $Workflow,
-    [Parameter(Mandatory)] [string] $Gate
+    [Parameter(Mandatory)] [string] $Gate,
+    [Parameter(Mandatory)] [string] $ExecutionSurface
   )
 
-  $contract = "$Workflow`n$Gate"
+  $contract = "$Workflow`n$Gate`n$ExecutionSurface"
   $requiredPatterns = [ordered]@{
     'dispatch-only trigger' = '(?ms)^on:\r?\n  workflow_dispatch:\r?\n    inputs:\r?\n      source_sha:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        type: string\r?\n\r?\npermissions:'
     'single trigger declaration' = '(?m)^on:\r?$'
@@ -52,6 +67,17 @@ function Assert-LinuxValidationContract {
     'Linux preflight syntax gate' = 'sh -n tools/linux-kvm-preflight\.sh'
     'Linux preflight test syntax gate' = 'sh -n tools/test-linux-kvm-preflight\.sh'
     'Linux preflight fixture gate' = 'sh tools/test-linux-kvm-preflight\.sh'
+    'Linux package syntax gate' = 'sh -n tools/check-linux-package\.sh'
+    'Linux package contract gate' = 'sh tools/check-linux-package\.sh'
+    'external package build target' = 'CARGO_TARGET_DIR must be bound outside the checkout'
+    'locked release package build' = 'cargo build --locked --release --bin vmcell'
+    'Linux package validation' = 'python3 tools/test-linux-package\.py --binary "\$CARGO_TARGET_DIR/release/vmcell"'
+    'Linux package non-root proof' = 'Linux portable-package smoke must run as an unprivileged identity'
+    'package assembly entry point' = 'tools/package-linux\.py'
+    'package atomic no-replace publication' = '(?s)renameat2\(\s*parent_descriptor,\s*os\.fsencode\(stage\.name\),\s*parent_descriptor,\s*os\.fsencode\(output\.name\),\s*1,'
+    'package private output parent' = 'output parent must be current-user-owned and not group/world writable'
+    'package source epoch binding' = 'source date epoch must equal the declared commit timestamp'
+    'package source version binding' = 'package version must equal the exact Cargo source identity'
     'post-gate clean-tree proof' = 'git diff --exit-code'
     'no ignored checkout target proof' = 'test ! -e "\$GITHUB_WORKSPACE/target"'
   }
@@ -93,6 +119,19 @@ function Assert-LinuxValidationContract {
     }
   }
 
+  $packageForbidden = [ordered]@{
+    'Python privilege escalation token' = '(?i)["''](?:sudo|su)["'']'
+    'Python host package manager token' = '(?i)["''](?:apt|apt-get|dnf|yum|pacman|zypper)["'']'
+    'Python KVM device access' = '(?i)/dev/kvm'
+    'Python QEMU process access' = '(?i)qemu-system(?:-[A-Za-z0-9_]+)?'
+    'Python vmcell lifecycle argument' = '(?i)["''](?:run|exec|copy-in|copy-out|destroy|gc)["'']'
+  }
+  foreach ($entry in $packageForbidden.GetEnumerator()) {
+    if ($ExecutionSurface -match $entry.Value) {
+      throw "Linux package execution surface contains forbidden $($entry.Key)"
+    }
+  }
+
   $gateCommands = @($Gate -split '\r?\n' | Where-Object {
     $_ -notmatch '^\s*(?:#|$)' -and $_ -notmatch '^\s*set\s+-eu\s*$'
   })
@@ -107,11 +146,27 @@ function Assert-LinuxValidationContract {
     '^cargo test --locked --workspace --all-features --doc$',
     '^sh -n tools/linux-kvm-preflight\.sh$',
     '^sh -n tools/test-linux-kvm-preflight\.sh$',
-    '^sh tools/test-linux-kvm-preflight\.sh$'
+    '^sh tools/test-linux-kvm-preflight\.sh$',
+    '^sh -n tools/check-linux-package\.sh$',
+    '^sh tools/check-linux-package\.sh$'
   )
   foreach ($command in $gateCommands) {
     if (-not @($allowedGateCommands | Where-Object { $command -match $_ })) {
       throw "Linux repository gate contains an unapproved command: $command"
+    }
+  }
+
+  $packageGateCommands = @($packageGate -split '\r?\n' | Where-Object {
+    $_ -notmatch '^\s*(?:#|$)' -and $_ -notmatch '^\s*set\s+-eu\s*$'
+  })
+  $allowedPackageGateCommands = @(
+    '^: "\$\{CARGO_TARGET_DIR:\?CARGO_TARGET_DIR must be bound outside the checkout\}"$',
+    '^cargo build --locked --release --bin vmcell$',
+    '^python3 tools/test-linux-package\.py --binary "\$CARGO_TARGET_DIR/release/vmcell"$'
+  )
+  foreach ($command in $packageGateCommands) {
+    if (-not @($allowedPackageGateCommands | Where-Object { $command -match $_ })) {
+      throw "Linux package gate contains an unapproved command: $command"
     }
   }
 }
@@ -189,11 +244,12 @@ function Assert-RejectedMutation {
   param(
     [Parameter(Mandatory)] [string] $Name,
     [Parameter(Mandatory)] [string] $Workflow,
-    [Parameter(Mandatory)] [string] $Gate
+    [Parameter(Mandatory)] [string] $Gate,
+    [Parameter(Mandatory)] [string] $ExecutionSurface
   )
 
   try {
-    Assert-LinuxValidationContract -Workflow $Workflow -Gate $Gate
+    Assert-LinuxValidationContract -Workflow $Workflow -Gate $Gate -ExecutionSurface $ExecutionSurface
   } catch {
     return
   }
@@ -215,7 +271,7 @@ function Assert-RejectedPreflightMutation {
   throw "Linux KVM preflight negative regression was accepted: $Name"
 }
 
-Assert-LinuxValidationContract -Workflow $workflow -Gate $gate
+Assert-LinuxValidationContract -Workflow $workflow -Gate $gate -ExecutionSurface $packageSurface
 Assert-LinuxPreflightContract -Preflight $preflight -FixtureTest $preflightTest
 
 Assert-RejectedPreflightMutation -Name 'privileged command' `
@@ -240,22 +296,30 @@ Assert-RejectedPreflightMutation -Name 'live fixture test invocation' `
   -Preflight $preflight -FixtureTest "$preflightTest`n--qemu-system /usr/bin/qemu-system-x86_64"
 
 Assert-RejectedMutation -Name 'automatic push' `
-  -Workflow ($workflow -replace '  workflow_dispatch:', '  push: {}') -Gate $gate
+  -Workflow ($workflow -replace '  workflow_dispatch:', '  push: {}') -Gate $gate -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'inline pull request trigger' `
-  -Workflow ($workflow -replace '  workflow_dispatch:', "  workflow_dispatch:`n  pull_request: {}") -Gate $gate
+  -Workflow ($workflow -replace '  workflow_dispatch:', "  workflow_dispatch:`n  pull_request: {}") -Gate $gate -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'write permission' `
-  -Workflow ($workflow -replace 'contents: read', 'contents: write') -Gate $gate
+  -Workflow ($workflow -replace 'contents: read', 'contents: write') -Gate $gate -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'privileged gate command' `
-  -Workflow $workflow -Gate "$gate`nsudo true"
+  -Workflow $workflow -Gate "$gate`nsudo true" -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'host package mutation' `
-  -Workflow $workflow -Gate "$gate`napt-get install qemu"
+  -Workflow $workflow -Gate "$gate`napt-get install qemu" -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'KVM device mutation' `
-  -Workflow $workflow -Gate "$gate`nchmod 0666 /dev/kvm"
+  -Workflow $workflow -Gate "$gate`nchmod 0666 /dev/kvm" -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'kernel module mutation' `
-  -Workflow $workflow -Gate "$gate`nmodprobe kvm"
+  -Workflow $workflow -Gate "$gate`nmodprobe kvm" -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'QEMU lifecycle' `
-  -Workflow $workflow -Gate "$gate`nqemu-system-x86_64 --version"
+  -Workflow $workflow -Gate "$gate`nqemu-system-x86_64 --version" -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'vmcell lifecycle' `
-  -Workflow $workflow -Gate "$gate`nvmcell run --image test -- true"
+  -Workflow $workflow -Gate "$gate`nvmcell run --image test -- true" -ExecutionSurface $packageSurface
+Assert-RejectedMutation -Name 'invoked package privilege escalation' `
+  -Workflow $workflow -Gate $gate -ExecutionSurface "$packageSurface`nsubprocess.run(['sudo', 'true'])"
+Assert-RejectedMutation -Name 'invoked package host mutation' `
+  -Workflow $workflow -Gate $gate -ExecutionSurface "$packageSurface`nsubprocess.run(['apt-get', 'install', 'qemu'])"
+Assert-RejectedMutation -Name 'invoked package KVM access' `
+  -Workflow $workflow -Gate $gate -ExecutionSurface "$packageSurface`nopen('/dev/kvm', 'wb')"
+Assert-RejectedMutation -Name 'invoked package provider lifecycle' `
+  -Workflow $workflow -Gate $gate -ExecutionSurface "$packageSurface`nsubprocess.run(['vmcell', 'run'])"
 
 Write-Host 'Linux validation workflow safety contract passed'

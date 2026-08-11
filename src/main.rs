@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
-use clap_complete::{generate, shells::PowerShell};
+use clap_complete::{
+    generate,
+    shells::{Bash, PowerShell, Zsh},
+};
 use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliExitCode, CliHumanOutput, CliInputError, CliProvider, Command,
@@ -364,8 +367,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
 fn write_completion(command: CompletionCommand, output: &mut dyn Write) {
     let mut command_line = Cli::command();
     match command {
+        CompletionCommand::Bash => {
+            generate(Bash, &mut command_line, "vmcell", output);
+        }
         CompletionCommand::Powershell => {
             generate(PowerShell, &mut command_line, "vmcell", output);
+        }
+        CompletionCommand::Zsh => {
+            generate(Zsh, &mut command_line, "vmcell", output);
         }
     }
 }

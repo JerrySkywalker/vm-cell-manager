@@ -1,0 +1,57 @@
+VM Cell Manager portable GNU/Linux package
+==========================================
+
+Install
+-------
+
+1. Verify the adjacent SHA256SUMS.txt before extraction.
+2. Extract into a user-owned staging directory under an explicit umask 022 so
+   the normalized 0755/0644 archive modes are retained, then verify
+   PACKAGE-CONTENTS.sha256 before copying any payload.
+3. Run the packaged vmcell-portable-layout.py helper from that verified layout.
+   It admits/creates the private user-owned parent chain, creates one new
+   versioned vmcell-vX.Y.Z-linux-x86_64 directory atomically, and stops if that
+   exact target already exists.
+4. The helper copies only the fixed package layout with explicit modes. It does
+   not overwrite a shared binary or completion path. It keeps vmcell and the
+   helper mode 0755 and other files mode 0644.
+5. The helper verifies PACKAGE-CONTENTS.sha256 before publication. Run
+   `vmcell --version`, `vmcell --help`, and `vmcell doctor` through that exact
+   path before adding it to PATH or selecting its Bash/Zsh completion.
+
+The package does not install QEMU, repair /dev/kvm, load modules, configure
+networking, start services, or grant provider authority. Real KVM/QGA execution
+remains release-gated.
+
+Upgrade
+-------
+
+1. Stop other vmcell commands using the same state root. Do not stop or remove
+   provider objects merely to replace the program.
+2. Keep the old versioned program directory and a recoverable copy of the state
+   root. Registered immutable base images remain in place.
+3. Verify and install the new archive into a different, previously absent
+   versioned directory. Never install over the previous directory.
+4. Run `vmcell --state-root PATH state check` with the new binary before the
+   first mutating command. Stop on upgrade-required, integrity, or ambiguity.
+5. Switch PATH/completion selection only after version/help/doctor checks pass.
+   Rollback selects the preserved old directory; it is not a state downgrade.
+
+Remove
+------
+
+1. Inspect retained cells and operations through vmcell before deciding on any
+   provider cleanup. Never delete a VM by name or PID alone.
+2. Quiesce the program directory. Prove its root/completions directories and
+   every fixed payload are ordinary non-symlink entries owned by the effective
+   user. Compare the installed content manifest to the retained verified
+   package copy and require every hash, mode, and exact entry name to match.
+3. Stop without deleting anything on a missing, additional, replaced, linked,
+   ownership-drifted, mode-drifted, or hash-drifted entry.
+4. Run the packaged helper from the retained verified extracted package, never
+   from the installed directory itself. It rejects a source that is the target
+   and removes only the fixed verified payload list and its empty directories;
+   then remove that exact versioned directory from PATH/completion selection.
+
+Removing this portable package is intentionally not a data or provider cleanup
+operation.

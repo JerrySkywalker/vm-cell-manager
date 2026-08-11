@@ -400,8 +400,14 @@ pub enum StateCommand {
 
 #[derive(Debug, Clone, Copy, Subcommand)]
 pub enum CompletionCommand {
+    /// Generate Bash argument completion for vmcell.
+    Bash,
+
     /// Generate PowerShell argument completion for vmcell.
     Powershell,
+
+    /// Generate Zsh argument completion for vmcell.
+    Zsh,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2212,14 +2218,19 @@ mod tests {
     }
 
     #[test]
-    fn powershell_completion_is_an_explicit_nested_command() {
-        let cli = Cli::try_parse_from(["vmcell", "completion", "powershell"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Completion {
-                command: CompletionCommand::Powershell
-            }
-        ));
+    fn shell_completions_are_explicit_nested_commands() {
+        for (shell, expected) in [
+            ("bash", CompletionCommand::Bash),
+            ("powershell", CompletionCommand::Powershell),
+            ("zsh", CompletionCommand::Zsh),
+        ] {
+            let cli = Cli::try_parse_from(["vmcell", "completion", shell]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Completion { command } if std::mem::discriminant(&command)
+                    == std::mem::discriminant(&expected)
+            ));
+        }
         assert!(Cli::try_parse_from(["vmcell", "completion"]).is_err());
     }
 
