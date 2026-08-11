@@ -10,16 +10,16 @@ is created by these instructions.
    trusted candidate workflow.
 2. Verify the ZIP SHA-256 against the exact checksum line before extraction.
 3. Extract into a user-owned versioned parent such as
-   `%LOCALAPPDATA%\Programs\vmcell\0.2.0`. The ZIP retains its deterministic
-   top-level `vmcell-v0.2.0-windows-x86_64` directory.
+   `%LOCALAPPDATA%\Programs\vmcell\0.3.0`. The ZIP retains its deterministic
+   top-level `vmcell-v0.3.0-windows-x86_64` directory.
 4. Set `$installDir` to that nested directory, then run the exact binary's
    version, help, and doctor checks.
 5. Add `$installDir` to the user PATH only after those checks.
 
 ```powershell
-$extractDir = Join-Path $env:LOCALAPPDATA 'Programs\vmcell\0.2.0'
-Expand-Archive -LiteralPath .\vmcell-v0.2.0-windows-x86_64.zip -DestinationPath $extractDir
-$installDir = Join-Path $extractDir 'vmcell-v0.2.0-windows-x86_64'
+$extractDir = Join-Path $env:LOCALAPPDATA 'Programs\vmcell\0.3.0'
+Expand-Archive -LiteralPath .\vmcell-v0.3.0-windows-x86_64.zip -DestinationPath $extractDir
+$installDir = Join-Path $extractDir 'vmcell-v0.3.0-windows-x86_64'
 $vmcell = Join-Path $installDir 'vmcell.exe'
 & $vmcell --version
 & $vmcell --help
@@ -44,7 +44,8 @@ same completion contract for custom layouts.
    Keep registered base images immutable and in place.
 3. Verify and extract the new version into a different versioned directory.
 4. With the new binary, run `vmcell --state-root PATH state check` before any
-   mutation. The v0.1-to-v0.2 format-1 path is read in place without rewrite.
+   mutation. Compatible format-1 roots from earlier candidates are read in
+   place without rewrite.
 5. On `vmcell.state.upgrade_required`, integrity failure, or ambiguous state,
    stop. Do not repair JSON manually or run lifecycle commands with the new
    binary. Return to the binary that owns the state schema or follow a future

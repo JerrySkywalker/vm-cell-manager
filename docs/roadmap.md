@@ -442,13 +442,18 @@ A developer can install vmcell, maintain a small local image collection, run dis
 
 # v0.3.0 — Cross-Platform Human MVP
 
+**Repository-local status:** issue #26 slices 1-6 are complete in the `0.3.0`
+candidate. Windows and native-Linux compile/test/package evidence is green;
+real Hyper-V/PowerShell Direct, QEMU/WHPX/QGA, and QEMU/KVM/QGA acceptance,
+publication, tagging, and promotion to `main` remain external release gates.
+
 ## Product promise
 
 > The same human-facing vmcell workflow works on both Windows and native Linux, with provider differences expressed as capabilities rather than different products.
 
 This milestone makes the original cross-platform execution-cell vision directly visible.
 
-## Required accepted platform paths
+## Target acceptance platform paths
 
 At minimum:
 
@@ -459,6 +464,8 @@ Linux + QEMU/KVM + Linux guest + QGA
 ```
 
 Native Linux evidence is required; WSL2 is development evidence only. macOS/HVF may remain deferred or experimental.
+Repository-local tests and native-Linux compile/package CI do not satisfy these
+real virtualization acceptance paths or promote their support status.
 
 ## Required user-facing capabilities
 
@@ -500,7 +507,9 @@ Prove real QEMU process lifecycle, immutable QCOW2 base, exactly one overlay, QM
 
 ### Native Linux distribution
 
-Publish a supported native Linux binary/install path and prove Unix state permissions, path containment, process-tree termination, QMP Unix sockets, KVM admission, durable state, and cleanup semantics.
+Prepare a native Linux binary/install path for later publication and prove its
+repository-local Unix state, path, process, QMP socket, KVM admission, durable
+state, and cleanup contracts without claiming dedicated-host acceptance.
 
 **Repository-local implementation:** the manual exact-SHA native-Linux lane
 builds and validates a deterministic `x86_64-unknown-linux-gnu` portable
@@ -938,7 +947,8 @@ v0.9  1.0 Contract Candidate
 v1.0  Stable Execution Cell Runtime
 ```
 
-Repository-local v0.2 Windows Daily Driver implementation is complete on
-`dev`. The next repository-development milestone is **v0.3.0 — Cross-Platform
-Human MVP**. Public release advancement remains separately blocked on the
-dedicated Windows acceptance path, beginning with the frozen v0.1 candidate.
+Repository-local v0.3 Cross-Platform Human MVP implementation is complete on
+`dev`. The next repository-development milestone is **v0.4.0 — Reproducible
+Jobs**, subject to a separate admitted plan. Public release advancement remains
+separately blocked on dedicated real-platform acceptance, beginning with the
+frozen earlier candidates.

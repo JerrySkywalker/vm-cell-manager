@@ -155,8 +155,8 @@ Hypervisor lifecycle and guest execution are orthogonal.
 Examples:
 
 - Hyper-V + Windows: VM lifecycle via Hyper-V, command execution via PowerShell Direct.
-- Hyper-V + Linux: VM lifecycle via Hyper-V, command execution via SSH or another guest mechanism.
-- QEMU + Windows/Linux: VM lifecycle via QMP, command execution via QGA or SSH.
+- QEMU + Linux: VM lifecycle via QMP, command execution via QGA on the current WHPX/KVM target paths.
+- SSH remains modeled but unsupported, and the current contract does not claim Windows-guest QGA support.
 
 This separation prevents provider code from accumulating application protocols and keeps command execution independent from virtual networking where possible.
 

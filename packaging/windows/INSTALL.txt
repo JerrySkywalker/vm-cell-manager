@@ -36,8 +36,8 @@ Upgrade
 3. Extract the new archive into a new user-owned directory and verify
    `vmcell.exe --version` plus the archive checksum.
 4. Run `vmcell.exe --state-root PATH state check` with the new binary before
-   the first mutating command. A compatible v0.1/v0.2 format-1 root is read in
-   place and is not rewritten.
+   the first mutating command. A compatible format-1 root from an earlier
+   candidate is read in place and is not rewritten.
 5. If state check reports upgrade-required or integrity failure, do not mutate
    the root. Keep it unchanged and return to the binary that owns its schema.
 6. Run `vmcell.exe doctor`, then switch your user PATH to the new directory.

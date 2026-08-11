@@ -6,6 +6,15 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Set the repository candidate identity to `0.3.0` and completed the
+  repository-local Cross-Platform Human MVP: provider-neutral support and run
+  planning, Windows QEMU/WHPX and native Linux QEMU/KVM foundations for
+  prepared Linux QCOW2 + QGA guests, and deterministic Linux distribution.
+  Real Hyper-V, PowerShell Direct, WHPX, KVM, QGA, and release publication
+  remain separately gated.
+- Finalized versioned, non-authorizing human/JSON run-plan regressions across
+  Windows/Hyper-V/PowerShell Direct, Windows/QEMU/WHPX/Linux/QGA, and
+  Linux/QEMU/KVM/Linux/QGA without promoting any real-platform support row.
 - Completed the repository-local v0.2 Windows Daily Driver documentation with
   one canonical install-to-upgrade workflow and explicit real-platform gates.
 - Bumped the repository-local candidate identity to `0.2.0` and extended the

@@ -24,12 +24,12 @@ the retained manifest before publication. Stop on any mismatch.
 
 ```sh
 set -eu
-archive=vmcell-v0.2.0-linux-x86_64.tar.gz
+archive=vmcell-v0.3.0-linux-x86_64.tar.gz
 staging=$(mktemp -d)
 (umask 022; tar -xzf "$archive" -C "$staging")
-layout="$staging/vmcell-v0.2.0-linux-x86_64"
+layout="$staging/vmcell-v0.3.0-linux-x86_64"
 install_parent="$HOME/.local/lib/vmcell"
-install_root="$install_parent/vmcell-v0.2.0-linux-x86_64"
+install_root="$install_parent/vmcell-v0.3.0-linux-x86_64"
 
 (cd "$layout" && sha256sum --check --strict PACKAGE-CONTENTS.sha256)
 python3 "$layout/vmcell-portable-layout.py" install --parent "$install_parent"
@@ -45,9 +45,9 @@ versioned `completions` directory to Zsh `fpath`. No command overwrites a shared
 binary or completion target. Retain the verified archive/checksum and a full
 checksum-verified extracted layout as the removal identity and helper source.
 
-The example version follows the current repository candidate and is aligned to
-`0.3.0` during v0.3 closeout. Do not use an archive whose version, checksum,
-target, or recorded glibc floor does not match the intended installation.
+The example version follows the current repository candidate. Do not use an
+archive whose version, checksum, target, or recorded glibc floor does not match
+the intended installation.
 
 ## Upgrade and rollback
 

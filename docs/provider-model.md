@@ -85,16 +85,19 @@ shared_folder
 gpu_or_device_assignment
 ```
 
-The schema will be versioned before it is treated as a stable external API.
+The provider-neutral doctor and run-plan automation contracts are versioned.
+Raw provider diagnostics remain conservative, non-authorizing implementation
+evidence rather than a stable authority surface.
 
 ## Provider selection
 
 Selection should follow these rules:
 
-1. An explicitly requested provider wins if it is available and satisfies the request.
-2. Otherwise the platform default is preferred.
-3. A provider that cannot satisfy a required capability must not be selected merely because it is installed.
-4. Cross-architecture software emulation requires explicit opt-in.
+1. A compatible explicit CLI provider or accelerator override has highest precedence.
+2. An explicitly present configuration preference is advisory and next in precedence; it never grants provider or TCG authority.
+3. Otherwise select one deterministic compatible native/default path from image variants, host/provider probes, accelerator availability, guest identity, transport requirements, and the support matrix.
+4. Ambiguity, unavailable capabilities, drift, or an incompatible image variant fails before mutation.
+5. TCG requires both explicit `--accelerator tcg` and `--allow-tcg`; it is never implicit, config-authorized, or a fallback.
 
 Initial defaults:
 
@@ -105,6 +108,11 @@ macOS   -> QEMU/HVF
 ```
 
 QEMU/WHPX remains useful on Windows for portability and provider-contract testing even though Hyper-V is the preferred Windows-native path.
+
+The resolved `vmcell.run-plan.v1` plan is descriptive and
+`authorizing=false`; the engine revalidates current image/provider/capability
+evidence before issuing its existing lifecycle authority. See
+[provider-neutral run selection](run-selection.md).
 
 ## Future providers
 
