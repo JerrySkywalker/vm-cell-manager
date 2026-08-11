@@ -449,9 +449,12 @@ pub fn build_job_run_request(
             allow_tcg: plan.execution.accelerator == Accelerator::Tcg,
         },
         command: spec.guest_command(),
-        readiness: ReadinessPolicy {
-            timeout: StdDuration::from_secs(spec.readiness_timeout_seconds),
-            poll_interval: StdDuration::from_secs(2),
+        readiness: {
+            let timeout = StdDuration::from_secs(spec.readiness_timeout_seconds);
+            ReadinessPolicy {
+                timeout,
+                poll_interval: StdDuration::from_secs(2).min(timeout),
+            }
         },
         cleanup: RunCleanupPolicy {
             keep: spec.cleanup.keep,
@@ -6535,6 +6538,50 @@ sources = ["results/output.txt"]
         ));
         assert!(engine.state.list_cells().unwrap().is_empty());
         assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn job_request_caps_readiness_poll_interval_to_an_accepted_short_timeout() {
+        let (directory, engine, image_id) = fixture();
+        let image = engine.state.load_image(&image_id).unwrap();
+        let loaded = LoadedJobSpec::from_validated_parts_for_test(
+            directory.path().join("one-second-readiness.toml"),
+            "d".repeat(64),
+            crate::core::job_spec::parse_job_spec(&format!(
+                r#"
+schema_version = 1
+image = "{image_id}"
+cpu_count = 2
+memory_mib = 4096
+readiness_timeout_seconds = 1
+
+[command]
+program = "cmd.exe"
+
+[cleanup]
+keep = false
+keep_on_failure = false
+"#,
+            ))
+            .unwrap(),
+        );
+        let host = HostPlatform {
+            os: crate::core::support::HostOs::Windows,
+            architecture: Architecture::X86_64,
+        };
+
+        let (_, request) =
+            build_job_run_request(&loaded, host, &image, &[engine.provider.probe()]).unwrap();
+
+        assert_eq!(
+            request.binding.request.readiness.timeout,
+            StdDuration::from_secs(1)
+        );
+        assert_eq!(
+            request.binding.request.readiness.poll_interval,
+            StdDuration::from_secs(1)
+        );
+        assert!(validate_readiness_policy(request.binding.request.readiness).is_ok());
     }
 
     #[test]
