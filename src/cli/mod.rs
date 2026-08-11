@@ -11,6 +11,7 @@ use crate::core::automation::{
 use crate::core::cell::{CellId, CellIdError, CellRecord};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError, GuestOperationRecord};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError, ImageRecord};
+use crate::core::job_spec::JobSpecError;
 use crate::core::run_selection::{RunExecutionPlan, RunSelectionError};
 use crate::engine::{
     CellInspection, EngineError, ImageValidationReport, RunCellError, RunCleanupDisposition,
@@ -96,6 +97,12 @@ pub enum Command {
     Image {
         #[command(subcommand)]
         command: ImageCommand,
+    },
+
+    /// Inspect a reproducible job specification without lifecycle mutation.
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
     },
 
     /// Create one stopped, networkless Hyper-V or QEMU cell.
@@ -297,6 +304,15 @@ pub enum Command {
 
     /// Explicitly destroy expired exact-owned cells; no daemon is used.
     Gc,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobCommand {
+    /// Resolve one versioned job specification through current read-only evidence.
+    Plan {
+        #[arg(long, value_name = "PATH")]
+        spec: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -933,6 +949,9 @@ pub fn classify_cli_error(error: &(dyn Error + 'static)) -> CliErrorClassificati
     if let Some(error) = error.downcast_ref::<ConfigError>() {
         return classify_config_error(error);
     }
+    if let Some(error) = error.downcast_ref::<JobSpecError>() {
+        return classify_job_spec_error(error);
+    }
     if error.downcast_ref::<CliInputError>().is_some() {
         return classification(
             "vmcell.invalid_input",
@@ -1031,6 +1050,39 @@ fn classify_config_error(error: &ConfigError) -> CliErrorClassification {
         ),
         ConfigError::Io(_) => classification(
             "vmcell.config.io",
+            CliErrorCategory::Internal,
+            CliExitCode::Internal,
+            false,
+        ),
+    }
+}
+
+fn classify_job_spec_error(error: &JobSpecError) -> CliErrorClassification {
+    match error {
+        JobSpecError::NotFound => classification(
+            error.code(),
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        JobSpecError::UnsupportedSchema { .. } => classification(
+            error.code(),
+            CliErrorCategory::Integrity,
+            CliExitCode::Integrity,
+            false,
+        ),
+        JobSpecError::UnsafePath
+        | JobSpecError::TooLarge
+        | JobSpecError::InvalidEncoding
+        | JobSpecError::Toml
+        | JobSpecError::InvalidValue(_) => classification(
+            error.code(),
+            CliErrorCategory::InvalidInput,
+            CliExitCode::InvalidInput,
+            false,
+        ),
+        JobSpecError::Io(_) => classification(
+            error.code(),
             CliErrorCategory::Internal,
             CliExitCode::Internal,
             false,
@@ -1595,6 +1647,21 @@ mod tests {
                 CliExitCode::InvalidInput,
                 false,
             ),
+            (
+                Box::new(JobSpecError::Toml),
+                "vmcell.job_spec.invalid_document",
+                CliExitCode::InvalidInput,
+                false,
+            ),
+            (
+                Box::new(JobSpecError::UnsupportedSchema {
+                    expected: 1,
+                    actual: 2,
+                }),
+                "vmcell.job_spec.unsupported_schema",
+                CliExitCode::Integrity,
+                false,
+            ),
         ];
 
         for (error, code, exit_code, retryable) in cases {
@@ -2078,6 +2145,17 @@ mod tests {
                 allow_tcg: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parses_read_only_job_plan_surface() {
+        let cli = Cli::try_parse_from(["vmcell", "job", "plan", "--spec", "vmcell.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Job {
+                command: JobCommand::Plan { spec }
+            } if spec == std::path::Path::new("vmcell.toml")
         ));
     }
 

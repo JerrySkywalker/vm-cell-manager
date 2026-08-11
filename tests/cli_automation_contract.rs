@@ -412,6 +412,103 @@ fn malformed_or_unsupported_config_fails_before_state_access_and_is_redacted() {
 }
 
 #[test]
+fn job_plan_rejects_secret_like_input_before_state_or_provider_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("must-not-exist");
+    let config = directory.path().join("config.json");
+    write_config(
+        &config,
+        &serde_json::json!({"schema_version": 1, "defaults": {}}),
+    );
+    let spec = directory.path().join("job.toml");
+    fs::write(
+        &spec,
+        "schema_version = 1\npassword = \"job-spec-secret-sentinel",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&spec, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .arg("--state-root")
+        .arg(&state_root)
+        .args(["job", "plan", "--spec"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!state_root.exists());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "vmcell.job_spec.invalid_document"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("job-spec-secret-sentinel"));
+}
+
+#[test]
+fn job_plan_missing_image_is_read_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("must-not-exist");
+    let config = directory.path().join("config.json");
+    write_config(
+        &config,
+        &serde_json::json!({"schema_version": 1, "defaults": {}}),
+    );
+    let spec = directory.path().join("job.toml");
+    fs::write(
+        &spec,
+        r#"
+schema_version = 1
+image = "missing-image"
+cpu_count = 2
+memory_mib = 2048
+
+[command]
+program = "echo"
+
+[cleanup]
+keep = false
+keep_on_failure = false
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&spec, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .arg("--state-root")
+        .arg(&state_root)
+        .args(["job", "plan", "--spec"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!state_root.exists());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(envelope["error"]["code"], "vmcell.state.not_found");
+}
+
+#[test]
 fn run_failures_preserve_stage_cell_and_cleanup_in_json_and_human_modes() {
     let state = tempfile::tempdir().unwrap();
     let json = invalid_run(state.path(), true);

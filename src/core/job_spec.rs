@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::cell::{MAX_CPU_COUNT, MAX_MEMORY_MIB, MIN_MEMORY_MIB};
@@ -105,6 +106,9 @@ pub struct JobArtifactSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedJobSpec {
     pub path: PathBuf,
+    /// SHA-256 of the exact bounded source bytes.  It binds a later plan or
+    /// result to an input document without serializing the document itself.
+    pub source_sha256: String,
     pub spec: JobSpec,
 }
 
@@ -165,9 +169,14 @@ pub fn load_job_spec(path: &Path) -> Result<LoadedJobSpec, JobSpecError> {
     if bytes.len() as u64 > MAX_JOB_SPEC_BYTES {
         return Err(JobSpecError::TooLarge);
     }
+    let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
     let input = std::str::from_utf8(&bytes).map_err(|_| JobSpecError::InvalidEncoding)?;
     let spec = parse_job_spec(input)?;
-    Ok(LoadedJobSpec { path, spec })
+    Ok(LoadedJobSpec {
+        path,
+        source_sha256,
+        spec,
+    })
 }
 
 impl JobSpec {
@@ -243,7 +252,7 @@ struct RawJobCopyInSpec {
     max_bytes: u64,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawJobArtifactSpec {
     sources: Vec<String>,
@@ -251,6 +260,16 @@ struct RawJobArtifactSpec {
     timeout_seconds: u64,
     #[serde(default = "default_max_artifact_file_bytes")]
     max_bytes_per_file: u64,
+}
+
+impl Default for RawJobArtifactSpec {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            timeout_seconds: default_action_timeout_seconds(),
+            max_bytes_per_file: default_max_artifact_file_bytes(),
+        }
+    }
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -732,6 +751,32 @@ max_bytes_per_file = 4096
     }
 
     #[test]
+    fn optional_artifact_section_uses_bounded_defaults() {
+        let spec = parse_job_spec(
+            r#"
+schema_version = 1
+image = "linux-qemu"
+cpu_count = 2
+memory_mib = 2048
+
+[command]
+program = "echo"
+
+[cleanup]
+keep = false
+keep_on_failure = false
+"#,
+        )
+        .unwrap();
+        assert!(spec.artifacts.sources.is_empty());
+        assert_eq!(
+            spec.artifacts.timeout_seconds,
+            DEFAULT_ACTION_TIMEOUT_SECONDS
+        );
+        assert_eq!(spec.artifacts.max_bytes_per_file, MAX_ARTIFACT_FILE_BYTES);
+    }
+
+    #[test]
     fn loader_is_required_and_bounded() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing.toml");
@@ -746,6 +791,7 @@ max_bytes_per_file = 4096
         let loaded = load_job_spec(&path).unwrap();
         assert_eq!(loaded.spec.image.as_str(), "linux-qemu");
         assert_eq!(loaded.path, path.canonicalize().unwrap());
+        assert_eq!(loaded.source_sha256.len(), 64);
 
         fs::write(&path, vec![b' '; MAX_JOB_SPEC_BYTES as usize + 1]).unwrap();
         assert!(matches!(load_job_spec(&path), Err(JobSpecError::TooLarge)));
