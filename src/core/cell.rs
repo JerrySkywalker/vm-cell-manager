@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::image::{ImageBinding, ImageId};
+use super::job::JobCorrelation;
 use super::ownership::{CellOwnership, ProviderObjectIdentity};
 
 pub const CELL_SCHEMA_VERSION: u32 = 1;
@@ -101,4 +102,8 @@ pub struct CellRecord {
     pub updated_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    /// Immutable provenance for a cell created by `vmcell run --spec`.
+    /// Direct cells and legacy state deliberately have no job correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobCorrelation>,
 }

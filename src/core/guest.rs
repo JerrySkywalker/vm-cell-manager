@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::cell::CellId;
+use super::job::JobId;
 
 pub const GUEST_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -107,11 +108,25 @@ pub struct GuestOperationRecord {
     pub artifact_id: Option<GuestOperationId>,
     #[serde(default)]
     pub artifact_pruned_at: Option<DateTime<Utc>>,
+    /// Optional durable correlation for an action dispatched by a job.  A
+    /// direct command on a retained job cell remains deliberately unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<JobId>,
 }
 
 impl GuestOperationRecord {
     #[must_use]
     pub fn intent(cell_id: CellId, kind: GuestOperationKind, now: DateTime<Utc>) -> Self {
+        Self::intent_with_job(cell_id, kind, now, None)
+    }
+
+    #[must_use]
+    pub fn intent_with_job(
+        cell_id: CellId,
+        kind: GuestOperationKind,
+        now: DateTime<Utc>,
+        job_id: Option<JobId>,
+    ) -> Self {
         Self {
             schema_version: GUEST_OPERATION_SCHEMA_VERSION,
             id: GuestOperationId::new(),
@@ -127,6 +142,7 @@ impl GuestOperationRecord {
             stderr_bytes: None,
             artifact_id: None,
             artifact_pruned_at: None,
+            job_id,
         }
     }
 }
@@ -146,6 +162,9 @@ pub struct ArtifactRecord {
     pub cell_id: CellId,
     pub created_at: DateTime<Utc>,
     pub entries: Vec<ArtifactEntry>,
+    /// Optional durable correlation copied from the owning guest operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<JobId>,
 }
 
 pub const MAX_ARTIFACT_FILES: usize = 16;

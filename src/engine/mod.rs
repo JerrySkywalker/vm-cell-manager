@@ -23,7 +23,7 @@ use crate::core::guest::{
 use crate::core::image::{
     Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
 };
-use crate::core::job::{JobResultMetadata, JobRunContext};
+use crate::core::job::{JobCorrelation, JobId, JobResultMetadata, JobRunContext};
 use crate::core::job_plan::{ResolvedJobPlan, resolve_job_plan};
 use crate::core::job_spec::LoadedJobSpec;
 use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObjectIdentity};
@@ -217,10 +217,11 @@ pub struct RunCellRequest {
 /// caller receives it.  The engine compares that binding before any lifecycle
 /// mutation, so a caller cannot substitute a plan, command, or cleanup policy
 /// while retaining the original job-spec digest in the result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct JobRunRequest {
     request: RunCellRequest,
     job: JobRunContext,
+    actions: JobRunActions,
     binding: JobRunRequestBinding,
 }
 
@@ -228,17 +229,129 @@ pub struct JobRunRequest {
 struct JobRunRequestBinding {
     request: RunCellRequest,
     job: JobRunContext,
+    actions: JobRunActions,
+}
+
+/// Internal, immutable guest-action projection of a validated job spec.
+/// Paths are canonicalized against the job-spec parent before this is exposed
+/// to the lifecycle engine and are revalidated immediately before copy-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JobRunActions {
+    copy_in: Vec<JobCopyInAction>,
+    artifacts: Option<JobArtifactAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobCopyInAction {
+    source: PathBuf,
+    source_root: PathBuf,
+    source_sha256: String,
+    source_size: u64,
+    destination: GuestPath,
+    overwrite: OverwritePolicy,
+    timeout: StdDuration,
+    max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobCopySourceBinding<'a> {
+    root: &'a Path,
+    sha256: &'a str,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobArtifactAction {
+    sources: Vec<GuestPath>,
+    timeout: StdDuration,
+    max_bytes_per_file: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobGuestActionContext {
+    cell_id: CellId,
+    readiness: ReadinessPolicy,
+    job_id: Option<JobId>,
+}
+
+/// Redacted, bounded operation evidence emitted only for a job-backed run.
+/// Host/guest paths, copy bytes, command text, credentials, and guest output
+/// remain available only through their existing scoped inspection surfaces.
+pub const JOB_OPERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const JOB_OPERATION_MANIFEST_CONTRACT: &str = "vmcell.job-operations.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCopyInSummary {
+    pub operation_id: GuestOperationId,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobArtifactSummary {
+    pub operation_id: GuestOperationId,
+    pub file_count: u32,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobOperationManifest {
+    pub schema_version: u32,
+    pub contract: String,
+    pub copy_in: Vec<JobCopyInSummary>,
+    pub command_operation_id: Option<GuestOperationId>,
+    pub artifacts: Vec<JobArtifactSummary>,
+}
+
+impl JobOperationManifest {
+    fn new() -> Self {
+        Self {
+            schema_version: JOB_OPERATION_MANIFEST_SCHEMA_VERSION,
+            contract: JOB_OPERATION_MANIFEST_CONTRACT.to_owned(),
+            copy_in: Vec::new(),
+            command_operation_id: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn record_copy_in(&mut self, report: &GuestCopyInReport) {
+        self.copy_in.push(JobCopyInSummary {
+            operation_id: report.operation_id,
+            size: report.size,
+        });
+    }
+
+    fn record_command(&mut self, operation_id: GuestOperationId) {
+        self.command_operation_id = Some(operation_id);
+    }
+
+    fn record_artifact(&mut self, report: &ArtifactReport) {
+        self.artifacts.push(JobArtifactSummary {
+            operation_id: report.operation_id,
+            file_count: report.artifact.entries.len() as u32,
+            total_bytes: report
+                .artifact
+                .entries
+                .iter()
+                .fold(0_u64, |total, entry| total.saturating_add(entry.size)),
+        });
+    }
 }
 
 impl JobRunRequest {
-    fn new(request: RunCellRequest, job: JobRunContext) -> Self {
+    fn new_with_actions(
+        request: RunCellRequest,
+        job: JobRunContext,
+        actions: JobRunActions,
+    ) -> Self {
         Self {
             binding: JobRunRequestBinding {
                 request: request.clone(),
                 job: job.clone(),
+                actions: actions.clone(),
             },
             request,
             job,
+            actions,
         }
     }
 
@@ -254,14 +367,17 @@ impl JobRunRequest {
         &self.binding.job
     }
 
-    fn into_parts(self) -> Result<(RunCellRequest, JobRunContext), EngineError> {
-        if self.request != self.binding.request || self.job != self.binding.job {
+    fn into_parts(self) -> Result<(RunCellRequest, JobRunContext, JobRunActions), EngineError> {
+        if self.request != self.binding.request
+            || self.job != self.binding.job
+            || self.actions != self.binding.actions
+        {
             return Err(EngineError::Integrity(
                 "job execution request no longer matches its validated specification binding"
                     .to_owned(),
             ));
         }
-        Ok((self.request, self.job))
+        Ok((self.request, self.job, self.actions))
     }
 }
 
@@ -270,28 +386,50 @@ impl JobRunRequest {
 /// than a caller-supplied plan prevents a public caller from substituting a
 /// different provider or accelerator after spec validation.  The engine will
 /// still revalidate the resulting plan immediately before mutation.  Copy and
-/// artifact actions deliberately fail closed here until the correlated
-/// operation slice can thread their durable records.
+/// artifact actions are bound here, then dispatched only through the existing
+/// guest-operation state machine.
 pub fn build_job_run_request(
     loaded: &LoadedJobSpec,
     host: HostPlatform,
     image: &ImageRecord,
     probes: &[ProviderProbe],
 ) -> Result<(ResolvedJobPlan, JobRunRequest), EngineError> {
-    let spec = &loaded.spec;
+    let spec = loaded.spec();
     let plan = resolve_job_plan(loaded, host, image, probes)?;
     if plan.execution.authorizing || plan.execution.image != spec.image {
         return Err(EngineError::Integrity(
             "resolved job plan is not bound to the validated job specification".to_owned(),
         ));
     }
-    if !spec.copy_in.is_empty() || !spec.artifacts.sources.is_empty() {
-        return Err(EngineError::InvalidCellRequest(
-            "job copy and artifact actions are unavailable until correlated operation support is enabled"
-                .to_owned(),
-        ));
-    }
-    let job = JobRunContext::new(loaded.source_sha256.clone(), Utc::now()).map_err(|_| {
+    let source_root = loaded.path().parent().ok_or_else(|| {
+        EngineError::Integrity(
+            "validated job specification path has no parent directory".to_owned(),
+        )
+    })?;
+    let copy_in = spec
+        .copy_in
+        .iter()
+        .map(|input| {
+            let (source, source_sha256, source_size) =
+                bind_job_copy_source(source_root, &input.source, input.max_bytes)?;
+            Ok(JobCopyInAction {
+                source,
+                source_root: source_root.to_path_buf(),
+                source_sha256,
+                source_size,
+                destination: input.destination.clone(),
+                overwrite: input.overwrite,
+                timeout: StdDuration::from_secs(input.timeout_seconds),
+                max_bytes: input.max_bytes,
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let artifacts = (!spec.artifacts.sources.is_empty()).then(|| JobArtifactAction {
+        sources: spec.artifacts.sources.clone(),
+        timeout: StdDuration::from_secs(spec.artifacts.timeout_seconds),
+        max_bytes_per_file: spec.artifacts.max_bytes_per_file,
+    });
+    let job = JobRunContext::new(loaded.source_sha256(), Utc::now()).map_err(|_| {
         EngineError::Integrity("validated job specification digest is malformed".to_owned())
     })?;
     let request = RunCellRequest {
@@ -316,7 +454,10 @@ pub fn build_job_run_request(
             keep_on_failure: spec.cleanup.keep_on_failure,
         },
     };
-    Ok((plan.clone(), JobRunRequest::new(request, job)))
+    Ok((
+        plan.clone(),
+        JobRunRequest::new_with_actions(request, job, JobRunActions { copy_in, artifacts }),
+    ))
 }
 
 pub fn validate_run_resources(
@@ -366,6 +507,13 @@ struct GuestOperationPlan {
     readiness: ReadinessPolicy,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GuestOperationDispatch {
+    cell_id: CellId,
+    job_id: Option<JobId>,
+    plan: GuestOperationPlan,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -406,7 +554,9 @@ pub enum RunStage {
     CellCreation,
     ProviderStart,
     GuestReadiness,
+    GuestCopyIn,
     GuestExecution,
+    ArtifactCollection,
     Cleanup,
     Interrupted,
 }
@@ -420,7 +570,9 @@ impl RunStage {
             Self::CellCreation => "cell_creation",
             Self::ProviderStart => "provider_start",
             Self::GuestReadiness => "guest_readiness",
+            Self::GuestCopyIn => "guest_copy_in",
             Self::GuestExecution => "guest_execution",
+            Self::ArtifactCollection => "artifact_collection",
             Self::Cleanup => "cleanup",
             Self::Interrupted => "interrupted",
         }
@@ -444,6 +596,8 @@ pub struct RunCellReport {
     pub plan: Option<RunExecutionPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobResultMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_operations: Option<JobOperationManifest>,
     pub cell_id: CellId,
     pub operation_id: GuestOperationId,
     pub outcome: RunOutcome,
@@ -458,6 +612,8 @@ pub struct RunFailureReport {
     pub plan: Option<RunExecutionPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobResultMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_operations: Option<JobOperationManifest>,
     pub cell_id: Option<CellId>,
     pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
@@ -483,7 +639,18 @@ pub enum RunProgressEvent {
     },
     CommandCompleted {
         cell_id: CellId,
+        operation_id: GuestOperationId,
         exit_code: i32,
+    },
+    CopyInCompleted {
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+        size: u64,
+    },
+    ArtifactCollected {
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+        file_count: u32,
     },
     CleanupStarted {
         cell_id: CellId,
@@ -1180,13 +1347,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
     }
 
     pub fn create_cell(&self, spec: CellSpec) -> Result<CellRecord, EngineError> {
-        self.create_cell_with_id(spec, CellId::new())
+        self.create_cell_with_id(spec, CellId::new(), None)
     }
 
     fn create_cell_with_id(
         &self,
         spec: CellSpec,
         cell_id: CellId,
+        job: Option<JobCorrelation>,
     ) -> Result<CellRecord, EngineError> {
         self.require_provider_available()?;
         validate_cell_spec(&spec, self.provider.name())?;
@@ -1233,6 +1401,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             updated_at: now,
             expires_at,
             last_error: None,
+            job,
         };
         self.state.save_cell(&record)?;
         let runtime_authority = match self.state.prepare_cell_runtime_for(
@@ -1552,7 +1721,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         request: RunCellRequest,
         observer: &mut O,
     ) -> Result<RunCellReport, RunCellError> {
-        self.run_cell_observed_with_job(transport, credentials, request, None, observer)
+        self.run_cell_observed_with_job(transport, credentials, request, None, None, observer)
     }
 
     /// Execute an opaque, spec-bound job request through the canonical run
@@ -1567,7 +1736,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
     ) -> Result<RunCellReport, RunCellError> {
         let plan = request.plan().clone();
         let job = request.job().clone();
-        let (request, job) = match request.into_parts() {
+        let (request, job, actions) = match request.into_parts() {
             Ok(parts) => parts,
             Err(error) => {
                 return Err(run_cell_error(
@@ -1580,7 +1749,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 ));
             }
         };
-        self.run_cell_observed_with_job(transport, credentials, request, Some(job), observer)
+        self.run_cell_observed_with_job(
+            transport,
+            credentials,
+            request,
+            Some(job),
+            Some(actions),
+            observer,
+        )
     }
 
     fn run_cell_observed_with_job<G: GuestTransport, O: RunObserver>(
@@ -1589,6 +1765,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         credentials: &GuestCredentials,
         request: RunCellRequest,
         job: Option<JobRunContext>,
+        actions: Option<JobRunActions>,
         observer: &mut O,
     ) -> Result<RunCellReport, RunCellError> {
         let plan = request.plan.clone();
@@ -1633,8 +1810,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
 
+        let job_correlation = job.as_ref().map(JobRunContext::correlation);
         let cell_id = CellId::new();
-        let cell = match self.create_cell_with_id(request.spec, cell_id) {
+        let cell = match self.create_cell_with_id(request.spec, cell_id, job_correlation) {
             Ok(cell) => cell,
             Err(error) => {
                 let stage = match &error {
@@ -1663,11 +1841,16 @@ impl<P: LocalVmProvider> CellEngine<P> {
             || observer.observe(&RunProgressEvent::CellCreated { cell_id }) == RunControl::Cancel
         {
             return Err(self.interrupted_run(
-                &plan,
-                cell_id,
-                request.cleanup,
-                false,
-                job.as_ref(),
+                InterruptedRunContext {
+                    plan: &plan,
+                    cell_id,
+                    cleanup_policy: request.cleanup,
+                    ambiguous: false,
+                    job: job.as_ref(),
+                    job_operations: None,
+                    operation_id: None,
+                    result: None,
+                },
                 observer,
             ));
         }
@@ -1686,13 +1869,86 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if observer.observe(&RunProgressEvent::ProviderStarted { cell_id }) == RunControl::Cancel {
             return Err(self.interrupted_run(
-                &plan,
-                cell_id,
-                request.cleanup,
-                false,
-                job.as_ref(),
+                InterruptedRunContext {
+                    plan: &plan,
+                    cell_id,
+                    cleanup_policy: request.cleanup,
+                    ambiguous: false,
+                    job: job.as_ref(),
+                    job_operations: None,
+                    operation_id: None,
+                    result: None,
+                },
                 observer,
             ));
+        }
+
+        let actions = actions.unwrap_or_default();
+        let job_id = job.as_ref().map(JobRunContext::job_id);
+        let mut job_operations = job.as_ref().map(|_| JobOperationManifest::new());
+
+        for copy in actions.copy_in {
+            let mut copy_operation_id = None;
+            let copy = self.copy_into_guest_for_job(
+                transport,
+                credentials,
+                JobGuestActionContext {
+                    cell_id,
+                    readiness: request.readiness,
+                    job_id,
+                },
+                copy,
+                |operation_id| copy_operation_id = Some(operation_id),
+            );
+            let copy = match copy {
+                Ok(report) => report,
+                Err(error) => {
+                    let (_, terminal) = guest_failure_class(&error);
+                    // A rejected or unreadable host input is known to occur
+                    // before guest transport.  Once an intent was recorded,
+                    // retain the existing unknown-effect policy instead.
+                    let ambiguous = copy_operation_id.is_some() && !terminal;
+                    let (cleanup, cleanup_error) =
+                        self.cleanup_failed_run(cell_id, request.cleanup, ambiguous, observer);
+                    return Err(run_cell_error(
+                        RunFailureContext::with_job_operations(
+                            Some(&plan),
+                            Some(cell_id),
+                            copy_operation_id,
+                            job.as_ref(),
+                            job_operations.as_ref(),
+                        ),
+                        RunStage::GuestCopyIn,
+                        cleanup,
+                        error,
+                        cleanup_error.as_ref(),
+                        None,
+                    ));
+                }
+            };
+            if let Some(manifest) = job_operations.as_mut() {
+                manifest.record_copy_in(&copy);
+            }
+            if observer.observe(&RunProgressEvent::CopyInCompleted {
+                cell_id,
+                operation_id: copy.operation_id,
+                size: copy.size,
+            }) == RunControl::Cancel
+            {
+                return Err(self.interrupted_run(
+                    InterruptedRunContext {
+                        plan: &plan,
+                        cell_id,
+                        cleanup_policy: request.cleanup,
+                        ambiguous: false,
+                        job: job.as_ref(),
+                        job_operations: job_operations.as_ref(),
+                        operation_id: Some(copy.operation_id),
+                        result: None,
+                    },
+                    observer,
+                ));
+            }
         }
 
         let mut guest_was_ready = false;
@@ -1706,6 +1962,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 command: request.command,
                 readiness: request.readiness,
             },
+            job_id,
             || {
                 guest_was_ready = true;
                 if observer.observe(&RunProgressEvent::GuestReady { cell_id }) == RunControl::Cancel
@@ -1735,11 +1992,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let (cleanup, cleanup_error) =
                     self.cleanup_failed_run(cell_id, request.cleanup, !terminal, observer);
                 return Err(run_cell_error(
-                    RunFailureContext::with_job(
+                    RunFailureContext::with_job_operations(
                         Some(&plan),
                         Some(cell_id),
                         guest_operation_id,
                         job.as_ref(),
+                        job_operations.as_ref(),
                     ),
                     stage,
                     cleanup,
@@ -1749,6 +2007,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 ));
             }
         };
+        if let Some(manifest) = job_operations.as_mut() {
+            manifest.record_command(execution.operation_id);
+        }
 
         let outcome = if execution.result.exit_code == 0 {
             RunOutcome::Success
@@ -1757,27 +2018,84 @@ impl<P: LocalVmProvider> CellEngine<P> {
         };
         if observer.observe(&RunProgressEvent::CommandCompleted {
             cell_id,
+            operation_id: execution.operation_id,
             exit_code: execution.result.exit_code,
         }) == RunControl::Cancel
         {
-            let error = EngineError::LifecycleConflict(
-                "run interruption was observed after the guest command completed".to_owned(),
-            );
-            let (cleanup, cleanup_error) =
-                self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
-            return Err(run_cell_error(
-                RunFailureContext::with_job(
-                    Some(&plan),
-                    Some(cell_id),
-                    Some(execution.operation_id),
-                    job.as_ref(),
-                ),
-                RunStage::Interrupted,
-                cleanup,
-                error,
-                cleanup_error.as_ref(),
-                Some(execution.result),
+            return Err(self.interrupted_run(
+                InterruptedRunContext {
+                    plan: &plan,
+                    cell_id,
+                    cleanup_policy: request.cleanup,
+                    ambiguous: false,
+                    job: job.as_ref(),
+                    job_operations: job_operations.as_ref(),
+                    operation_id: Some(execution.operation_id),
+                    result: Some(execution.result),
+                },
+                observer,
             ));
+        }
+
+        if let Some(artifacts) = actions.artifacts {
+            let mut artifact_operation_id = None;
+            let artifact = self.collect_artifacts_for_job(
+                transport,
+                credentials,
+                JobGuestActionContext {
+                    cell_id,
+                    readiness: request.readiness,
+                    job_id,
+                },
+                artifacts,
+                |operation_id| artifact_operation_id = Some(operation_id),
+            );
+            let artifact = match artifact {
+                Ok(report) => report,
+                Err(error) => {
+                    let (_, terminal) = guest_failure_class(&error);
+                    let ambiguous = artifact_operation_id.is_some() && !terminal;
+                    let (cleanup, cleanup_error) =
+                        self.cleanup_failed_run(cell_id, request.cleanup, ambiguous, observer);
+                    return Err(run_cell_error(
+                        RunFailureContext::with_job_operations(
+                            Some(&plan),
+                            Some(cell_id),
+                            artifact_operation_id,
+                            job.as_ref(),
+                            job_operations.as_ref(),
+                        ),
+                        RunStage::ArtifactCollection,
+                        cleanup,
+                        error,
+                        cleanup_error.as_ref(),
+                        Some(execution.result),
+                    ));
+                }
+            };
+            if let Some(manifest) = job_operations.as_mut() {
+                manifest.record_artifact(&artifact);
+            }
+            if observer.observe(&RunProgressEvent::ArtifactCollected {
+                cell_id,
+                operation_id: artifact.operation_id,
+                file_count: artifact.artifact.entries.len() as u32,
+            }) == RunControl::Cancel
+            {
+                return Err(self.interrupted_run(
+                    InterruptedRunContext {
+                        plan: &plan,
+                        cell_id,
+                        cleanup_policy: request.cleanup,
+                        ambiguous: false,
+                        job: job.as_ref(),
+                        job_operations: job_operations.as_ref(),
+                        operation_id: Some(artifact.operation_id),
+                        result: Some(execution.result),
+                    },
+                    observer,
+                ));
+            }
         }
 
         let cleanup = if request.cleanup.keep {
@@ -1807,11 +2125,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                         let _ = observer.observe(&RunProgressEvent::CleanupRefused { cell_id });
                     }
                     return Err(run_cell_error(
-                        RunFailureContext::with_job(
+                        RunFailureContext::with_job_operations(
                             Some(&plan),
                             Some(cell_id),
                             Some(execution.operation_id),
                             job.as_ref(),
+                            job_operations.as_ref(),
                         ),
                         RunStage::Cleanup,
                         disposition,
@@ -1829,6 +2148,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             job: job
                 .as_ref()
                 .map(|context| context.result_metadata(Utc::now())),
+            job_operations,
             cell_id,
             operation_id: execution.operation_id,
             outcome,
@@ -1839,24 +2159,30 @@ impl<P: LocalVmProvider> CellEngine<P> {
 
     fn interrupted_run<O: RunObserver>(
         &self,
-        plan: &RunExecutionPlan,
-        cell_id: CellId,
-        cleanup_policy: RunCleanupPolicy,
-        ambiguous: bool,
-        job: Option<&JobRunContext>,
+        context: InterruptedRunContext<'_>,
         observer: &mut O,
     ) -> RunCellError {
         let error =
             EngineError::LifecycleConflict("run interrupted at a safe checkpoint".to_owned());
-        let (cleanup, cleanup_error) =
-            self.cleanup_failed_run(cell_id, cleanup_policy, ambiguous, observer);
+        let (cleanup, cleanup_error) = self.cleanup_failed_run(
+            context.cell_id,
+            context.cleanup_policy,
+            context.ambiguous,
+            observer,
+        );
         run_cell_error(
-            RunFailureContext::with_job(Some(plan), Some(cell_id), None, job),
+            RunFailureContext::with_job_operations(
+                Some(context.plan),
+                Some(context.cell_id),
+                context.operation_id,
+                context.job,
+                context.job_operations,
+            ),
             RunStage::Interrupted,
             cleanup,
             error,
             cleanup_error.as_ref(),
-            None,
+            context.result,
         )
     }
 
@@ -1919,7 +2245,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
         credentials: &GuestCredentials,
         request: GuestExecRequest,
     ) -> Result<GuestExecReport, EngineError> {
-        self.exec_guest_with_ready_callback(transport, credentials, request, || Ok(()), |_| {})
+        self.exec_guest_with_ready_callback(
+            transport,
+            credentials,
+            request,
+            None,
+            || Ok(()),
+            |_| {},
+        )
     }
 
     pub fn exec_guest_observed<G, R>(
@@ -1933,7 +2266,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
         G: GuestTransport,
         R: FnOnce(GuestOperationId),
     {
-        self.exec_guest_with_ready_callback(transport, credentials, request, || Ok(()), on_recorded)
+        self.exec_guest_with_ready_callback(
+            transport,
+            credentials,
+            request,
+            None,
+            || Ok(()),
+            on_recorded,
+        )
     }
 
     fn exec_guest_with_ready_callback<G, F, R>(
@@ -1941,6 +2281,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         transport: &G,
         credentials: &GuestCredentials,
         request: GuestExecRequest,
+        job_id: Option<JobId>,
         on_ready: F,
         on_recorded: R,
     ) -> Result<GuestExecReport, EngineError>
@@ -1956,10 +2297,13 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let result = self.run_guest_operation(
             transport,
             credentials,
-            cell_id,
-            GuestOperationPlan {
-                kind: GuestOperationKind::Exec,
-                readiness: request.readiness,
+            GuestOperationDispatch {
+                cell_id,
+                job_id,
+                plan: GuestOperationPlan {
+                    kind: GuestOperationKind::Exec,
+                    readiness: request.readiness,
+                },
             },
             on_recorded,
             |authority, expected, operation_id| {
@@ -1992,9 +2336,71 @@ impl<P: LocalVmProvider> CellEngine<P> {
         credentials: &GuestCredentials,
         request: GuestCopyInRequest,
     ) -> Result<GuestCopyInReport, EngineError> {
+        self.copy_into_guest_with_job(transport, credentials, request, None, None, |_| {})
+    }
+
+    fn copy_into_guest_for_job<G, R>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        context: JobGuestActionContext,
+        action: JobCopyInAction,
+        on_recorded: R,
+    ) -> Result<GuestCopyInReport, EngineError>
+    where
+        G: GuestTransport,
+        R: FnOnce(GuestOperationId),
+    {
+        let source_root = action.source_root;
+        let source_sha256 = action.source_sha256;
+        let source_size = action.source_size;
+        self.copy_into_guest_with_job(
+            transport,
+            credentials,
+            GuestCopyInRequest {
+                cell_id: context.cell_id,
+                source: action.source,
+                destination: action.destination,
+                overwrite: action.overwrite,
+                timeout: action.timeout,
+                max_bytes: action.max_bytes,
+                readiness: context.readiness,
+            },
+            Some(JobCopySourceBinding {
+                root: source_root.as_path(),
+                sha256: source_sha256.as_str(),
+                size: source_size,
+            }),
+            context.job_id,
+            on_recorded,
+        )
+    }
+
+    fn copy_into_guest_with_job<G, R>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: GuestCopyInRequest,
+        source_binding: Option<JobCopySourceBinding<'_>>,
+        job_id: Option<JobId>,
+        on_recorded: R,
+    ) -> Result<GuestCopyInReport, EngineError>
+    where
+        G: GuestTransport,
+        R: FnOnce(GuestOperationId),
+    {
         validate_guest_timeout_and_size(request.timeout, request.max_bytes)?;
         validate_readiness_policy(request.readiness)?;
-        let content = read_ordinary_copy_source(&request.source, request.max_bytes)?;
+        let content = match source_binding {
+            Some(binding) => read_job_copy_source(
+                binding.root,
+                &request.source,
+                request.max_bytes,
+                binding.sha256,
+                binding.size,
+            )?,
+            None => read_ordinary_copy_source(&request.source, request.max_bytes)?,
+        };
         let cell_id = request.cell_id;
         let destination = request.destination;
         let overwrite = request.overwrite;
@@ -2003,12 +2409,15 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.run_guest_operation(
             transport,
             credentials,
-            cell_id,
-            GuestOperationPlan {
-                kind: GuestOperationKind::CopyIn,
-                readiness: request.readiness,
+            GuestOperationDispatch {
+                cell_id,
+                job_id,
+                plan: GuestOperationPlan {
+                    kind: GuestOperationKind::CopyIn,
+                    readiness: request.readiness,
+                },
             },
-            |_| {},
+            on_recorded,
             |authority, expected, operation_id| {
                 transport.copy_in(
                     authority,
@@ -2054,6 +2463,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 readiness: request.readiness,
             },
             GuestOperationKind::CopyOut,
+            None,
+            |_| {},
         )
     }
 
@@ -2068,6 +2479,36 @@ impl<P: LocalVmProvider> CellEngine<P> {
             credentials,
             request,
             GuestOperationKind::ArtifactCollect,
+            None,
+            |_| {},
+        )
+    }
+
+    fn collect_artifacts_for_job<G, R>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        context: JobGuestActionContext,
+        action: JobArtifactAction,
+        on_recorded: R,
+    ) -> Result<ArtifactReport, EngineError>
+    where
+        G: GuestTransport,
+        R: FnOnce(GuestOperationId),
+    {
+        self.collect_artifacts_with_kind(
+            transport,
+            credentials,
+            ArtifactCollectRequest {
+                cell_id: context.cell_id,
+                sources: action.sources,
+                timeout: action.timeout,
+                max_bytes_per_file: action.max_bytes_per_file,
+                readiness: context.readiness,
+            },
+            GuestOperationKind::ArtifactCollect,
+            context.job_id,
+            on_recorded,
         )
     }
 
@@ -2825,13 +3266,19 @@ impl<P: LocalVmProvider> CellEngine<P> {
         Ok(())
     }
 
-    fn collect_artifacts_with_kind<G: GuestTransport>(
+    fn collect_artifacts_with_kind<G, R>(
         &self,
         transport: &G,
         credentials: &GuestCredentials,
         request: ArtifactCollectRequest,
         kind: GuestOperationKind,
-    ) -> Result<ArtifactReport, EngineError> {
+        job_id: Option<JobId>,
+        on_recorded: R,
+    ) -> Result<ArtifactReport, EngineError>
+    where
+        G: GuestTransport,
+        R: FnOnce(GuestOperationId),
+    {
         validate_guest_timeout_and_size(request.timeout, request.max_bytes_per_file)?;
         validate_readiness_policy(request.readiness)?;
         if request.sources.is_empty() || request.sources.len() > MAX_ARTIFACT_FILES {
@@ -2857,12 +3304,15 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.run_guest_operation(
             transport,
             credentials,
-            cell_id,
-            GuestOperationPlan {
-                kind,
-                readiness: request.readiness,
+            GuestOperationDispatch {
+                cell_id,
+                job_id,
+                plan: GuestOperationPlan {
+                    kind,
+                    readiness: request.readiness,
+                },
             },
-            |_| {},
+            on_recorded,
             |authority, expected, operation_id| {
                 let artifact_guard = self.state.prepare_artifact_root(cell_id, operation_id)?;
                 let mut entries = Vec::with_capacity(sources.len());
@@ -2897,6 +3347,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     cell_id,
                     created_at: Utc::now(),
                     entries,
+                    job_id,
                 };
                 self.state.save_artifact_new(&artifact_guard, &artifact)?;
                 Ok((
@@ -2919,8 +3370,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         transport: &G,
         credentials: &GuestCredentials,
-        cell_id: CellId,
-        plan: GuestOperationPlan,
+        dispatch: GuestOperationDispatch,
         on_recorded: R,
         action: F,
     ) -> Result<T, EngineError>
@@ -2935,6 +3385,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
     {
         self.require_provider()?;
         let mutation = self.state.acquire_mutation_lock()?;
+        let cell_id = dispatch.cell_id;
         let record = self.state.load_cell(cell_id)?;
         require_lifecycle_state(&record, "run a guest operation on", &[CellState::Running])?;
         if record.phase != CellPhase::Ready {
@@ -2968,7 +3419,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             return Err(EngineError::UnexpectedPowerState(expected.power_state));
         }
 
-        let mut operation = GuestOperationRecord::intent(cell_id, plan.kind, Utc::now());
+        let mut operation = GuestOperationRecord::intent_with_job(
+            cell_id,
+            dispatch.plan.kind,
+            Utc::now(),
+            dispatch.job_id,
+        );
         self.state.save_guest_operation(&operation)?;
         on_recorded(operation.id);
         let execution = (|| {
@@ -2989,7 +3445,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 &authority,
                 &expected,
                 credentials,
-                plan.readiness,
+                dispatch.plan.readiness,
             )?;
             action(&authority, &expected, operation.id)
         })();
@@ -3063,12 +3519,24 @@ fn durable_error_code(error: &EngineError) -> &'static str {
     }
 }
 
+struct InterruptedRunContext<'a> {
+    plan: &'a RunExecutionPlan,
+    cell_id: CellId,
+    cleanup_policy: RunCleanupPolicy,
+    ambiguous: bool,
+    job: Option<&'a JobRunContext>,
+    job_operations: Option<&'a JobOperationManifest>,
+    operation_id: Option<GuestOperationId>,
+    result: Option<GuestCommandResult>,
+}
+
 #[derive(Clone, Copy)]
 struct RunFailureContext<'a> {
     plan: Option<&'a RunExecutionPlan>,
     cell_id: Option<CellId>,
     operation_id: Option<GuestOperationId>,
     job: Option<&'a JobRunContext>,
+    job_operations: Option<&'a JobOperationManifest>,
 }
 
 impl<'a> RunFailureContext<'a> {
@@ -3082,6 +3550,7 @@ impl<'a> RunFailureContext<'a> {
             cell_id,
             operation_id,
             job: None,
+            job_operations: None,
         }
     }
 
@@ -3096,6 +3565,23 @@ impl<'a> RunFailureContext<'a> {
             cell_id,
             operation_id,
             job,
+            job_operations: None,
+        }
+    }
+
+    const fn with_job_operations(
+        plan: Option<&'a RunExecutionPlan>,
+        cell_id: Option<CellId>,
+        operation_id: Option<GuestOperationId>,
+        job: Option<&'a JobRunContext>,
+        job_operations: Option<&'a JobOperationManifest>,
+    ) -> Self {
+        Self {
+            plan,
+            cell_id,
+            operation_id,
+            job,
+            job_operations,
         }
     }
 }
@@ -3113,6 +3599,7 @@ fn run_cell_error(
             schema_version: AUTOMATION_SCHEMA_VERSION,
             plan: context.plan.cloned(),
             job: context.job.map(|job| job.result_metadata(Utc::now())),
+            job_operations: context.job_operations.cloned(),
             cell_id: context.cell_id,
             operation_id: context.operation_id,
             stage,
@@ -3242,6 +3729,75 @@ fn validate_guest_command_result(
         return Err(GuestIoError::InvalidResponse.into());
     }
     Ok(())
+}
+
+/// Bind one already-validated lexical job input beneath the canonical job-spec
+/// directory.  The opaque action retains only a bounded content digest and
+/// size; it never serializes source bytes or the host path into a result.
+fn bind_job_copy_source(
+    root: &Path,
+    source: &Path,
+    max_bytes: u64,
+) -> Result<(PathBuf, String, u64), EngineError> {
+    let canonical_root = root.canonicalize().map_err(|_| {
+        EngineError::Integrity("job specification parent is no longer available".to_owned())
+    })?;
+    let candidate = canonical_root.join(source);
+    if !candidate.starts_with(&canonical_root) {
+        return Err(GuestIoError::PathViolation.into());
+    }
+    // Open through the lexical in-root path before canonicalizing it.  This
+    // preserves the ordinary-file/no-reparse policy for a source that is
+    // swapped to a link or reparse point between parsing and dispatch.
+    let bytes = read_ordinary_copy_source(&candidate, max_bytes)?;
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| EngineError::InvalidCellRequest("job copy-in source is absent".to_owned()))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(GuestIoError::PathViolation.into());
+    }
+    Ok((
+        candidate,
+        format!("{:x}", Sha256::digest(&bytes)),
+        bytes.len() as u64,
+    ))
+}
+
+/// Revalidate the canonical job-input binding immediately before copying.  A
+/// replacement, reparse traversal, or containment escape is a bounded copy
+/// failure and is never replayed by job orchestration.
+fn read_job_copy_source(
+    root: &Path,
+    source: &Path,
+    max_bytes: u64,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<Vec<u8>, EngineError> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| EngineError::Integrity("job input root is no longer available".to_owned()))?;
+    let current = source
+        .canonicalize()
+        .map_err(|_| EngineError::InvalidCellRequest("job copy-in source is absent".to_owned()))?;
+    if !current.starts_with(&canonical_root) {
+        return Err(GuestIoError::PathViolation.into());
+    }
+    if !paths_equal(&current, source) {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    let bytes = read_ordinary_copy_source(source, max_bytes)?;
+    let rechecked = source
+        .canonicalize()
+        .map_err(|_| GuestIoError::PartialCopy)?;
+    if !rechecked.starts_with(&canonical_root) || !paths_equal(&rechecked, source) {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    if bytes.len() as u64 != expected_size
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_sha256
+    {
+        return Err(GuestIoError::PartialCopy.into());
+    }
+    Ok(bytes)
 }
 
 fn read_ordinary_copy_source(path: &Path, max_bytes: u64) -> Result<Vec<u8>, EngineError> {
@@ -5017,9 +5573,54 @@ mod tests {
             timeout: StdDuration::from_secs(30),
             max_output_bytes: 1024,
         };
-        JobRunRequest::new(
+        JobRunRequest::new_with_actions(
             request,
             JobRunContext::new("a".repeat(64), Utc::now()).unwrap(),
+            JobRunActions::default(),
+        )
+    }
+
+    fn job_run_request_with_actions(
+        image: ImageId,
+        source_root: &Path,
+        source: Option<PathBuf>,
+        keep: bool,
+        collect_artifacts: bool,
+    ) -> JobRunRequest {
+        let mut request = run_request(image);
+        request.command = GuestCommand {
+            program: "job-command-secret".to_owned(),
+            args: vec!["job-argument-secret".to_owned()],
+            timeout: StdDuration::from_secs(30),
+            max_output_bytes: 1024,
+        };
+        request.cleanup.keep = keep;
+        let source_root = source_root.canonicalize().unwrap();
+        let copy_in = source
+            .into_iter()
+            .map(|source| {
+                let bytes = fs::read(&source).unwrap();
+                JobCopyInAction {
+                    source: source.canonicalize().unwrap(),
+                    source_root: source_root.clone(),
+                    source_sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    source_size: bytes.len() as u64,
+                    destination: GuestPath::parse("inputs/data.bin").unwrap(),
+                    overwrite: OverwritePolicy::Deny,
+                    timeout: StdDuration::from_secs(30),
+                    max_bytes: 1024,
+                }
+            })
+            .collect();
+        let artifacts = collect_artifacts.then(|| JobArtifactAction {
+            sources: vec![GuestPath::parse("results/output.bin").unwrap()],
+            timeout: StdDuration::from_secs(30),
+            max_bytes_per_file: 16,
+        });
+        JobRunRequest::new_with_actions(
+            request,
+            JobRunContext::new("c".repeat(64), Utc::now()).unwrap(),
+            JobRunActions { copy_in, artifacts },
         )
     }
 
@@ -5463,17 +6064,309 @@ mod tests {
     }
 
     #[test]
-    fn job_request_derives_selection_from_validated_spec_and_defers_operations() {
-        let (_directory, engine, image_id) = fixture();
+    fn job_run_orders_copy_exec_and_artifact_with_durable_correlation() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        let source = directory.path().join("job-input-secret.bin");
+        fs::write(&source, b"job-copy-bytes").unwrap();
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([
+                GuestReadiness::Ready,
+                GuestReadiness::Ready,
+                GuestReadiness::Ready,
+            ]);
+            state.copy_out = VecDeque::from([b"artifact-bytes".to_vec()]);
+        }
+
+        let report = engine
+            .run_job_cell(
+                &guest,
+                &credentials,
+                job_run_request_with_actions(image_id, directory.path(), Some(source), false, true),
+            )
+            .unwrap();
+
+        let job = report.job.as_ref().unwrap();
+        let operations = report.job_operations.as_ref().unwrap();
+        assert_eq!(operations.contract, JOB_OPERATION_MANIFEST_CONTRACT);
+        assert_eq!(operations.copy_in.len(), 1);
+        assert_eq!(operations.command_operation_id, Some(report.operation_id));
+        assert_eq!(operations.artifacts.len(), 1);
+        assert_eq!(operations.artifacts[0].file_count, 1);
+        assert_eq!(operations.artifacts[0].total_bytes, 14);
+        assert_eq!(report.cleanup, RunCleanupDisposition::Destroyed);
+
+        let cell = engine.state.load_cell(report.cell_id).unwrap();
+        assert_eq!(
+            cell.job.as_ref().map(|value| value.job_id),
+            Some(job.job_id)
+        );
+        assert_eq!(cell.job.as_ref().unwrap().job_spec_sha256, "c".repeat(64));
+        let durable_operations = engine.list_guest_operations(Some(report.cell_id)).unwrap();
+        assert_eq!(durable_operations.len(), 3);
+        assert!(
+            durable_operations
+                .iter()
+                .all(|operation| operation.job_id == Some(job.job_id))
+        );
+        let artifact = engine
+            .inspect_artifact(report.cell_id, operations.artifacts[0].operation_id)
+            .unwrap();
+        assert_eq!(artifact.job_id, Some(job.job_id));
+
+        assert_eq!(
+            guest.state.lock().unwrap().calls,
+            [
+                "probe_ready",
+                "copy_in",
+                "probe_ready",
+                "exec",
+                "probe_ready",
+                "copy_out"
+            ]
+        );
+        let encoded = serde_json::to_string(&report).unwrap();
+        for forbidden in [
+            "job-input-secret.bin",
+            "inputs/data.bin",
+            "results/output.bin",
+            "job-copy-bytes",
+            "artifact-bytes",
+            "job-command-secret",
+            "job-argument-secret",
+            "credential-sentinel",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn job_nonzero_command_collects_declared_artifacts_before_cleanup() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready, GuestReadiness::Ready]);
+            state.exec_result.exit_code = 23;
+            state.copy_out = VecDeque::from([b"known-nonzero".to_vec()]);
+        }
+
+        let report = engine
+            .run_job_cell(
+                &guest,
+                &credentials,
+                job_run_request_with_actions(image_id, directory.path(), None, false, true),
+            )
+            .unwrap();
+
+        assert_eq!(report.outcome, RunOutcome::GuestNonZero);
+        assert_eq!(report.cleanup, RunCleanupDisposition::Destroyed);
+        assert_eq!(report.job_operations.as_ref().unwrap().artifacts.len(), 1);
+        assert_eq!(
+            guest.state.lock().unwrap().calls,
+            ["probe_ready", "exec", "probe_ready", "copy_out"]
+        );
+    }
+
+    #[test]
+    fn job_unknown_copy_effect_is_retained_and_never_replayed() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        let source = directory.path().join("job-input.bin");
+        fs::write(&source, b"job-copy-bytes").unwrap();
+        guest.state.lock().unwrap().failure = Some(InjectedGuestFailure::Timeout);
+
+        let error = engine
+            .run_job_cell(
+                &guest,
+                &credentials,
+                job_run_request_with_actions(
+                    image_id,
+                    directory.path(),
+                    Some(source),
+                    false,
+                    false,
+                ),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::GuestCopyIn);
+        assert_eq!(
+            error.report().cleanup,
+            RunCleanupDisposition::RefusedAmbiguous
+        );
+        let cell_id = error.report().cell_id.unwrap();
+        let operation_id = error.report().operation_id.unwrap();
+        let operation = engine.inspect_guest_operation(operation_id).unwrap();
+        assert_eq!(operation.phase, GuestOperationPhase::TransportActive);
+        assert_eq!(
+            operation.job_id,
+            error.report().job.as_ref().map(|job| job.job_id)
+        );
+        assert!(matches!(
+            engine.exec_guest(
+                &guest,
+                &credentials,
+                GuestExecRequest {
+                    cell_id,
+                    command: GuestCommand {
+                        program: "cmd.exe".to_owned(),
+                        args: vec!["/c".to_owned(), "exit 0".to_owned()],
+                        timeout: StdDuration::from_secs(1),
+                        max_output_bytes: 1024,
+                    },
+                    readiness: readiness_for_test(),
+                },
+            ),
+            Err(EngineError::LifecycleConflict(_))
+        ));
+        assert!(!guest.state.lock().unwrap().calls.contains(&"exec"));
+    }
+
+    #[test]
+    fn job_copy_source_replacement_is_rejected_before_guest_transport() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        let source = directory.path().join("job-input.bin");
+        fs::write(&source, b"bound-job-input").unwrap();
+        let request = job_run_request_with_actions(
+            image_id,
+            directory.path(),
+            Some(source.clone()),
+            false,
+            false,
+        );
+
+        // The opaque request was bound to the original bytes. A same-user
+        // replacement before dispatch must fail before readiness or guest I/O.
+        fs::write(&source, b"replaced-job-input").unwrap();
+        let error = engine
+            .run_job_cell(&guest, &credentials, request)
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::GuestCopyIn);
+        assert_eq!(error.report().cleanup, RunCleanupDisposition::Destroyed);
+        assert!(error.report().operation_id.is_none());
+        assert!(guest.state.lock().unwrap().calls.is_empty());
+        assert!(
+            engine
+                .list_guest_operations(error.report().cell_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_copy_source_binding_rejects_in_root_reparse() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.bin");
+        let source = directory.path().join("linked.bin");
+        fs::write(&target, b"job-copy-content").unwrap();
+        if std::os::windows::fs::symlink_file(&target, &source).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            bind_job_copy_source(directory.path(), Path::new("linked.bin"), 1024),
+            Err(EngineError::Guest(GuestIoError::PathViolation))
+        ));
+    }
+
+    #[test]
+    fn job_artifact_failure_keeps_completed_command_result_and_refuses_cleanup() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        // The artifact action permits 16 bytes; the mock turns the larger
+        // provider reply into a bounded output-limit ambiguity after command
+        // completion.
+        {
+            let mut state = guest.state.lock().unwrap();
+            state.readiness = VecDeque::from([GuestReadiness::Ready, GuestReadiness::Ready]);
+            state.copy_out = VecDeque::from([vec![0_u8; 17]]);
+        }
+
+        let error = engine
+            .run_job_cell(
+                &guest,
+                &credentials,
+                job_run_request_with_actions(image_id, directory.path(), None, false, true),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::ArtifactCollection);
+        assert_eq!(
+            error.report().cleanup,
+            RunCleanupDisposition::RefusedAmbiguous
+        );
+        assert_eq!(
+            error
+                .report()
+                .result
+                .as_ref()
+                .map(|result| result.exit_code),
+            Some(0)
+        );
+        let operations = error.report().job_operations.as_ref().unwrap();
+        assert!(operations.command_operation_id.is_some());
+        assert!(operations.artifacts.is_empty());
+        let artifact_operation = engine
+            .inspect_guest_operation(error.report().operation_id.unwrap())
+            .unwrap();
+        assert_eq!(
+            artifact_operation.phase,
+            GuestOperationPhase::TransportActive
+        );
+    }
+
+    #[test]
+    fn direct_operation_on_retained_job_cell_is_not_retroactively_attributed() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        let job_report = engine
+            .run_job_cell(
+                &guest,
+                &credentials,
+                job_run_request_with_actions(image_id, directory.path(), None, true, false),
+            )
+            .unwrap();
+        let cell = engine.state.load_cell(job_report.cell_id).unwrap();
+        assert!(cell.job.is_some());
+        guest.state.lock().unwrap().readiness = VecDeque::from([GuestReadiness::Ready]);
+
+        let direct = engine
+            .exec_guest(
+                &guest,
+                &credentials,
+                GuestExecRequest {
+                    cell_id: job_report.cell_id,
+                    command: GuestCommand {
+                        program: "cmd.exe".to_owned(),
+                        args: vec!["/c".to_owned(), "exit 0".to_owned()],
+                        timeout: StdDuration::from_secs(1),
+                        max_output_bytes: 1024,
+                    },
+                    readiness: readiness_for_test(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .inspect_guest_operation(direct.operation_id)
+                .unwrap()
+                .job_id,
+            None
+        );
+        engine.destroy_cell(job_report.cell_id).unwrap();
+    }
+
+    #[test]
+    fn job_request_derives_selection_and_binds_declared_operations() {
+        let (directory, engine, image_id) = fixture();
         let image = engine.state.load_image(&image_id).unwrap();
         let host = HostPlatform {
             os: crate::core::support::HostOs::Windows,
             architecture: Architecture::X86_64,
         };
-        let loaded = LoadedJobSpec {
-            path: PathBuf::from("job-secret-path.toml"),
-            source_sha256: "b".repeat(64),
-            spec: crate::core::job_spec::parse_job_spec(
+        let loaded = LoadedJobSpec::from_validated_parts_for_test(
+            directory.path().join("job-secret-path.toml"),
+            "b".repeat(64),
+            crate::core::job_spec::parse_job_spec(
                 r#"
 schema_version = 1
 image = "windows-dev"
@@ -5490,7 +6383,7 @@ keep_on_failure = false
 "#,
             )
             .unwrap(),
-        };
+        );
         let probe = engine.provider.probe();
         let (plan, request) = build_job_run_request(&loaded, host, &image, &[probe]).unwrap();
 
@@ -5509,8 +6402,10 @@ keep_on_failure = false
             "job-command-secret"
         );
 
-        let with_artifact = LoadedJobSpec {
-            spec: crate::core::job_spec::parse_job_spec(
+        let with_artifact = LoadedJobSpec::from_validated_parts_for_test(
+            loaded.path().to_path_buf(),
+            loaded.source_sha256().to_owned(),
+            crate::core::job_spec::parse_job_spec(
                 r#"
 schema_version = 1
 image = "windows-dev"
@@ -5522,17 +6417,31 @@ program = "cmd.exe"
 
 [cleanup]
 
+[[copy_in]]
+source = "job-input.bin"
+destination = "inputs/job-input.bin"
+
 [artifacts]
 sources = ["results/output.txt"]
 "#,
             )
             .unwrap(),
-            ..loaded
-        };
+        );
+        let input = directory.path().join("job-input.bin");
+        fs::write(&input, b"validated input").unwrap();
         engine.provider.state.lock().unwrap().calls.clear();
-        assert!(matches!(
-            build_job_run_request(&with_artifact, host, &image, &[engine.provider.probe()]),
-            Err(EngineError::InvalidCellRequest(_))
+        let (_, artifact_request) =
+            build_job_run_request(&with_artifact, host, &image, &[engine.provider.probe()])
+                .unwrap();
+        assert!(artifact_request.actions.artifacts.is_some());
+        assert_eq!(artifact_request.actions.copy_in.len(), 1);
+        assert_eq!(
+            artifact_request.actions.copy_in[0].source,
+            input.canonicalize().unwrap()
+        );
+        assert!(paths_equal(
+            &artifact_request.actions.copy_in[0].source_root,
+            &directory.path().canonicalize().unwrap()
         ));
         assert!(engine.state.list_cells().unwrap().is_empty());
         assert!(engine.provider.state.lock().unwrap().calls.is_empty());
@@ -5541,7 +6450,7 @@ sources = ["results/output.txt"]
     #[test]
     fn tampered_job_request_is_rejected_before_state_or_provider_mutation() {
         let (_directory, engine, image_id, guest, credentials) = run_fixture();
-        let mut request = job_run_request(image_id);
+        let mut request = job_run_request(image_id.clone());
         request.request.command.program = "tampered-command".to_owned();
         engine.provider.state.lock().unwrap().calls.clear();
 
@@ -5551,6 +6460,19 @@ sources = ["results/output.txt"]
 
         assert_eq!(error.report().stage, RunStage::RequestValidation);
         assert!(error.report().job.is_some());
+        assert!(engine.state.list_cells().unwrap().is_empty());
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+
+        let mut action_request = job_run_request(image_id);
+        action_request.actions.artifacts = Some(JobArtifactAction {
+            sources: vec![GuestPath::parse("forged-artifact.bin").unwrap()],
+            timeout: StdDuration::from_secs(30),
+            max_bytes_per_file: 1024,
+        });
+        let error = engine
+            .run_job_cell(&guest, &credentials, action_request)
+            .unwrap_err();
+        assert_eq!(error.report().stage, RunStage::RequestValidation);
         assert!(engine.state.list_cells().unwrap().is_empty());
         assert!(engine.provider.state.lock().unwrap().calls.is_empty());
     }
@@ -6917,6 +7839,7 @@ sources = ["results/output.txt"]
             GuestOperationRecord::intent(cell.id, GuestOperationKind::ArtifactCollect, Utc::now());
         committed.phase = GuestOperationPhase::ArtifactCommitted;
         committed.artifact_id = Some(committed.id);
+        engine.state.save_guest_operation(&committed).unwrap();
         let artifact_guard = engine
             .state
             .prepare_artifact_root(cell.id, committed.id)
@@ -6937,12 +7860,12 @@ sources = ["results/output.txt"]
                 sha256: format!("{:x}", Sha256::digest(b"recovery-artifact")),
                 size: 17,
             }],
+            job_id: None,
         };
         engine
             .state
             .save_artifact_new(&artifact_guard, &artifact)
             .unwrap();
-        engine.state.save_guest_operation(&committed).unwrap();
         let report = engine.reconcile_guest_operation(committed.id).unwrap();
         assert_eq!(
             report.disposition,

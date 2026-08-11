@@ -252,7 +252,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         } => {
             let loaded = load_job_spec(&spec)?;
             let state = StateStore::new(state_root.unwrap_or_else(StateStore::default_root));
-            let image = state.load_image(&loaded.spec.image)?;
+            let image = state.load_image(&loaded.spec().image)?;
             let plan = resolve_job_plan(
                 &loaded,
                 HostPlatform::current()?,
@@ -273,7 +273,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let root = state_root.unwrap_or_else(StateStore::default_root);
             let state = StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout);
             let loaded = load_job_spec(&spec)?;
-            let image = state.load_image(&loaded.spec.image)?;
+            let image = state.load_image(&loaded.spec().image)?;
             let host = HostPlatform::current()?;
             let probes = builtin_provider_probes();
             let plan = resolve_job_plan(&loaded, host, &image, &probes)?;
@@ -2028,15 +2028,20 @@ fn write_cell_summary(
     now: chrono::DateTime<chrono::Utc>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
+    let job = cell.job.as_ref().map_or_else(
+        || "none".to_owned(),
+        |correlation| correlation.job_id.to_string(),
+    );
     writeln!(
         output,
-        "cell={} provider={} image={} state={} phase={} retention={} last_error={}",
+        "cell={} provider={} image={} state={} phase={} retention={} job={} last_error={}",
         cell.id,
         cell.provider,
         cell.image.image_id,
         cell_state_name(cell.state),
         cell_phase_name(cell.phase),
         cell_retention(cell, now),
+        job,
         cell.last_error.as_deref().unwrap_or("none")
     )
 }
@@ -2098,11 +2103,15 @@ fn write_guest_operation(
     operation: &GuestOperationRecord,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
+    let job = operation
+        .job_id
+        .map_or_else(|| "none".to_owned(), |job_id| job_id.to_string());
     writeln!(
         output,
-        "operation={} cell={} kind={} phase={} failure={} action={} updated_at={}",
+        "operation={} cell={} job={} kind={} phase={} failure={} action={} updated_at={}",
         operation.id,
         operation.cell_id,
+        job,
         guest_operation_kind_name(operation.kind),
         guest_operation_phase_name(operation.phase),
         operation.failure.map_or("none", guest_failure_class_name),
@@ -2533,7 +2542,20 @@ fn write_human_run_result(
             report.cell_id,
             report.result.exit_code,
             report.cleanup.as_str()
-        )
+        )?;
+        if let Some(operations) = &report.job_operations {
+            writeln!(
+                stderr,
+                "vmcell: job operations: copy_in={} command_operation={} artifacts={}",
+                operations.copy_in.len(),
+                operations
+                    .command_operation_id
+                    .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                operations.artifacts.len(),
+            )
+        } else {
+            Ok(())
+        }
     } else {
         writeln!(
             stderr,
@@ -2607,9 +2629,31 @@ impl<W: Write, F: Fn() -> bool> RunObserver for HumanRunObserver<W, F> {
             RunProgressEvent::GuestReady { cell_id } => {
                 self.line(format_args!("guest ready: {cell_id}"));
             }
-            RunProgressEvent::CommandCompleted { cell_id, exit_code } => {
+            RunProgressEvent::CommandCompleted {
+                cell_id,
+                operation_id,
+                exit_code,
+            } => {
                 self.line(format_args!(
-                    "command completed: cell={cell_id} exit={exit_code}"
+                    "command completed: cell={cell_id} operation={operation_id} exit={exit_code}"
+                ));
+            }
+            RunProgressEvent::CopyInCompleted {
+                cell_id,
+                operation_id,
+                size,
+            } => {
+                self.line(format_args!(
+                    "copy-in completed: cell={cell_id} operation={operation_id} bytes={size}"
+                ));
+            }
+            RunProgressEvent::ArtifactCollected {
+                cell_id,
+                operation_id,
+                file_count,
+            } => {
+                self.line(format_args!(
+                    "artifacts collected: cell={cell_id} operation={operation_id} files={file_count}"
                 ));
             }
             RunProgressEvent::CleanupStarted { cell_id } => {
@@ -2950,6 +2994,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             expires_at,
             last_error: None,
+            job: None,
         }
     }
 
@@ -2967,6 +3012,7 @@ mod tests {
             schema_version: 1,
             plan: Some(test_run_plan()),
             job: None,
+            job_operations: None,
             cell_id: vm_cell_manager::core::cell::CellId::new(),
             operation_id: vm_cell_manager::core::guest::GuestOperationId::new(),
             outcome: vm_cell_manager::engine::RunOutcome::GuestNonZero,
@@ -3155,6 +3201,7 @@ mod tests {
     fn human_run_observer_reports_safe_lifecycle_progress() {
         let image = "windows-dev".parse().unwrap();
         let cell_id = vm_cell_manager::core::cell::CellId::new();
+        let operation_id = vm_cell_manager::core::guest::GuestOperationId::new();
         let mut observer = HumanRunObserver::new(Vec::new());
         for event in [
             RunProgressEvent::ImageVerified { image },
@@ -3163,7 +3210,18 @@ mod tests {
             RunProgressEvent::GuestReady { cell_id },
             RunProgressEvent::CommandCompleted {
                 cell_id,
+                operation_id,
                 exit_code: 0,
+            },
+            RunProgressEvent::CopyInCompleted {
+                cell_id,
+                operation_id,
+                size: 17,
+            },
+            RunProgressEvent::ArtifactCollected {
+                cell_id,
+                operation_id,
+                file_count: 1,
             },
             RunProgressEvent::CleanupStarted { cell_id },
             RunProgressEvent::CellDestroyed { cell_id },
@@ -3181,7 +3239,15 @@ mod tests {
         assert!(output.contains(&format!("vmcell: cell created: {cell_id}")));
         assert!(output.contains(&format!("vmcell: provider started: {cell_id}")));
         assert!(output.contains(&format!("vmcell: guest ready: {cell_id}")));
-        assert!(output.contains(&format!("vmcell: command completed: cell={cell_id} exit=0")));
+        assert!(output.contains(&format!(
+            "vmcell: command completed: cell={cell_id} operation={operation_id} exit=0"
+        )));
+        assert!(output.contains(&format!(
+            "vmcell: copy-in completed: cell={cell_id} operation={operation_id} bytes=17"
+        )));
+        assert!(output.contains(&format!(
+            "vmcell: artifacts collected: cell={cell_id} operation={operation_id} files=1"
+        )));
         assert!(output.contains(&format!("vmcell: cleanup started: {cell_id}")));
         assert!(output.contains(&format!("vmcell: cell destroyed: {cell_id}")));
         assert!(output.contains(&format!(
@@ -3288,6 +3354,8 @@ mod tests {
         let mut operation =
             GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, chrono::Utc::now());
         operation.phase = GuestOperationPhase::TransportActive;
+        let job_id = vm_cell_manager::core::job::JobId::new();
+        operation.job_id = Some(job_id);
         let mut output = Vec::new();
 
         write_guest_operation(&operation, &mut output).unwrap();
@@ -3295,14 +3363,32 @@ mod tests {
 
         assert!(output.contains("phase=transport_active"));
         assert!(output.contains("action=manual_review"));
+        assert!(output.contains(&format!("job={job_id}")));
         assert_eq!(
             guest_operation_required_action(operation.phase),
             RequiredAction::ManualReview
         );
 
+        let mut correlated_cell = test_cell(CellState::Running, None);
+        correlated_cell.job = Some(
+            vm_cell_manager::core::job::JobCorrelation::new(
+                job_id,
+                "a".repeat(64),
+                chrono::Utc::now(),
+            )
+            .unwrap(),
+        );
+        let mut cell_output = Vec::new();
+        write_cell_summary(&correlated_cell, chrono::Utc::now(), &mut cell_output).unwrap();
+        assert!(
+            String::from_utf8(cell_output)
+                .unwrap()
+                .contains(&format!("job={job_id}"))
+        );
+
         let inspection = CellInspection {
             schema_version: 1,
-            cell: test_cell(CellState::Running, None),
+            cell: correlated_cell,
             provider_vm: None,
             classification: vm_cell_manager::engine::ReconciliationClassification {
                 code: vm_cell_manager::engine::ReconciliationCode::ExactOwned,

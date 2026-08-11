@@ -15,8 +15,8 @@ use crate::core::job::JobResultMetadata;
 use crate::core::job_spec::JobSpecError;
 use crate::core::run_selection::{RunExecutionPlan, RunSelectionError};
 use crate::engine::{
-    CellInspection, EngineError, ImageValidationReport, RunCellError, RunCleanupDisposition,
-    RunFailureReport, RunStage,
+    CellInspection, EngineError, ImageValidationReport, JobOperationManifest, RunCellError,
+    RunCleanupDisposition, RunFailureReport, RunStage,
 };
 use crate::guest::{
     DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES, GuestIoError, GuestPath, OverwritePolicy,
@@ -810,6 +810,8 @@ pub struct RunErrorReport {
     pub plan: Option<RunExecutionPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job: Option<JobResultMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_operations: Option<JobOperationManifest>,
     pub cell_id: Option<CellId>,
     pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
@@ -825,6 +827,7 @@ impl From<&RunFailureReport> for RunErrorReport {
             schema_version: report.schema_version,
             plan: report.plan.clone(),
             job: report.job.clone(),
+            job_operations: report.job_operations.clone(),
             cell_id: report.cell_id,
             operation_id: report.operation_id,
             stage: report.stage,
@@ -1221,7 +1224,8 @@ fn classify_state_error(error: &StateError) -> CliErrorClassification {
         | StateError::IdentityMismatch { .. }
         | StateError::UnsupportedSchema { .. }
         | StateError::ArtifactIntegrity { .. }
-        | StateError::GuestOperationIntegrity { .. } => classification(
+        | StateError::GuestOperationIntegrity { .. }
+        | StateError::JobCorrelationIntegrity { .. } => classification(
             "vmcell.state.integrity",
             CliErrorCategory::Integrity,
             CliExitCode::Integrity,
@@ -1529,6 +1533,7 @@ mod tests {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             plan: Some(test_run_plan()),
             job: Some(job.clone()),
+            job_operations: None,
             cell_id: Some(CellId::new()),
             operation_id: Some(GuestOperationId::new()),
             stage: RunStage::Cleanup,
