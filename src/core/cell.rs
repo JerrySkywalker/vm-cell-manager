@@ -10,7 +10,13 @@ use super::image::{ImageBinding, ImageId};
 use super::job::JobCorrelation;
 use super::ownership::{CellOwnership, ProviderObjectIdentity};
 
+/// Legacy/direct cell records use durable schema v1.
 pub const CELL_SCHEMA_VERSION: u32 = 1;
+/// Job-correlated cells use v2 so an older v1-only binary refuses them before
+/// it can rewrite and silently discard their provenance.
+pub const JOB_CORRELATED_CELL_SCHEMA_VERSION: u32 = 2;
+/// Highest cell schema understood by this binary.
+pub const MAX_CELL_SCHEMA_VERSION: u32 = JOB_CORRELATED_CELL_SCHEMA_VERSION;
 pub const MIN_MEMORY_MIB: u64 = 512;
 pub const MAX_MEMORY_MIB: u64 = 1_048_576;
 pub const MAX_CPU_COUNT: u16 = 64;
@@ -106,4 +112,16 @@ pub struct CellRecord {
     /// Direct cells and legacy state deliberately have no job correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobCorrelation>,
+}
+
+impl CellRecord {
+    /// Select the narrow durable schema fence for the supplied provenance.
+    #[must_use]
+    pub const fn schema_version_for_job(job: Option<&JobCorrelation>) -> u32 {
+        if job.is_some() {
+            JOB_CORRELATED_CELL_SCHEMA_VERSION
+        } else {
+            CELL_SCHEMA_VERSION
+        }
+    }
 }

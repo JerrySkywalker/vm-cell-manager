@@ -163,6 +163,9 @@ vmcell image unregister IMAGE
 vmcell create --image IMAGE --provider PROVIDER --cpu-count 2 --memory-mib 4096 [--accelerator POLICY] [--allow-tcg] [--ttl-seconds N]
 vmcell run --image IMAGE [--provider PROVIDER] [--accelerator POLICY] [--allow-tcg] [--cpu 2] [--memory 4096] [--ttl N] [--keep | --keep-on-failure] -- PROGRAM [ARG...]
 vmcell --json run --image IMAGE [--provider PROVIDER] [--accelerator POLICY] [--allow-tcg] --plan-only
+vmcell job plan --spec vmcell.toml
+vmcell run --spec vmcell.toml --plan-only
+vmcell run --spec vmcell.toml [--username USER --password-stdin]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -229,6 +232,15 @@ when resolution completed, safe recovery identifiers, and cleanup disposition,
 but never guest stream contents. `run --plan-only` exposes the same versioned
 plan without credentials or mutation. See [run selection](docs/run-selection.md).
 
+A [versioned job specification](docs/job-spec.md) describes one prepared,
+disposable execution-cell workload without becoming a provisioning DSL. `vmcell
+job plan --spec` and `vmcell run --spec ... --plan-only` are read-only and
+non-authorizing. Each admitted non-plan `run --spec` lifecycle run receives a
+fresh job and cell identity, even when the same specification hash is used
+again; this is not deduplication, replay, or a claim that guest/application
+output is byte identical. Job results and durable correlation remain bounded
+observability metadata, never lifecycle or provider authority.
+
 The canonical [native Linux QEMU/KVM/QGA walkthrough](docs/linux-kvm-qga.md)
 uses the same provider-neutral workflow for a prepared Linux x86_64 QCOW2
 guest. KVM admission distinguishes a missing device from one that the current
@@ -239,9 +251,11 @@ acceptance remains pending and the support row stays `untested`.
 Before first use of a newer binary against an existing root, `vmcell state
 check` provides a read-only, provider-free durable compatibility preflight.
 The frozen v0.1 candidate and v0.2 share durable format version 1; compatible
-v0.1 records are read in place without rewrite. Unknown schemas fail with
-`vmcell.state.upgrade_required` before mutation. See
-[durable-state compatibility and recovery](docs/state-compatibility.md).
+v0.1 records are read in place without rewrite. v0.4 job-correlated cell,
+operation, and artifact records use format version 2 so an older binary refuses
+their provenance before mutation; direct and historical records remain version
+1. Unknown schemas fail with `vmcell.state.upgrade_required` before mutation.
+See [durable-state compatibility and recovery](docs/state-compatibility.md).
 
 `vmcell image validate` is read-only. Candidate-path mode proves that the
 ordinary non-reparse base file has the selected provider's format, has no

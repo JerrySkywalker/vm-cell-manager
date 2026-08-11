@@ -27,10 +27,13 @@ vmcell image list
 vmcell image inspect IMAGE
 vmcell image dependencies IMAGE
 vmcell image unregister IMAGE
+vmcell job plan --spec PATH
 vmcell create --image IMAGE [--provider hyperv|qemu] [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
               [--accelerator auto|whpx|kvm|hvf|tcg] [--allow-tcg]
 vmcell run --image IMAGE [--provider hyperv|qemu] [--accelerator auto|whpx|kvm|hvf|tcg]
            [--allow-tcg] [--plan-only | -- PROGRAM [ARG...]]
+vmcell run --spec PATH --plan-only
+vmcell run --spec PATH [--username USER --password-stdin]
 vmcell list
 vmcell inspect CELL_ID
 vmcell start CELL_ID
@@ -59,11 +62,12 @@ Changing the state root does not authorize adoption of provider objects.
 
 `state check` is read-only and provider-free. It emits
 `vmcell.state-compatibility.v1` with schema version 1, one `checked_at`, durable
-format version 1, status `empty|compatible`, and counts for active installation,
-image, cell, guest-operation, and operation-bound artifact records. It does not
-create a missing root or rewrite compatible v0.1 JSON. Unsupported durable
-schemas use `vmcell.state.upgrade_required`, integrity exit 9, and require the
-operator to stop mutation and follow
+format version `1` for legacy/direct-only state or `2` when readable v0.4
+job-correlated records are present, status `empty|compatible`, and counts for
+active installation, image, cell, guest-operation, and operation-bound artifact
+records. It does not create a missing root or rewrite compatible v0.1 JSON.
+Unsupported durable schemas use `vmcell.state.upgrade_required`, integrity exit
+9, and require the operator to stop mutation and follow
 [`state-compatibility.md`](state-compatibility.md).
 
 `completion powershell` is human-only shell integration. It is generated from
@@ -141,6 +145,14 @@ probe detail. `run --plan-only` returns that plan directly. Actual run success
 and failure objects carry it as an additive `plan` field when resolution
 completed, preserving the one-JSON-document rule.
 
+`job plan --spec PATH` loads the strict TOML `vmcell.job-spec.v1` document and
+returns a non-authorizing `vmcell.job-plan.v1`. `run --spec PATH --plan-only`
+returns the same job-plan contract. Both paths resolve current read-only image
+and provider evidence but do not acquire a mutation lock, create state, issue
+provider authority, read credentials, or contact a guest. A spec is
+self-contained for provider selection: it never inherits a mutable configured
+provider preference.
+
 For QEMU, the selected image variant and accelerator must be compatible. TCG
 requires both `--accelerator tcg` and `--allow-tcg`; `auto` never falls back to
 TCG, even when `--allow-tcg` is present. Linux QGA guest commands are
@@ -149,7 +161,13 @@ workspace. Windows QGA is not advertised.
 
 ## Successful output
 
-Single-object responses contain `schema_version: 1`. List responses use:
+Automation reports, list envelopes, and error envelopes use their documented
+`schema_version: 1` contracts. Durable records serialized directly have their
+own schema: legacy/direct cell, guest-operation, and artifact records are
+version `1`, while v0.4 job-correlated records are version `2`. Thus `operation
+inspect --json` and `artifact inspect --json` may return a v2 durable record;
+`operation list --json` and `status --json` retain their v1 outer envelope but
+may contain v2 records. List responses use:
 
 `doctor --json` additionally reports `contract: "vmcell.doctor.v1"`, overall
 `status` (`ready` or `unavailable`), and typed provider probe status (`ready`,
@@ -174,6 +192,14 @@ operation counts, and non-authorizing cleanup guidance. A
 status never replays or reconciles it. Image validation is attempted only when
 the recorded provider probe is ready, otherwise the durable image remains
 visible with typed provider status.
+
+Cells created by `run --spec` expose an optional
+`cells[].cell.job = { job_id, job_spec_sha256, started_at }`; job-dispatched
+guest operations and artifact records expose an optional `job_id`. `operation
+inspect --json` returns that same optional operation field. Human `status` and
+`operation` output render `job=<UUID|none>`. `none` means no durable correlation
+is known (including direct work on a retained job cell or legacy state); it
+never means that replay, cleanup, or ownership is safe.
 
 ```json
 {
@@ -253,12 +279,14 @@ background timer.
 ## Run workflow output
 
 `vmcell run --image IMAGE [options] -- PROGRAM [ARG...]` composes the existing
-create, start, guest-exec, and exact-owned destroy operations. In default human
-mode, lifecycle progress and the final cleanup disposition are written to
-stderr. Bounded guest stdout is written to stdout and bounded guest stderr is
-written to stderr. Progress records contain only image/cell identifiers,
-stages, exit status, and cleanup classification; they never echo credentials,
-the guest command, host paths, or raw provider diagnostics.
+create, start, guest-exec, and exact-owned destroy operations. `vmcell run
+--spec PATH` resolves the same lifecycle authority from a validated,
+self-contained job specification. In default human mode, lifecycle progress
+and the final cleanup disposition are written to stderr. Bounded guest stdout
+is written to stdout and bounded guest stderr is written to stderr. Progress
+records contain only image/cell identifiers, stages, exit status, and cleanup
+classification; they never echo credentials, the guest command, host paths, or
+raw provider diagnostics.
 
 With `--json`, progress is suppressed and success emits one schema-v1
 `RunCellReport` to stdout. It contains `cell_id`, `operation_id`, `outcome`, the
@@ -266,6 +294,24 @@ bounded `result`, and `cleanup`. A run failure uses the normal error body plus a
 `run` object containing the safe stage, cell/operation identifiers, durable
 error codes, cleanup disposition, and optional result metadata. Guest stdout
 and stderr content are never included in an error envelope.
+
+Direct-run reports leave `job` and `job_operations` absent rather than encoding
+`null`. A spec-backed success adds `job` with contract
+`vmcell.job-result.v1` (fresh job ID, source SHA-256, and timing) and
+`job_operations` with contract `vmcell.job-operations.v1`. The latter contains
+only copy operation IDs and byte counts, an optional command operation ID, and
+artifact operation IDs, file counts, and byte totals. Failures after a
+`JobRunRequest` exists, including bounded interruption-handler setup, carry the
+same safe `job` data under `run`; `job_operations` is absent before the manifest
+is initialized, present but empty after that initialization before an action
+finishes, and populated only with known completed actions. Invalid or unreadable specification
+input and pre-request preparation failures such as a missing or invalid bound
+copy source use the generic redacted error envelope even when a read-only plan
+was resolved. None of these job fields contains
+specification contents, command text, credentials, host or guest paths, raw
+provider diagnostics, or guest stream contents. The compact terminal human job
+result has counts and safe IDs; use `status` and `operation list|inspect` for
+durable recovery correlation.
 
 After a completed guest command, `vmcell run` returns the guest exit code when
 it is in `1..=255`; an out-of-range nonzero guest code maps to `1`. This

@@ -12,13 +12,12 @@ use uuid::Uuid;
 
 use crate::core::automation::{AUTOMATION_SCHEMA_VERSION, OwnershipClassification, RequiredAction};
 use crate::core::cell::{
-    CELL_SCHEMA_VERSION, CellId, CellPhase, CellRecord, CellSpec, CellState, MAX_CPU_COUNT,
-    MAX_MEMORY_MIB, MIN_MEMORY_MIB,
+    CellId, CellPhase, CellRecord, CellSpec, CellState, MAX_CPU_COUNT, MAX_MEMORY_MIB,
+    MIN_MEMORY_MIB,
 };
 use crate::core::guest::{
-    ARTIFACT_SCHEMA_VERSION, ArtifactEntry, ArtifactRecord, GuestFailureClass, GuestOperationId,
-    GuestOperationKind, GuestOperationPhase, GuestOperationRecord, MAX_ARTIFACT_FILES,
-    MAX_ARTIFACT_TOTAL_BYTES,
+    ArtifactEntry, ArtifactRecord, GuestFailureClass, GuestOperationId, GuestOperationKind,
+    GuestOperationPhase, GuestOperationRecord, MAX_ARTIFACT_FILES, MAX_ARTIFACT_TOTAL_BYTES,
 };
 use crate::core::image::{
     Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
@@ -1389,7 +1388,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             .ttl_seconds
             .map(|seconds| now + Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)));
         let mut record = CellRecord {
-            schema_version: CELL_SCHEMA_VERSION,
+            schema_version: CellRecord::schema_version_for_job(job.as_ref()),
             id: cell_id,
             provider: self.provider.name().to_owned(),
             spec,
@@ -2598,6 +2597,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 break;
             }
 
+            // A legacy v1 orphan remains inspectable, but artifact pruning is
+            // a durable mutation and must not act without its exact parent
+            // cell authority, including the tombstone-recovery branch below.
+            self.state
+                .require_guest_operation_parent_for_mutation(&operation)?;
+
             let artifact_exists = self
                 .state
                 .artifact_root_exists(operation.cell_id, operation.id)?;
@@ -2655,6 +2660,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
     ) -> Result<GuestOperationRecoveryReport, EngineError> {
         let _mutation = self.state.acquire_mutation_lock()?;
         let mut operation = self.state.load_guest_operation(operation_id)?;
+        self.state
+            .require_guest_operation_parent_for_mutation(&operation)?;
         let (disposition, changed) = match operation.phase {
             GuestOperationPhase::Completed | GuestOperationPhase::Failed => {
                 (GuestOperationRecoveryDisposition::AlreadyTerminal, false)
@@ -3347,7 +3354,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     });
                 }
                 let artifact = ArtifactRecord {
-                    schema_version: ARTIFACT_SCHEMA_VERSION,
+                    schema_version: ArtifactRecord::schema_version_for_job(job_id),
                     id: operation_id,
                     cell_id,
                     created_at: Utc::now(),
@@ -5999,6 +6006,9 @@ mod tests {
         assert_eq!(report.result.exit_code, 0);
         assert_eq!(report.result.stdout, "ok\n");
         assert_eq!(report.cleanup, RunCleanupDisposition::Destroyed);
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("job").is_none());
+        assert!(json.get("job_operations").is_none());
         assert!(!engine.destroy_cell(report.cell_id).unwrap().changed);
         let calls = engine.provider.state.lock().unwrap().calls.clone();
         for required in [
@@ -6046,6 +6056,69 @@ mod tests {
         for forbidden in ["job-command-secret", "job-argument-secret"] {
             assert!(!encoded.contains(forbidden), "leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn same_loaded_job_spec_resolves_and_runs_as_two_fresh_execution_cells() {
+        let (directory, engine, image_id, guest, credentials) = run_fixture();
+        let image = engine.state.load_image(&image_id).unwrap();
+        let loaded = LoadedJobSpec::from_validated_parts_for_test(
+            directory.path().join("repeatable-job.toml"),
+            "b".repeat(64),
+            crate::core::job_spec::parse_job_spec(&format!(
+                r#"
+schema_version = 1
+image = "{image_id}"
+cpu_count = 2
+memory_mib = 4096
+
+[command]
+program = "cmd.exe"
+args = ["/c", "exit 0"]
+
+[cleanup]
+keep = false
+keep_on_failure = false
+"#,
+            ))
+            .unwrap(),
+        );
+        let host = HostPlatform {
+            os: crate::core::support::HostOs::Windows,
+            architecture: Architecture::X86_64,
+        };
+
+        let (first_plan, first_request) =
+            build_job_run_request(&loaded, host, &image, &[engine.provider.probe()]).unwrap();
+        let (second_plan, second_request) =
+            build_job_run_request(&loaded, host, &image, &[engine.provider.probe()]).unwrap();
+        let first_job_id = first_request.job().job_id();
+        let second_job_id = second_request.job().job_id();
+
+        assert_eq!(first_plan, second_plan);
+        assert_eq!(first_plan.job_spec_sha256, loaded.source_sha256());
+        assert_eq!(first_plan.execution.image, image_id);
+        assert_ne!(first_job_id, second_job_id);
+
+        let first = engine
+            .run_job_cell(&guest, &credentials, first_request)
+            .unwrap();
+        guest.state.lock().unwrap().readiness = VecDeque::from([GuestReadiness::Ready]);
+        let second = engine
+            .run_job_cell(&guest, &credentials, second_request)
+            .unwrap();
+
+        assert_eq!(first.plan.as_ref(), Some(&first_plan.execution));
+        assert_eq!(second.plan.as_ref(), Some(&second_plan.execution));
+        assert_eq!(first.job.as_ref().unwrap().job_id, first_job_id);
+        assert_eq!(second.job.as_ref().unwrap().job_id, second_job_id);
+        assert_eq!(first.job.as_ref().unwrap().job_spec_sha256, "b".repeat(64));
+        assert_eq!(second.job.as_ref().unwrap().job_spec_sha256, "b".repeat(64));
+        assert_ne!(first.cell_id, second.cell_id);
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_eq!(first.cleanup, RunCleanupDisposition::Destroyed);
+        assert_eq!(second.cleanup, RunCleanupDisposition::Destroyed);
+        assert_eq!(engine.state.list_cells().unwrap().len(), 2);
     }
 
     #[test]
@@ -6103,6 +6176,10 @@ mod tests {
 
         let cell = engine.state.load_cell(report.cell_id).unwrap();
         assert_eq!(
+            cell.schema_version,
+            crate::core::cell::JOB_CORRELATED_CELL_SCHEMA_VERSION
+        );
+        assert_eq!(
             cell.job.as_ref().map(|value| value.job_id),
             Some(job.job_id)
         );
@@ -6114,9 +6191,17 @@ mod tests {
                 .iter()
                 .all(|operation| operation.job_id == Some(job.job_id))
         );
+        assert!(durable_operations.iter().all(|operation| {
+            operation.schema_version
+                == crate::core::guest::JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION
+        }));
         let artifact = engine
             .inspect_artifact(report.cell_id, operations.artifacts[0].operation_id)
             .unwrap();
+        assert_eq!(
+            artifact.schema_version,
+            crate::core::guest::JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION
+        );
         assert_eq!(artifact.job_id, Some(job.job_id));
 
         assert_eq!(
@@ -6448,6 +6533,48 @@ sources = ["results/output.txt"]
             &artifact_request.actions.copy_in[0].source_root,
             &directory.path().canonicalize().unwrap()
         ));
+        assert!(engine.state.list_cells().unwrap().is_empty());
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn job_request_missing_copy_source_fails_before_lifecycle_request_exists() {
+        let (directory, engine, image_id) = fixture();
+        let image = engine.state.load_image(&image_id).unwrap();
+        let loaded = LoadedJobSpec::from_validated_parts_for_test(
+            directory.path().join("missing-copy-source-job.toml"),
+            "c".repeat(64),
+            crate::core::job_spec::parse_job_spec(&format!(
+                r#"
+schema_version = 1
+image = "{image_id}"
+cpu_count = 2
+memory_mib = 4096
+
+[command]
+program = "cmd.exe"
+
+[cleanup]
+keep = false
+keep_on_failure = false
+
+[[copy_in]]
+source = "missing-input.bin"
+destination = "inputs/missing-input.bin"
+"#,
+            ))
+            .unwrap(),
+        );
+        let host = HostPlatform {
+            os: crate::core::support::HostOs::Windows,
+            architecture: Architecture::X86_64,
+        };
+        engine.provider.state.lock().unwrap().calls.clear();
+
+        let error =
+            build_job_run_request(&loaded, host, &image, &[engine.provider.probe()]).unwrap_err();
+
+        assert!(matches!(error, EngineError::InvalidCellRequest(_)));
         assert!(engine.state.list_cells().unwrap().is_empty());
         assert!(engine.provider.state.lock().unwrap().calls.is_empty());
     }
@@ -7148,7 +7275,7 @@ sources = ["results/output.txt"]
         let (_directory, engine, image_id) = fixture();
         let cell = engine.create_cell(spec(image_id)).unwrap();
         let mut record = engine.state.load_cell(cell.id).unwrap();
-        record.schema_version += 1;
+        record.schema_version = crate::core::cell::MAX_CELL_SCHEMA_VERSION + 1;
         let path = engine
             .state
             .root()
@@ -7169,7 +7296,7 @@ sources = ["results/output.txt"]
             calls_before
         );
 
-        record.schema_version = CELL_SCHEMA_VERSION;
+        record.schema_version = crate::core::cell::CELL_SCHEMA_VERSION;
         record.ownership.schema_version += 1;
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         assert!(matches!(
@@ -7855,7 +7982,7 @@ sources = ["results/output.txt"]
             .unwrap();
         let artifact_file = engine.state.root().join(&host_relative_path);
         let artifact = ArtifactRecord {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
+            schema_version: crate::core::guest::ARTIFACT_SCHEMA_VERSION,
             id: committed.id,
             cell_id: cell.id,
             created_at: Utc::now(),
@@ -8407,6 +8534,71 @@ sources = ["results/output.txt"]
             }),
             Err(EngineError::InvalidCellRequest(_))
         ));
+    }
+
+    #[test]
+    fn legacy_orphan_operation_is_readable_but_not_reconcilable_or_prunable() {
+        let (_directory, engine, _cell, _guest, _credentials) = running_fixture();
+        let orphan_cell = CellId::new();
+        let now = Utc::now();
+        let mut operation =
+            GuestOperationRecord::intent(orphan_cell, GuestOperationKind::ArtifactCollect, now);
+        operation.phase = GuestOperationPhase::Completed;
+        operation.completed_at = Some(now);
+        operation.artifact_id = Some(operation.id);
+        operation.artifact_pruned_at = Some(now);
+
+        // This is deliberately raw historical v1 state: normal StateStore
+        // reads retain it for observation, while every engine mutation must
+        // require the absent parent cell and fail closed.
+        let guard = engine
+            .state
+            .prepare_artifact_root(orphan_cell, operation.id)
+            .unwrap();
+        let sentinel = engine.state.root().join(
+            engine
+                .state
+                .write_artifact_file(&guard, 0, b"preserve")
+                .unwrap(),
+        );
+        drop(guard);
+        fs::write(
+            engine
+                .state
+                .root()
+                .join("operations")
+                .join(format!("{}.json", operation.id)),
+            serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.inspect_guest_operation(operation.id).unwrap(),
+            operation
+        );
+
+        for result in [
+            engine.reconcile_guest_operation(operation.id).map(|_| ()),
+            engine
+                .prune_artifacts(ArtifactPruneRequest {
+                    older_than: StdDuration::ZERO,
+                    max_artifacts: 1,
+                    dry_run: false,
+                })
+                .map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(EngineError::State(StateError::JobCorrelationIntegrity {
+                    reason: "guest operation references a missing cell",
+                    ..
+                }))
+            ));
+        }
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve");
+        assert_eq!(
+            engine.inspect_guest_operation(operation.id).unwrap(),
+            operation
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@ use crate::engine::{
     CellInspection, EngineError, ImageValidationReport, JobOperationManifest, RunCellError,
     RunCleanupDisposition, RunFailureReport, RunStage,
 };
+#[cfg(test)]
+use crate::engine::{JobArtifactSummary, JobCopyInSummary};
 use crate::guest::{
     DEFAULT_MAX_COPY_BYTES, DEFAULT_MAX_OUTPUT_BYTES, GuestIoError, GuestPath, OverwritePolicy,
 };
@@ -37,7 +39,7 @@ pub struct CliInputError(pub String);
     name = "vmcell",
     version,
     about = "Local disposable VM execution cells",
-    after_help = "Windows Human MVP examples (real execution remains release-gated):\n  vmcell doctor\n  vmcell status\n  vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell image add --id windows-dev --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell run --image windows-dev --username Administrator --password-stdin -- cmd.exe /d /c ver\n\nSee docs/quickstart-windows.md. Never place a guest password on argv."
+    after_help = "Windows Human MVP examples (real execution remains release-gated):\n  vmcell doctor\n  vmcell status\n  vmcell image validate --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell image add --id windows-dev --path BASE.vhdx --guest-os windows --provider hyperv\n  vmcell run --image windows-dev --username Administrator --password-stdin -- cmd.exe /d /c ver\n\nReproducible job examples:\n  vmcell job plan --spec vmcell.toml\n  vmcell run --spec vmcell.toml --plan-only\n\nSee docs/quickstart-windows.md and docs/job-spec.md. Never place a guest password on argv."
 )]
 pub struct Cli {
     /// Emit versioned machine-readable JSON.
@@ -130,7 +132,7 @@ pub enum Command {
         allow_tcg: bool,
     },
 
-    /// Create a disposable cell, run one guest command, and apply the cleanup policy.
+    /// Run one direct command or a validated job spec through the existing lifecycle.
     Run {
         /// Execute a validated declarative job spec through the existing run lifecycle.
         #[arg(
@@ -1529,11 +1531,27 @@ mod tests {
         let job = crate::core::job::JobRunContext::new("a".repeat(64), chrono::Utc::now())
             .unwrap()
             .result_metadata(chrono::Utc::now());
+        let copy_operation_id = GuestOperationId::new();
+        let command_operation_id = GuestOperationId::new();
+        let artifact_operation_id = GuestOperationId::new();
         let report = RunFailureReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             plan: Some(test_run_plan()),
             job: Some(job.clone()),
-            job_operations: None,
+            job_operations: Some(JobOperationManifest {
+                schema_version: crate::engine::JOB_OPERATION_MANIFEST_SCHEMA_VERSION,
+                contract: crate::engine::JOB_OPERATION_MANIFEST_CONTRACT.to_owned(),
+                copy_in: vec![JobCopyInSummary {
+                    operation_id: copy_operation_id,
+                    size: 17,
+                }],
+                command_operation_id: Some(command_operation_id),
+                artifacts: vec![JobArtifactSummary {
+                    operation_id: artifact_operation_id,
+                    file_count: 2,
+                    total_bytes: 31,
+                }],
+            }),
             cell_id: Some(CellId::new()),
             operation_id: Some(GuestOperationId::new()),
             stage: RunStage::Cleanup,
@@ -1570,6 +1588,97 @@ mod tests {
         assert_eq!(value["run"]["job"]["contract"], "vmcell.job-result.v1");
         assert_eq!(value["run"]["job"]["job_id"], job.job_id.to_string());
         assert_eq!(value["run"]["job"]["job_spec_sha256"], "a".repeat(64));
+        assert_eq!(
+            value["run"]["job_operations"],
+            serde_json::json!({
+                "schema_version": 1,
+                "contract": "vmcell.job-operations.v1",
+                "copy_in": [{
+                    "operation_id": copy_operation_id.to_string(),
+                    "size": 17,
+                }],
+                "command_operation_id": command_operation_id.to_string(),
+                "artifacts": [{
+                    "operation_id": artifact_operation_id.to_string(),
+                    "file_count": 2,
+                    "total_bytes": 31,
+                }],
+            })
+        );
+        for forbidden in [
+            "stdout-secret-sentinel",
+            "stderr-secret-sentinel",
+            "job-command-secret",
+            "credential-sentinel",
+            "host-path-secret",
+            "guest-path-secret",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn run_error_envelope_freezes_job_operation_manifest_presence() {
+        let classification = classify_cli_error(&ProviderError::Command("redacted".to_owned()));
+        let job = crate::core::job::JobRunContext::new("b".repeat(64), chrono::Utc::now())
+            .unwrap()
+            .result_metadata(chrono::Utc::now());
+        let mut report = RunFailureReport {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            plan: Some(test_run_plan()),
+            job: None,
+            job_operations: None,
+            cell_id: Some(CellId::new()),
+            operation_id: None,
+            stage: RunStage::RequestValidation,
+            cleanup: RunCleanupDisposition::NothingCreated,
+            error_code: "vmcell.run.invalid_request".to_owned(),
+            cleanup_error_code: None,
+            result: None,
+        };
+
+        let direct = serde_json::to_value(RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            &report,
+        ))
+        .unwrap();
+        assert!(direct["run"].get("job").is_none());
+        assert!(direct["run"].get("job_operations").is_none());
+
+        report.job = Some(job);
+        let before_manifest = serde_json::to_value(RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            &report,
+        ))
+        .unwrap();
+        assert!(before_manifest["run"].get("job").is_some());
+        assert!(before_manifest["run"].get("job_operations").is_none());
+
+        report.job_operations = Some(JobOperationManifest {
+            schema_version: crate::engine::JOB_OPERATION_MANIFEST_SCHEMA_VERSION,
+            contract: crate::engine::JOB_OPERATION_MANIFEST_CONTRACT.to_owned(),
+            copy_in: Vec::new(),
+            command_operation_id: None,
+            artifacts: Vec::new(),
+        });
+        let empty_manifest = serde_json::to_value(RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            &report,
+        ))
+        .unwrap();
+        assert_eq!(
+            empty_manifest["run"]["job_operations"],
+            serde_json::json!({
+                "schema_version": 1,
+                "contract": "vmcell.job-operations.v1",
+                "copy_in": [],
+                "command_operation_id": null,
+                "artifacts": [],
+            })
+        );
     }
 
     #[test]

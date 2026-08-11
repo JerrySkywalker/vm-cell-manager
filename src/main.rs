@@ -37,6 +37,8 @@ use vm_cell_manager::core::run_selection::{
 use vm_cell_manager::core::support::{Accelerator, ProviderId};
 #[cfg(test)]
 use vm_cell_manager::core::support::{GuestTransportId, HostOs, SupportStatus};
+#[cfg(test)]
+use vm_cell_manager::engine::run_request_validation_error;
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
     GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
@@ -44,8 +46,7 @@ use vm_cell_manager::engine::{
     ImageValidationReport, ImageValidationStatus, JobRunRequest, RegisterImageRequest,
     RunCellError, RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver,
     RunProgressEvent, ValidateImageRequest, build_job_run_request, inspect_image_dependencies,
-    run_request_validation_error, run_request_validation_error_with_job, unregister_image,
-    validate_run_resources,
+    run_request_validation_error_with_job, unregister_image, validate_run_resources,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
@@ -288,7 +289,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             if !cli.json && human_output == HumanOutputPreference::Normal {
                 write_human_job_plan(&plan, &mut std::io::stderr().lock())?;
             }
-            let interrupt = install_run_interrupt(request.plan())?;
+            let interrupt = install_job_run_interrupt(request.plan(), request.job())?;
             let report = match plan.execution.provider {
                 ProviderId::Hyperv => {
                     let engine = CellEngine::new(state, HyperVProvider::system());
@@ -1682,13 +1683,29 @@ fn install_run_interrupt(plan: &RunExecutionPlan) -> Result<RunInterruptGuard, R
     install_run_interrupt_with(plan, RunInterruptGuard::install)
 }
 
+fn install_job_run_interrupt(
+    plan: &RunExecutionPlan,
+    job: &vm_cell_manager::core::job::JobRunContext,
+) -> Result<RunInterruptGuard, RunCellError> {
+    install_run_interrupt_with_job(plan, Some(job), RunInterruptGuard::install)
+}
+
 fn install_run_interrupt_with(
     plan: &RunExecutionPlan,
     install: impl FnOnce() -> Result<RunInterruptGuard, Box<dyn Error>>,
 ) -> Result<RunInterruptGuard, RunCellError> {
+    install_run_interrupt_with_job(plan, None, install)
+}
+
+fn install_run_interrupt_with_job(
+    plan: &RunExecutionPlan,
+    job: Option<&vm_cell_manager::core::job::JobRunContext>,
+    install: impl FnOnce() -> Result<RunInterruptGuard, Box<dyn Error>>,
+) -> Result<RunInterruptGuard, RunCellError> {
     install().map_err(|_| {
-        run_request_validation_error(
+        run_request_validation_error_with_job(
             plan,
+            job,
             EngineError::InvalidCellRequest(
                 "the bounded run interruption handler is unavailable".to_owned(),
             ),
@@ -3040,6 +3057,69 @@ mod tests {
     }
 
     #[test]
+    fn human_job_run_result_reports_safe_identity_and_counts_only() {
+        let job =
+            vm_cell_manager::core::job::JobRunContext::new("a".repeat(64), chrono::Utc::now())
+                .unwrap()
+                .result_metadata(chrono::Utc::now());
+        let copy_operation_id = vm_cell_manager::core::guest::GuestOperationId::new();
+        let command_operation_id = vm_cell_manager::core::guest::GuestOperationId::new();
+        let artifact_operation_id = vm_cell_manager::core::guest::GuestOperationId::new();
+        let report = RunCellReport {
+            schema_version: 1,
+            plan: Some(test_run_plan()),
+            job: Some(job.clone()),
+            job_operations: Some(vm_cell_manager::engine::JobOperationManifest {
+                schema_version: 1,
+                contract: "vmcell.job-operations.v1".to_owned(),
+                copy_in: vec![vm_cell_manager::engine::JobCopyInSummary {
+                    operation_id: copy_operation_id,
+                    size: 17,
+                }],
+                command_operation_id: Some(command_operation_id),
+                artifacts: vec![vm_cell_manager::engine::JobArtifactSummary {
+                    operation_id: artifact_operation_id,
+                    file_count: 2,
+                    total_bytes: 31,
+                }],
+            }),
+            cell_id: vm_cell_manager::core::cell::CellId::new(),
+            operation_id: command_operation_id,
+            outcome: vm_cell_manager::engine::RunOutcome::Success,
+            result: vm_cell_manager::guest::GuestCommandResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                encoding: "utf-8".to_owned(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                truncated: false,
+            },
+            cleanup: vm_cell_manager::engine::RunCleanupDisposition::Destroyed,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_human_run_result(&report, &mut stdout, &mut stderr).unwrap();
+
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains(&format!("job {}", job.job_id)));
+        assert!(stderr.contains(&format!("cell {}", report.cell_id)));
+        assert!(stderr.contains("copy_in=1"));
+        assert!(stderr.contains(&format!("command_operation={command_operation_id}")));
+        assert!(stderr.contains("artifacts=1"));
+        for forbidden in [
+            "job-command-secret",
+            "credential-sentinel",
+            "host-path-secret",
+            "guest-path-secret",
+        ] {
+            assert!(!stderr.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
     fn cross_provider_run_plan_human_and_json_contracts_are_safe_and_versioned() {
         let cases = [
             (
@@ -3159,6 +3239,35 @@ mod tests {
         assert!(!serialized.contains("credential"));
         assert!(!serialized.contains("cmd.exe"));
         assert!(!serialized.contains("C:\\"));
+    }
+
+    #[test]
+    fn job_interrupt_install_failure_retains_safe_job_identity() {
+        let plan = test_run_plan();
+        let job =
+            vm_cell_manager::core::job::JobRunContext::new("a".repeat(64), chrono::Utc::now())
+                .unwrap();
+        let error = match install_run_interrupt_with_job(&plan, Some(&job), || {
+            Err(CliInputError("job-interrupt-secret-sentinel".to_owned()).into())
+        }) {
+            Ok(_) => panic!("injected interrupt installation failure should be reported"),
+            Err(error) => error,
+        };
+        let classification = classify_cli_error(&error);
+        let envelope = RunErrorEnvelope::new(
+            classification,
+            public_error_message(classification),
+            error.report(),
+        );
+        let json = serde_json::to_value(envelope).unwrap();
+        let serialized = serde_json::to_string(&json).unwrap();
+
+        assert_eq!(json["run"]["stage"], "request_validation");
+        assert_eq!(json["run"]["job"]["contract"], "vmcell.job-result.v1");
+        assert_eq!(json["run"]["job"]["job_id"], job.job_id().to_string());
+        assert_eq!(json["run"]["job"]["job_spec_sha256"], "a".repeat(64));
+        assert!(json["run"].get("job_operations").is_none());
+        assert!(!serialized.contains("job-interrupt-secret-sentinel"));
     }
 
     #[test]

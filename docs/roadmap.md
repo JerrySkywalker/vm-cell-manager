@@ -576,7 +576,9 @@ It must not become a Vagrant/Packer-style provisioning DSL. It does not own pack
 
 ### Human-readable planning
 
-Before mutation, users can inspect the resolved execution plan, conceptually through `vmcell run --spec ... --plan` or `vmcell plan --spec ...`. Planning is read-only and never grants mutation authority.
+Before mutation, users can inspect the resolved execution plan through `vmcell
+job plan --spec ...` or `vmcell run --spec ... --plan-only`. Planning is
+read-only and never grants mutation authority.
 
 ### Deterministic result model
 
@@ -588,7 +590,11 @@ All operations belonging to one `run` invocation are correlated under one run/jo
 
 ### Repeatability semantics
 
-Running the same specification twice means two fresh disposable execution cells unless explicitly requested otherwise. vmcell guarantees deterministic interpretation of its execution contract, not bit-for-bit deterministic application output.
+Two admitted runs of the same specification mean two fresh disposable execution
+cells and fresh job identities by default. v0.4 provides no reuse or
+deduplication switch. vmcell guarantees deterministic interpretation of its
+execution contract, not bit-for-bit deterministic guest or application output;
+repository and planning evidence do not promote any platform support row.
 
 ## Release gates
 

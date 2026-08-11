@@ -6,6 +6,14 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Added the repository-local v0.4 reproducible-job surface: strict TOML job
+  specifications, read-only job planning, fresh invocation/result identities,
+  safe durable operation/artifact correlation, and explicit repeatability and
+  downgrade-provenance policy. Correlated durable records use a narrow v2
+  schema fence while legacy/direct records remain v1, so older binaries refuse
+  provenance-bearing records before mutation. It reuses the existing lifecycle
+  authority and does not add provisioning, scheduling, or real-platform
+  acceptance.
 - Set the repository candidate identity to `0.3.0` and completed the
   repository-local Cross-Platform Human MVP: provider-neutral support and run
   planning, Windows QEMU/WHPX and native Linux QEMU/KVM foundations for
