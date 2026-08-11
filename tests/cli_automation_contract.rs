@@ -1,7 +1,12 @@
 use std::fs;
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 const MISSING_CELL_ID: &str = "00000000-0000-0000-0000-000000000001";
+const CORRELATED_CELL_ID: &str = "00000000-0000-0000-0000-000000000124";
+const CORRELATED_OPERATION_ID: &str = "00000000-0000-0000-0000-000000000125";
+const CORRELATED_JOB_ID: &str = "00000000-0000-0000-0000-000000000126";
 
 fn inspect_missing_cell(state_root: &std::path::Path, json: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vmcell"));
@@ -36,9 +41,35 @@ fn version_help_and_shell_completions_are_stable_and_state_free() {
     let help = run_vmcell(&["--help"]);
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    for command in ["doctor", "status", "state", "completion", "run", "shell"] {
+    for command in [
+        "doctor",
+        "status",
+        "state",
+        "completion",
+        "job",
+        "run",
+        "shell",
+    ] {
         assert!(help.contains(command), "root help omitted {command}");
     }
+
+    let run_help = run_vmcell(&["run", "--help"]);
+    assert!(run_help.status.success());
+    let run_help = String::from_utf8(run_help.stdout).unwrap();
+    assert!(run_help.contains("--spec <PATH>"));
+    assert!(run_help.contains("--plan-only"));
+
+    let job_help = run_vmcell(&["job", "--help"]);
+    assert!(job_help.status.success());
+    assert!(String::from_utf8(job_help.stdout).unwrap().contains("plan"));
+
+    let job_plan_help = run_vmcell(&["job", "plan", "--help"]);
+    assert!(job_plan_help.status.success());
+    assert!(
+        String::from_utf8(job_plan_help.stdout)
+            .unwrap()
+            .contains("--spec <PATH>")
+    );
 
     let directory = tempfile::tempdir().unwrap();
     let absent_state = directory.path().join("must-not-exist");
@@ -204,6 +235,184 @@ fn write_active_cell_fixture(state_root: &std::path::Path, base_path: &std::path
 
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
     }
+}
+
+fn write_v2_correlated_operation_and_artifact_fixture(state_root: &std::path::Path) {
+    let cells = state_root.join("cells");
+    let operations = state_root.join("operations");
+    let artifacts = state_root.join("artifacts");
+    let artifact_cell = artifacts.join(CORRELATED_CELL_ID);
+    let artifact_root = artifact_cell.join(CORRELATED_OPERATION_ID);
+    let files = artifact_root.join("files");
+    fs::create_dir_all(&cells).unwrap();
+    fs::create_dir_all(&operations).unwrap();
+    fs::create_dir_all(&files).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for directory in [
+            state_root,
+            &cells,
+            &operations,
+            &artifacts,
+            &artifact_cell,
+            &artifact_root,
+            &files,
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    let started_at = "2026-08-11T00:00:00Z";
+    let job_spec_sha256 = "a".repeat(64);
+    let artifact_bytes = b"job-artifact";
+    let artifact_relative_path =
+        format!("artifacts/{CORRELATED_CELL_ID}/{CORRELATED_OPERATION_ID}/files/0000.bin");
+    let cell = serde_json::json!({
+        "schema_version": 2,
+        "id": CORRELATED_CELL_ID,
+        "provider": "hyperv",
+        "spec": {
+            "image": "daily-image",
+            "provider": "hyperv",
+            "cpu_count": 2,
+            "memory_mib": 4096,
+            "ttl_seconds": null,
+            "accelerator": null,
+            "allow_tcg": false
+        },
+        "image": {
+            "image_id": "daily-image",
+            "guest_os": "windows",
+            "provider": "hyperv",
+            "disk_format": "vhdx",
+            "path": state_root.join("base.vhdx"),
+            "sha256": "fixture-hash-never-read",
+            "file_size": 23
+        },
+        "ownership": {
+            "schema_version": 1,
+            "install_id": "00000000-0000-0000-0000-000000000001",
+            "operation_id": "00000000-0000-0000-0000-000000000002",
+            "provider_object_name": "vmcell-fixture",
+            "provider_marker": "vmcell:v1:fixture",
+            "configuration_path": state_root.join("runtime").join("fixture.vmcell.json"),
+            "overlay_path": state_root.join("runtime").join("fixture.vhdx")
+        },
+        "provider_object": null,
+        "state": "stopped",
+        "phase": "ready",
+        "created_at": started_at,
+        "updated_at": started_at,
+        "expires_at": null,
+        "last_error": null,
+        "job": {
+            "job_id": CORRELATED_JOB_ID,
+            "job_spec_sha256": job_spec_sha256,
+            "started_at": started_at
+        }
+    });
+    let operation = serde_json::json!({
+        "schema_version": 2,
+        "id": CORRELATED_OPERATION_ID,
+        "cell_id": CORRELATED_CELL_ID,
+        "kind": "artifact_collect",
+        "phase": "completed",
+        "created_at": started_at,
+        "updated_at": started_at,
+        "completed_at": started_at,
+        "failure": null,
+        "exit_code": null,
+        "stdout_bytes": null,
+        "stderr_bytes": null,
+        "artifact_id": CORRELATED_OPERATION_ID,
+        "artifact_pruned_at": null,
+        "job_id": CORRELATED_JOB_ID
+    });
+    let artifact = serde_json::json!({
+        "schema_version": 2,
+        "id": CORRELATED_OPERATION_ID,
+        "cell_id": CORRELATED_CELL_ID,
+        "created_at": started_at,
+        "entries": [{
+            "guest_path": "results/output.bin",
+            "host_relative_path": artifact_relative_path,
+            "sha256": format!("{:x}", Sha256::digest(artifact_bytes)),
+            "size": artifact_bytes.len()
+        }],
+        "job_id": CORRELATED_JOB_ID
+    });
+    let cell_path = cells.join(format!("{CORRELATED_CELL_ID}.json"));
+    let operation_path = operations.join(format!("{CORRELATED_OPERATION_ID}.json"));
+    let artifact_path = artifact_root.join("manifest.json");
+    let artifact_file = files.join("0000.bin");
+    fs::write(&cell_path, serde_json::to_vec_pretty(&cell).unwrap()).unwrap();
+    fs::write(
+        &operation_path,
+        serde_json::to_vec_pretty(&operation).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&artifact).unwrap(),
+    )
+    .unwrap();
+    fs::write(&artifact_file, artifact_bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for file in [&cell_path, &operation_path, &artifact_path, &artifact_file] {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn job_correlated_durable_json_records_are_v2_inside_v1_envelopes() {
+    let directory = tempfile::tempdir().unwrap();
+    write_v2_correlated_operation_and_artifact_fixture(directory.path());
+    let state = directory.path().to_string_lossy().into_owned();
+
+    let operation = run_vmcell(&[
+        "--json",
+        "--state-root",
+        state.as_str(),
+        "operation",
+        "inspect",
+        CORRELATED_OPERATION_ID,
+    ]);
+    assert!(operation.status.success());
+    let operation: serde_json::Value = serde_json::from_slice(&operation.stdout).unwrap();
+    assert_eq!(operation["schema_version"], 2);
+    assert_eq!(operation["job_id"], CORRELATED_JOB_ID);
+
+    let list = run_vmcell(&[
+        "--json",
+        "--state-root",
+        state.as_str(),
+        "operation",
+        "list",
+    ]);
+    assert!(list.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list["schema_version"], 1);
+    assert_eq!(list["items"][0]["schema_version"], 2);
+
+    let artifact = run_vmcell(&[
+        "--json",
+        "--state-root",
+        state.as_str(),
+        "artifact",
+        "inspect",
+        CORRELATED_CELL_ID,
+        CORRELATED_OPERATION_ID,
+    ]);
+    assert!(artifact.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact.stdout).unwrap();
+    assert_eq!(artifact["schema_version"], 2);
+    assert_eq!(artifact["job_id"], CORRELATED_JOB_ID);
 }
 
 #[test]

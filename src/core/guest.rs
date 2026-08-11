@@ -9,8 +9,19 @@ use uuid::Uuid;
 use super::cell::CellId;
 use super::job::JobId;
 
+/// Legacy/direct guest-operation records use durable schema v1.
 pub const GUEST_OPERATION_SCHEMA_VERSION: u32 = 1;
+/// Guest operations correlated to a v0.4 job use schema v2.
+pub const JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION: u32 = 2;
+/// Highest guest-operation schema understood by this binary.
+pub const MAX_GUEST_OPERATION_SCHEMA_VERSION: u32 = JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION;
+
+/// Legacy/direct artifact manifests use durable schema v1.
 pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+/// Artifact manifests correlated to a v0.4 job use schema v2.
+pub const JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+/// Highest artifact schema understood by this binary.
+pub const MAX_ARTIFACT_SCHEMA_VERSION: u32 = JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -128,7 +139,7 @@ impl GuestOperationRecord {
         job_id: Option<JobId>,
     ) -> Self {
         Self {
-            schema_version: GUEST_OPERATION_SCHEMA_VERSION,
+            schema_version: Self::schema_version_for_job(job_id),
             id: GuestOperationId::new(),
             cell_id,
             kind,
@@ -143,6 +154,16 @@ impl GuestOperationRecord {
             artifact_id: None,
             artifact_pruned_at: None,
             job_id,
+        }
+    }
+
+    /// Select the narrow durable schema fence for the supplied provenance.
+    #[must_use]
+    pub const fn schema_version_for_job(job_id: Option<JobId>) -> u32 {
+        if job_id.is_some() {
+            JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION
+        } else {
+            GUEST_OPERATION_SCHEMA_VERSION
         }
     }
 }
@@ -165,6 +186,18 @@ pub struct ArtifactRecord {
     /// Optional durable correlation copied from the owning guest operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<JobId>,
+}
+
+impl ArtifactRecord {
+    /// Select the narrow durable schema fence for the supplied provenance.
+    #[must_use]
+    pub const fn schema_version_for_job(job_id: Option<JobId>) -> u32 {
+        if job_id.is_some() {
+            JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION
+        } else {
+            ARTIFACT_SCHEMA_VERSION
+        }
+    }
 }
 
 pub const MAX_ARTIFACT_FILES: usize = 16;

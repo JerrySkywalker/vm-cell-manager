@@ -70,6 +70,20 @@ must still pass before mutation; the normal immutable-image, ownership, and
 provider/guest authority checks remain unchanged. See
 [provider-neutral run selection](run-selection.md).
 
+The v0.4 reproducible-job surface deliberately composes that same seam rather
+than introducing a job scheduler or second state machine:
+
+```text
+strict TOML job spec -> read-only job plan -> opaque job run request
+   -> existing CellEngine create/start/guest/cleanup flow
+   -> existing cell, operation, and artifact records with safe correlation
+```
+
+Each admitted non-plan `run --spec` lifecycle run creates a fresh job and cell.
+The job ID and source digest are observability metadata only; they do not
+identify an owned provider object, authorize cleanup, deduplicate a request, or
+permit replay after an unknown guest effect. See [the job-spec reference](job-spec.md).
+
 M2 guest actions use a second, narrower authority flow:
 
 ```text

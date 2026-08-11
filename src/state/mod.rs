@@ -15,10 +15,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::core::cell::{CELL_SCHEMA_VERSION, CellId, CellRecord};
+use crate::core::cell::{
+    CELL_SCHEMA_VERSION, CellId, CellRecord, JOB_CORRELATED_CELL_SCHEMA_VERSION,
+    MAX_CELL_SCHEMA_VERSION,
+};
 use crate::core::guest::{
     ARTIFACT_SCHEMA_VERSION, ArtifactRecord, GUEST_OPERATION_SCHEMA_VERSION, GuestOperationId,
-    GuestOperationRecord, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_TOTAL_BYTES,
+    GuestOperationRecord, JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION,
+    JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILES,
+    MAX_ARTIFACT_SCHEMA_VERSION, MAX_ARTIFACT_TOTAL_BYTES, MAX_GUEST_OPERATION_SCHEMA_VERSION,
 };
 use crate::core::image::{IMAGE_SCHEMA_VERSION, ImageId, ImageRecord};
 use crate::core::job::JobCorrelation;
@@ -26,7 +31,11 @@ use crate::core::ownership::OWNERSHIP_MARKER_SCHEMA;
 
 pub const INSTALL_SCHEMA_VERSION: u32 = 1;
 pub const STATE_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
-pub const DURABLE_STATE_FORMAT_VERSION: u32 = 1;
+/// Highest durable record format understood by this binary.
+pub const DURABLE_STATE_FORMAT_VERSION: u32 = 2;
+/// Legacy/direct roots remain format 1 until they contain job-correlated v2
+/// records. `state check` reports the active maximum, not merely this ceiling.
+pub const LEGACY_DURABLE_STATE_FORMAT_VERSION: u32 = 1;
 pub const STATE_COMPATIBILITY_CONTRACT: &str = "vmcell.state-compatibility.v1";
 pub const MAX_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -302,6 +311,12 @@ impl StateStore {
         validate_job_operation_bindings(&self.root, &cells, &operations)
             .map_err(as_upgrade_required)?;
         let mut artifacts = 0_u64;
+        let mut durable_state_format_version = cells
+            .iter()
+            .map(|cell| cell.schema_version)
+            .chain(operations.iter().map(|operation| operation.schema_version))
+            .max()
+            .unwrap_or(LEGACY_DURABLE_STATE_FORMAT_VERSION);
         for operation in &operations {
             if operation.artifact_id == Some(operation.id) && operation.artifact_pruned_at.is_none()
             {
@@ -316,6 +331,8 @@ impl StateStore {
                     &artifact,
                 )
                 .map_err(as_upgrade_required)?;
+                durable_state_format_version =
+                    durable_state_format_version.max(artifact.schema_version);
                 artifacts = artifacts.saturating_add(1);
             }
         }
@@ -334,7 +351,7 @@ impl StateStore {
         Ok(StateCompatibilityReport {
             schema_version: STATE_COMPATIBILITY_SCHEMA_VERSION,
             contract: STATE_COMPATIBILITY_CONTRACT,
-            durable_state_format_version: DURABLE_STATE_FORMAT_VERSION,
+            durable_state_format_version,
             status,
             checked_at: Utc::now(),
             counts,
@@ -641,7 +658,7 @@ impl StateStore {
             Ok(_) | Err(StateError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        self.validate_operation_parent_binding(&path, record)?;
+        self.validate_operation_parent_binding_for_write(&path, record)?;
         write_json_atomic(&path, record)
     }
 
@@ -674,7 +691,44 @@ impl StateStore {
         Ok(records)
     }
 
+    /// Require the exact parent-cell binding before a caller changes durable
+    /// operation or artifact state. Read compatibility for a historical v1
+    /// orphan intentionally does not extend to recovery or pruning authority.
+    pub(crate) fn require_guest_operation_parent_for_mutation(
+        &self,
+        operation: &GuestOperationRecord,
+    ) -> Result<(), StateError> {
+        self.validate_operation_parent_binding_for_write(
+            &self.guest_operation_path(operation.id),
+            operation,
+        )
+    }
+
     fn validate_operation_parent_binding(
+        &self,
+        path: &Path,
+        operation: &GuestOperationRecord,
+    ) -> Result<(), StateError> {
+        match self.load_cell(operation.cell_id) {
+            Ok(cell) => validate_operation_job_binding(path, &cell, operation),
+            // v0.3 format-1 state permitted an uncorrelated operation whose
+            // former cell record was unavailable. Preserve that read
+            // compatibility: the record confers no lifecycle authority, and
+            // any engine recovery path still requires the cell separately.
+            Err(StateError::NotFound(_)) if operation.job_id.is_none() => Ok(()),
+            Err(StateError::NotFound(_)) => Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "guest operation references a missing cell",
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Managed writes always require their parent cell. This is deliberately
+    /// stricter than read compatibility for an old uncorrelated operation:
+    /// historical evidence remains inspectable, but cannot be reconciled,
+    /// pruned, or rewritten without the exact cell authority.
+    fn validate_operation_parent_binding_for_write(
         &self,
         path: &Path,
         operation: &GuestOperationRecord,
@@ -757,6 +811,7 @@ impl StateStore {
             });
         }
         let operation = self.load_guest_operation(record.id)?;
+        self.require_guest_operation_parent_for_mutation(&operation)?;
         validate_artifact_job_binding(&path, &operation, record)?;
         let expected_prefix = format!("artifacts/{}/{}/files/", guard.cell_id, guard.operation_id);
         if record.entries.iter().any(|entry| {
@@ -1827,11 +1882,12 @@ fn windows_path_has_stream_or_device_ambiguity(_path: &Path) -> bool {
 }
 
 fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateError> {
-    ensure_schema(
+    ensure_schema_one_of(
         path,
         "cell record",
         record.schema_version,
-        CELL_SCHEMA_VERSION,
+        &[CELL_SCHEMA_VERSION, JOB_CORRELATED_CELL_SCHEMA_VERSION],
+        MAX_CELL_SCHEMA_VERSION,
     )?;
     ensure_schema(
         path,
@@ -1848,8 +1904,22 @@ fn validate_cell_schema(path: &Path, record: &CellRecord) -> Result<(), StateErr
             expected: expected.unwrap_or("<non-utf8>").to_owned(),
         });
     }
-    if let Some(job) = &record.job {
-        validate_job_correlation(path, job)?;
+    match (record.schema_version, &record.job) {
+        (CELL_SCHEMA_VERSION, None) => {}
+        (CELL_SCHEMA_VERSION, Some(_)) => {
+            return Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "cell schema v1 must not carry job correlation",
+            });
+        }
+        (JOB_CORRELATED_CELL_SCHEMA_VERSION, Some(job)) => validate_job_correlation(path, job)?,
+        (JOB_CORRELATED_CELL_SCHEMA_VERSION, None) => {
+            return Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "cell schema v2 requires job correlation",
+            });
+        }
+        _ => unreachable!("schema version was checked above"),
     }
     Ok(())
 }
@@ -1926,13 +1996,20 @@ fn validate_job_operation_bindings(
         let path = root
             .join("operations")
             .join(format!("{}.json", operation.id));
-        let cell = cells_by_id.get(&operation.cell_id).ok_or_else(|| {
-            StateError::JobCorrelationIntegrity {
-                path: path.clone(),
-                reason: "guest operation references a missing cell",
+        match cells_by_id.get(&operation.cell_id) {
+            Some(cell) => validate_operation_job_binding(&path, cell, operation)?,
+            // Legacy/direct operations without a job correlation remain
+            // readable under durable format 1 even if their old cell record
+            // is no longer present. They are observational only; no engine
+            // action may use them as a substitute for cell authority.
+            None if operation.job_id.is_none() => {}
+            None => {
+                return Err(StateError::JobCorrelationIntegrity {
+                    path,
+                    reason: "guest operation references a missing cell",
+                });
             }
-        })?;
-        validate_operation_job_binding(&path, cell, operation)?;
+        }
     }
     Ok(())
 }
@@ -1961,11 +2038,15 @@ fn validate_guest_operation_schema(
     path: &Path,
     record: &GuestOperationRecord,
 ) -> Result<(), StateError> {
-    ensure_schema(
+    ensure_schema_one_of(
         path,
         "guest operation record",
         record.schema_version,
-        GUEST_OPERATION_SCHEMA_VERSION,
+        &[
+            GUEST_OPERATION_SCHEMA_VERSION,
+            JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION,
+        ],
+        MAX_GUEST_OPERATION_SCHEMA_VERSION,
     )?;
     let expected = path.file_stem().and_then(|value| value.to_str());
     let record_id = record.id.to_string();
@@ -1975,6 +2056,23 @@ fn validate_guest_operation_schema(
             path: path.to_path_buf(),
             expected: expected.unwrap_or("<non-utf8>").to_owned(),
         });
+    }
+    match (record.schema_version, record.job_id) {
+        (GUEST_OPERATION_SCHEMA_VERSION, None)
+        | (JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION, Some(_)) => {}
+        (GUEST_OPERATION_SCHEMA_VERSION, Some(_)) => {
+            return Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "guest operation schema v1 must not carry job correlation",
+            });
+        }
+        (JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION, None) => {
+            return Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "guest operation schema v2 requires job correlation",
+            });
+        }
+        _ => unreachable!("schema version was checked above"),
     }
     let fields_are_valid = match record.phase {
         crate::core::guest::GuestOperationPhase::IntentRecorded => {
@@ -2066,12 +2164,32 @@ fn validate_guest_operation_schema(
 }
 
 fn validate_artifact_schema(path: &Path, record: &ArtifactRecord) -> Result<(), StateError> {
-    ensure_schema(
+    ensure_schema_one_of(
         path,
         "artifact record",
         record.schema_version,
-        ARTIFACT_SCHEMA_VERSION,
+        &[
+            ARTIFACT_SCHEMA_VERSION,
+            JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION,
+        ],
+        MAX_ARTIFACT_SCHEMA_VERSION,
     )?;
+    match (record.schema_version, record.job_id) {
+        (ARTIFACT_SCHEMA_VERSION, None) | (JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION, Some(_)) => {}
+        (ARTIFACT_SCHEMA_VERSION, Some(_)) => {
+            return Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "artifact schema v1 must not carry job correlation",
+            });
+        }
+        (JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION, None) => {
+            return Err(StateError::JobCorrelationIntegrity {
+                path: path.to_path_buf(),
+                reason: "artifact schema v2 requires job correlation",
+            });
+        }
+        _ => unreachable!("schema version was checked above"),
+    }
     if record.entries.is_empty() || record.entries.len() > MAX_ARTIFACT_FILES {
         return Err(StateError::ArtifactIntegrity {
             path: path.to_path_buf(),
@@ -2184,6 +2302,25 @@ fn ensure_schema(
             kind,
             path: path.to_path_buf(),
             expected,
+            actual,
+        })
+    }
+}
+
+fn ensure_schema_one_of(
+    path: &Path,
+    kind: &'static str,
+    actual: u32,
+    supported: &[u32],
+    highest_supported: u32,
+) -> Result<(), StateError> {
+    if supported.contains(&actual) {
+        Ok(())
+    } else {
+        Err(StateError::UnsupportedSchema {
+            kind,
+            path: path.to_path_buf(),
+            expected: highest_supported,
             actual,
         })
     }
@@ -2415,6 +2552,17 @@ mod tests {
         }
     }
 
+    fn test_job_cell_record(
+        store: &StateStore,
+        cell_id: CellId,
+        job: JobCorrelation,
+    ) -> CellRecord {
+        let mut cell = test_cell_record(store, cell_id);
+        cell.schema_version = CellRecord::schema_version_for_job(Some(&job));
+        cell.job = Some(job);
+        cell
+    }
+
     fn phase_and_state(label: &str) -> (CellPhase, CellState) {
         match label {
             "intent" => (CellPhase::IntentRecorded, CellState::Creating),
@@ -2459,7 +2607,9 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_check_is_read_only_for_empty_and_v01_state() {
+    fn compatibility_check_is_read_only_for_empty_and_field_omitting_legacy_state() {
+        use crate::core::job::{JobCorrelation, JobId};
+
         let directory = tempdir().unwrap();
         let empty_root = directory.path().join("empty-state");
         let empty = StateStore::new(empty_root.clone())
@@ -2469,7 +2619,7 @@ mod tests {
         assert_eq!(empty.counts, StateCompatibilityCounts::default());
         assert!(!empty_root.exists());
 
-        let store = StateStore::new(directory.path().join("v01-state"));
+        let store = StateStore::new(directory.path().join("legacy-state"));
         let mutation = store.acquire_mutation_lock().unwrap();
         store.installation().unwrap();
         let image_id = ImageId::parse("crash-base").unwrap();
@@ -2481,27 +2631,87 @@ mod tests {
             variants: vec![ImageVariant {
                 provider: "hyperv".to_owned(),
                 disk_format: "vhdx".to_owned(),
-                path: directory.path().join("v01-base.vhdx"),
-                sha256: "v01-fixture-hash".to_owned(),
+                path: directory.path().join("legacy-base.vhdx"),
+                sha256: "legacy-fixture-hash".to_owned(),
                 file_size: 42,
             }],
             registered_at: Utc::now(),
         };
         store.save_image_new(&image).unwrap();
         let cell_id = CellId::new();
-        store.save_cell(&test_cell_record(&store, cell_id)).unwrap();
         let now = Utc::now();
-        let mut operation = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
-        operation.phase = GuestOperationPhase::Failed;
-        operation.failure = Some(GuestFailureClass::Authentication);
-        operation.completed_at = Some(now);
+        let correlation =
+            JobCorrelation::new(JobId::new(), "a".repeat(64), now).expect("valid correlation");
+        let cell = test_job_cell_record(&store, cell_id, correlation.clone());
+        store.save_cell(&cell).unwrap();
+        let mut operation = GuestOperationRecord::intent_with_job(
+            cell_id,
+            GuestOperationKind::ArtifactCollect,
+            now,
+            Some(correlation.job_id),
+        );
+        operation.phase = GuestOperationPhase::TransportActive;
         store.save_guest_operation(&operation).unwrap();
+        let guard = store.prepare_artifact_root(cell_id, operation.id).unwrap();
+        let relative = store
+            .write_artifact_file(&guard, 0, b"legacy-correlation-artifact")
+            .unwrap();
+        let artifact = ArtifactRecord {
+            schema_version: ArtifactRecord::schema_version_for_job(Some(correlation.job_id)),
+            id: operation.id,
+            cell_id,
+            created_at: now,
+            entries: vec![ArtifactEntry {
+                guest_path: "results/output.bin".to_owned(),
+                host_relative_path: relative,
+                sha256: format!("{:x}", Sha256::digest(b"legacy-correlation-artifact")),
+                size: 27,
+            }],
+            job_id: Some(correlation.job_id),
+        };
+        store.save_artifact_new(&guard, &artifact).unwrap();
+        operation.phase = GuestOperationPhase::ArtifactCommitted;
+        operation.artifact_id = Some(operation.id);
+        store.save_guest_operation(&operation).unwrap();
+
+        let cell_path = store.cell_path(cell_id);
         let operation_path = store.guest_operation_path(operation.id);
+        let artifact_path = store
+            .artifact_root(cell_id, operation.id)
+            .join("manifest.json");
+        let mut legacy_cell = serde_json::to_value(&cell).unwrap();
+        assert!(legacy_cell.as_object_mut().unwrap().remove("job").is_some());
+        legacy_cell["schema_version"] = serde_json::json!(CELL_SCHEMA_VERSION);
         let mut legacy_operation = serde_json::to_value(&operation).unwrap();
-        legacy_operation
-            .as_object_mut()
-            .unwrap()
-            .remove("artifact_pruned_at");
+        assert!(
+            legacy_operation
+                .as_object_mut()
+                .unwrap()
+                .remove("artifact_pruned_at")
+                .is_some()
+        );
+        assert!(
+            legacy_operation
+                .as_object_mut()
+                .unwrap()
+                .remove("job_id")
+                .is_some()
+        );
+        legacy_operation["schema_version"] = serde_json::json!(GUEST_OPERATION_SCHEMA_VERSION);
+        let mut legacy_artifact = serde_json::to_value(&artifact).unwrap();
+        assert!(
+            legacy_artifact
+                .as_object_mut()
+                .unwrap()
+                .remove("job_id")
+                .is_some()
+        );
+        legacy_artifact["schema_version"] = serde_json::json!(ARTIFACT_SCHEMA_VERSION);
+        fs::write(
+            &cell_path,
+            format!("{}\n", serde_json::to_string_pretty(&legacy_cell).unwrap()),
+        )
+        .unwrap();
         fs::write(
             &operation_path,
             format!(
@@ -2510,13 +2720,23 @@ mod tests {
             ),
         )
         .unwrap();
+        fs::write(
+            &artifact_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&legacy_artifact).unwrap()
+            ),
+        )
+        .unwrap();
+        drop(guard);
         drop(mutation);
 
         let tracked_paths = [
             store.root().join("installation.json"),
             store.image_path(&image.id),
-            store.cell_path(cell_id),
+            cell_path,
             operation_path,
+            artifact_path,
         ];
         let before = tracked_paths
             .iter()
@@ -2535,8 +2755,82 @@ mod tests {
         assert_eq!(report.counts.images, 1);
         assert_eq!(report.counts.cells, 1);
         assert_eq!(report.counts.guest_operations, 1);
-        assert_eq!(report.counts.artifacts, 0);
+        assert_eq!(report.counts.artifacts, 1);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn field_omitting_legacy_operation_without_a_parent_cell_remains_readable() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("legacy-operation-state"));
+        let mutation = store.acquire_mutation_lock().unwrap();
+        let now = Utc::now();
+        let mut operation =
+            GuestOperationRecord::intent(CellId::new(), GuestOperationKind::Exec, now);
+        operation.phase = GuestOperationPhase::Failed;
+        operation.failure = Some(GuestFailureClass::Authentication);
+        operation.completed_at = Some(now);
+        let path = store.guest_operation_path(operation.id);
+        let mut legacy = serde_json::to_value(&operation).unwrap();
+        assert!(
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("artifact_pruned_at")
+                .is_some()
+        );
+        assert!(legacy.get("job_id").is_none());
+        write_json_atomic(&path, &legacy).unwrap();
+        drop(mutation);
+
+        let before = fs::read(&path).unwrap();
+        assert_eq!(store.load_guest_operation(operation.id).unwrap(), operation);
+        assert_eq!(
+            store.list_guest_operations().unwrap(),
+            vec![operation.clone()]
+        );
+        let report = store.check_compatibility().unwrap();
+        let after = fs::read(&path).unwrap();
+
+        assert_eq!(report.status, StateCompatibilityStatus::Compatible);
+        assert_eq!(report.counts.cells, 0);
+        assert_eq!(report.counts.guest_operations, 1);
+        assert_eq!(after, before);
+        assert!(matches!(
+            store.save_guest_operation(&operation),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "guest operation references a missing cell",
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let guard = store
+            .prepare_artifact_root(operation.cell_id, operation.id)
+            .unwrap();
+        let relative = store
+            .write_artifact_file(&guard, 0, b"legacy-orphan-artifact")
+            .unwrap();
+        let artifact = ArtifactRecord {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            id: operation.id,
+            cell_id: operation.cell_id,
+            created_at: now,
+            entries: vec![ArtifactEntry {
+                guest_path: "results/orphan.bin".to_owned(),
+                host_relative_path: relative,
+                sha256: format!("{:x}", Sha256::digest(b"legacy-orphan-artifact")),
+                size: 22,
+            }],
+            job_id: None,
+        };
+        assert!(matches!(
+            store.save_artifact_new(&guard, &artifact),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "guest operation references a missing cell",
+                ..
+            })
+        ));
+        assert!(!guard.root.join("manifest.json").exists());
     }
 
     #[test]
@@ -2879,7 +3173,9 @@ mod tests {
         let store = StateStore::new(directory.path().join("state"));
         let _mutation = store.acquire_mutation_lock().unwrap();
         let cell_id = CellId::new();
-        store.save_cell(&test_cell_record(&store, cell_id)).unwrap();
+        let cell = test_cell_record(&store, cell_id);
+        assert!(serde_json::to_value(&cell).unwrap().get("job").is_none());
+        store.save_cell(&cell).unwrap();
         let now = Utc::now();
         let mut operation = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
         operation.phase = GuestOperationPhase::Failed;
@@ -2890,6 +3186,7 @@ mod tests {
         let operation_json = fs::read_to_string(store.guest_operation_path(operation.id)).unwrap();
         assert!(!operation_json.contains("credential-sentinel"));
         assert!(!operation_json.contains("argument-sentinel"));
+        assert!(!operation_json.contains("\"job_id\""));
 
         let mut ambiguous = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
         ambiguous.phase = GuestOperationPhase::Failed;
@@ -2925,6 +3222,12 @@ mod tests {
         };
         store.save_artifact_new(&guard, &artifact).unwrap();
         assert_eq!(store.load_artifact(cell_id, artifact_id).unwrap(), artifact);
+        assert!(
+            serde_json::to_value(&artifact)
+                .unwrap()
+                .get("job_id")
+                .is_none()
+        );
 
         let mut oversized_file = artifact.clone();
         oversized_file.entries[0].size = MAX_ARTIFACT_FILE_BYTES + 1;
@@ -2956,7 +3259,7 @@ mod tests {
 
         let manifest_path = guard.root.join("manifest.json");
         let mut unsupported = artifact.clone();
-        unsupported.schema_version = ARTIFACT_SCHEMA_VERSION + 1;
+        unsupported.schema_version = MAX_ARTIFACT_SCHEMA_VERSION + 1;
         fs::write(&manifest_path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
         assert!(matches!(
             store.load_artifact(cell_id, artifact_id),
@@ -2989,8 +3292,7 @@ mod tests {
         let now = Utc::now();
         let correlation =
             JobCorrelation::new(JobId::new(), "d".repeat(64), now).expect("valid correlation");
-        let mut cell = test_cell_record(&store, cell_id);
-        cell.job = Some(correlation.clone());
+        let cell = test_job_cell_record(&store, cell_id, correlation.clone());
         store.save_cell(&cell).unwrap();
 
         let operation = GuestOperationRecord::intent_with_job(
@@ -3003,6 +3305,7 @@ mod tests {
 
         let mut mutated_cell = cell.clone();
         mutated_cell.job = None;
+        mutated_cell.schema_version = CellRecord::schema_version_for_job(None);
         assert!(matches!(
             store.save_cell(&mutated_cell),
             Err(StateError::JobCorrelationIntegrity {
@@ -3013,6 +3316,7 @@ mod tests {
 
         let mut mutated_operation = operation.clone();
         mutated_operation.job_id = None;
+        mutated_operation.schema_version = GuestOperationRecord::schema_version_for_job(None);
         assert!(matches!(
             store.save_guest_operation(&mutated_operation),
             Err(StateError::JobCorrelationIntegrity {
@@ -3040,7 +3344,7 @@ mod tests {
             .write_artifact_file(&guard, 0, b"correlated-artifact")
             .unwrap();
         let artifact = ArtifactRecord {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
+            schema_version: ArtifactRecord::schema_version_for_job(Some(JobId::new())),
             id: operation.id,
             cell_id,
             created_at: now,
@@ -3065,8 +3369,7 @@ mod tests {
             job_spec_sha256: "not-a-digest".to_owned(),
             started_at: now,
         };
-        let mut invalid_cell = test_cell_record(&store, CellId::new());
-        invalid_cell.job = Some(invalid);
+        let invalid_cell = test_job_cell_record(&store, CellId::new(), invalid);
         assert!(matches!(
             store.save_cell(&invalid_cell),
             Err(StateError::JobCorrelationIntegrity {
@@ -3074,6 +3377,216 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn job_correlated_records_use_v2_and_direct_operations_on_them_remain_v1() {
+        use crate::core::job::{JobCorrelation, JobId};
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let _mutation = store.acquire_mutation_lock().unwrap();
+        let cell_id = CellId::new();
+        let now = Utc::now();
+        let correlation =
+            JobCorrelation::new(JobId::new(), "7".repeat(64), now).expect("valid correlation");
+        let cell = test_job_cell_record(&store, cell_id, correlation.clone());
+        store.save_cell(&cell).unwrap();
+        assert_eq!(cell.schema_version, JOB_CORRELATED_CELL_SCHEMA_VERSION);
+
+        let mut operation = GuestOperationRecord::intent_with_job(
+            cell_id,
+            GuestOperationKind::ArtifactCollect,
+            now,
+            Some(correlation.job_id),
+        );
+        assert_eq!(
+            operation.schema_version,
+            JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION
+        );
+        operation.phase = GuestOperationPhase::TransportActive;
+        store.save_guest_operation(&operation).unwrap();
+
+        let guard = store.prepare_artifact_root(cell_id, operation.id).unwrap();
+        let relative = store
+            .write_artifact_file(&guard, 0, b"v2-correlated-artifact")
+            .unwrap();
+        let artifact = ArtifactRecord {
+            schema_version: ArtifactRecord::schema_version_for_job(Some(correlation.job_id)),
+            id: operation.id,
+            cell_id,
+            created_at: now,
+            entries: vec![ArtifactEntry {
+                guest_path: "results/v2.bin".to_owned(),
+                host_relative_path: relative,
+                sha256: format!("{:x}", Sha256::digest(b"v2-correlated-artifact")),
+                size: 22,
+            }],
+            job_id: Some(correlation.job_id),
+        };
+        store.save_artifact_new(&guard, &artifact).unwrap();
+        assert_eq!(
+            artifact.schema_version,
+            JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION
+        );
+
+        operation.phase = GuestOperationPhase::ArtifactCommitted;
+        operation.artifact_id = Some(operation.id);
+        store.save_guest_operation(&operation).unwrap();
+        operation.phase = GuestOperationPhase::Completed;
+        operation.completed_at = Some(now);
+        store.save_guest_operation(&operation).unwrap();
+        assert_eq!(
+            store
+                .load_guest_operation(operation.id)
+                .unwrap()
+                .schema_version,
+            JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .load_artifact(cell_id, operation.id)
+                .unwrap()
+                .schema_version,
+            JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION
+        );
+
+        // A later direct command on the retained job cell is intentionally not
+        // retroactively attributed and remains an ordinary v1 record.
+        let mut direct = GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
+        direct.phase = GuestOperationPhase::Failed;
+        direct.failure = Some(GuestFailureClass::Authentication);
+        direct.completed_at = Some(now);
+        store.save_guest_operation(&direct).unwrap();
+        assert_eq!(direct.schema_version, GUEST_OPERATION_SCHEMA_VERSION);
+        assert!(direct.job_id.is_none());
+
+        let report = store.check_compatibility().unwrap();
+        assert_eq!(report.status, StateCompatibilityStatus::Compatible);
+        assert_eq!(
+            report.durable_state_format_version,
+            DURABLE_STATE_FORMAT_VERSION
+        );
+    }
+
+    #[test]
+    fn correlation_and_schema_versions_are_mutually_required() {
+        use crate::core::job::{JobCorrelation, JobId};
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let _mutation = store.acquire_mutation_lock().unwrap();
+        let cell_id = CellId::new();
+        let now = Utc::now();
+        let correlation =
+            JobCorrelation::new(JobId::new(), "8".repeat(64), now).expect("valid correlation");
+
+        let mut v1_cell_with_job = test_job_cell_record(&store, cell_id, correlation.clone());
+        v1_cell_with_job.schema_version = CELL_SCHEMA_VERSION;
+        assert!(matches!(
+            store.save_cell(&v1_cell_with_job),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "cell schema v1 must not carry job correlation",
+                ..
+            })
+        ));
+        let mut v2_cell_without_job = test_cell_record(&store, cell_id);
+        v2_cell_without_job.schema_version = JOB_CORRELATED_CELL_SCHEMA_VERSION;
+        assert!(matches!(
+            store.save_cell(&v2_cell_without_job),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "cell schema v2 requires job correlation",
+                ..
+            })
+        ));
+
+        let cell = test_job_cell_record(&store, cell_id, correlation.clone());
+        store.save_cell(&cell).unwrap();
+        let mut v1_operation_with_job = GuestOperationRecord::intent_with_job(
+            cell_id,
+            GuestOperationKind::ArtifactCollect,
+            now,
+            Some(correlation.job_id),
+        );
+        v1_operation_with_job.schema_version = GUEST_OPERATION_SCHEMA_VERSION;
+        assert!(matches!(
+            store.save_guest_operation(&v1_operation_with_job),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "guest operation schema v1 must not carry job correlation",
+                ..
+            })
+        ));
+        let mut v2_operation_without_job =
+            GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
+        v2_operation_without_job.schema_version = JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION;
+        assert!(matches!(
+            store.save_guest_operation(&v2_operation_without_job),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "guest operation schema v2 requires job correlation",
+                ..
+            })
+        ));
+
+        let direct_operation =
+            GuestOperationRecord::intent(cell_id, GuestOperationKind::ArtifactCollect, now);
+        store.save_guest_operation(&direct_operation).unwrap();
+        let guard = store
+            .prepare_artifact_root(cell_id, direct_operation.id)
+            .unwrap();
+        let relative = store
+            .write_artifact_file(&guard, 0, b"schema-bound-artifact")
+            .unwrap();
+        let mut v1_artifact_with_job = ArtifactRecord {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            id: direct_operation.id,
+            cell_id,
+            created_at: now,
+            entries: vec![ArtifactEntry {
+                guest_path: "results/schema.bin".to_owned(),
+                host_relative_path: relative.clone(),
+                sha256: format!("{:x}", Sha256::digest(b"schema-bound-artifact")),
+                size: 21,
+            }],
+            job_id: Some(correlation.job_id),
+        };
+        assert!(matches!(
+            store.save_artifact_new(&guard, &v1_artifact_with_job),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "artifact schema v1 must not carry job correlation",
+                ..
+            })
+        ));
+        v1_artifact_with_job.schema_version = JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION;
+        v1_artifact_with_job.job_id = None;
+        assert!(matches!(
+            store.save_artifact_new(&guard, &v1_artifact_with_job),
+            Err(StateError::JobCorrelationIntegrity {
+                reason: "artifact schema v2 requires job correlation",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v03_style_v1_schema_gate_refuses_each_correlated_v2_record_before_mutation() {
+        let path = Path::new("v0.4-correlation.json");
+        for (kind, actual) in [
+            ("cell record", JOB_CORRELATED_CELL_SCHEMA_VERSION),
+            (
+                "guest operation record",
+                JOB_CORRELATED_GUEST_OPERATION_SCHEMA_VERSION,
+            ),
+            ("artifact record", JOB_CORRELATED_ARTIFACT_SCHEMA_VERSION),
+        ] {
+            assert!(matches!(
+                as_upgrade_required(ensure_schema(path, kind, actual, 1).unwrap_err()),
+                StateError::UpgradeRequired {
+                    kind: rejected_kind,
+                    supported: 1,
+                    actual: 2,
+                } if rejected_kind == kind
+            ));
+        }
     }
 
     #[test]
@@ -3085,12 +3598,10 @@ mod tests {
         let _mutation = store.acquire_mutation_lock().unwrap();
         let correlation = JobCorrelation::new(JobId::new(), "e".repeat(64), Utc::now()).unwrap();
 
-        let mut first = test_cell_record(&store, CellId::new());
-        first.job = Some(correlation.clone());
+        let first = test_job_cell_record(&store, CellId::new(), correlation.clone());
         store.save_cell(&first).unwrap();
 
-        let mut second = test_cell_record(&store, CellId::new());
-        second.job = Some(correlation);
+        let second = test_job_cell_record(&store, CellId::new(), correlation);
         assert!(matches!(
             store.save_cell(&second),
             Err(StateError::JobCorrelationIntegrity {
@@ -3130,8 +3641,7 @@ mod tests {
         let now = Utc::now();
         let correlation =
             JobCorrelation::new(JobId::new(), "f".repeat(64), now).expect("valid correlation");
-        let mut cell = test_cell_record(&store, cell_id);
-        cell.job = Some(correlation.clone());
+        let cell = test_job_cell_record(&store, cell_id, correlation.clone());
         store.save_cell(&cell).unwrap();
 
         let mut operation = GuestOperationRecord::intent_with_job(
@@ -3150,7 +3660,9 @@ mod tests {
             .save_artifact_new(
                 &guard,
                 &ArtifactRecord {
-                    schema_version: ARTIFACT_SCHEMA_VERSION,
+                    schema_version: ArtifactRecord::schema_version_for_job(Some(
+                        correlation.job_id,
+                    )),
                     id: operation.id,
                     cell_id,
                     created_at: now,
@@ -3269,7 +3781,7 @@ mod tests {
             Err(StateError::GuestOperationIntegrity { .. })
         ));
 
-        operation.schema_version = GUEST_OPERATION_SCHEMA_VERSION + 1;
+        operation.schema_version = MAX_GUEST_OPERATION_SCHEMA_VERSION + 1;
         write_json_atomic(&operation_path, &operation).unwrap();
         assert!(matches!(
             store.load_guest_operation(requested_id),
@@ -3944,7 +4456,7 @@ mod tests {
             store.cell_overlay_path(cell_id),
         );
         let mut cell = CellRecord {
-            schema_version: CELL_SCHEMA_VERSION + 1,
+            schema_version: MAX_CELL_SCHEMA_VERSION + 1,
             id: cell_id,
             provider: "hyperv".to_owned(),
             spec: CellSpec {
