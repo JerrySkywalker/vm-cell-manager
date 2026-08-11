@@ -68,7 +68,7 @@ pub fn resolve_job_plan(
     image: &ImageRecord,
     probes: &[ProviderProbe],
 ) -> Result<ResolvedJobPlan, RunSelectionError> {
-    let spec = &loaded.spec;
+    let spec = loaded.spec();
     let execution = resolve_run_execution_plan(
         host,
         image,
@@ -88,7 +88,7 @@ pub fn resolve_job_plan(
         authorizing: false,
         job_spec_contract: JOB_SPEC_CONTRACT.to_owned(),
         job_spec_schema_version: spec.schema_version,
-        job_spec_sha256: loaded.source_sha256.clone(),
+        job_spec_sha256: loaded.source_sha256().to_owned(),
         execution,
         resources: JobResourcePlan {
             cpu_count: spec.cpu_count,
@@ -157,11 +157,11 @@ sources = ["results/output.txt"]
 "#;
 
     fn loaded_spec() -> LoadedJobSpec {
-        LoadedJobSpec {
-            path: "job.toml".into(),
-            source_sha256: "a".repeat(64),
-            spec: super::super::job_spec::parse_job_spec(SPEC).unwrap(),
-        }
+        LoadedJobSpec::from_validated_parts_for_test(
+            "job.toml".into(),
+            "a".repeat(64),
+            super::super::job_spec::parse_job_spec(SPEC).unwrap(),
+        )
     }
 
     fn image() -> ImageRecord {
@@ -238,9 +238,11 @@ sources = ["results/output.txt"]
 
     #[test]
     fn absent_spec_provider_uses_native_selection_not_a_config_preference() {
-        let mut loaded = loaded_spec();
-        loaded.spec.provider = None;
-        loaded.spec.accelerator = None;
+        let mut spec = super::super::job_spec::parse_job_spec(SPEC).unwrap();
+        spec.provider = None;
+        spec.accelerator = None;
+        let loaded =
+            LoadedJobSpec::from_validated_parts_for_test("job.toml".into(), "a".repeat(64), spec);
         let plan = resolve_job_plan(
             &loaded,
             HostPlatform {

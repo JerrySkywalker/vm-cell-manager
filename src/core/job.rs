@@ -55,6 +55,44 @@ impl FromStr for JobId {
 #[error("invalid job id: {0}")]
 pub struct JobIdError(#[source] uuid::Error);
 
+/// Immutable, durable provenance for records created by one job invocation.
+///
+/// This is observability metadata only.  It never grants lifecycle authority,
+/// provider ownership, replay permission, or cleanup rights.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCorrelation {
+    pub job_id: JobId,
+    pub job_spec_sha256: String,
+    pub started_at: DateTime<Utc>,
+}
+
+impl JobCorrelation {
+    /// Construct a durable correlation only from a canonical SHA-256 binding.
+    pub fn new(
+        job_id: JobId,
+        job_spec_sha256: impl Into<String>,
+        started_at: DateTime<Utc>,
+    ) -> Result<Self, JobRunContextError> {
+        let job_spec_sha256 = job_spec_sha256.into();
+        if job_id.0.is_nil() {
+            return Err(JobRunContextError::InvalidJobId);
+        }
+        if !is_lowercase_sha256(&job_spec_sha256) {
+            return Err(JobRunContextError::InvalidSpecDigest);
+        }
+        Ok(Self {
+            job_id,
+            job_spec_sha256,
+            started_at,
+        })
+    }
+
+    #[must_use]
+    pub fn has_valid_spec_digest(&self) -> bool {
+        is_lowercase_sha256(&self.job_spec_sha256)
+    }
+}
+
 /// Non-serialized execution context established before the lifecycle call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRunContext {
@@ -86,6 +124,18 @@ impl JobRunContext {
         self.job_id
     }
 
+    /// Return the immutable durable projection established before lifecycle
+    /// mutation.  It intentionally excludes command data and credentials.
+    #[must_use]
+    pub fn correlation(&self) -> JobCorrelation {
+        // `new` has already validated this digest at construction time.
+        JobCorrelation {
+            job_id: self.job_id,
+            job_spec_sha256: self.job_spec_sha256.clone(),
+            started_at: self.started_at,
+        }
+    }
+
     #[must_use]
     pub fn result_metadata(&self, completed_at: DateTime<Utc>) -> JobResultMetadata {
         let completed_at = completed_at.max(self.started_at);
@@ -107,6 +157,8 @@ impl JobRunContext {
 
 #[derive(Debug, Error)]
 pub enum JobRunContextError {
+    #[error("job execution requires a non-nil job identity")]
+    InvalidJobId,
     #[error("job execution requires an exact lower-case SHA-256 job-spec digest")]
     InvalidSpecDigest,
 }
@@ -169,5 +221,28 @@ mod tests {
                 Err(JobRunContextError::InvalidSpecDigest)
             ));
         }
+    }
+
+    #[test]
+    fn durable_correlation_excludes_execution_secrets_and_validates_digest() {
+        let started = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+        let context = JobRunContext::new("b".repeat(64), started).unwrap();
+        let correlation = context.correlation();
+
+        assert_eq!(correlation.job_id, context.job_id());
+        assert!(correlation.has_valid_spec_digest());
+        assert!(
+            !serde_json::to_string(&correlation)
+                .unwrap()
+                .contains("credential-sentinel")
+        );
+        assert!(matches!(
+            JobCorrelation::new(JobId::new(), "B".repeat(64), started),
+            Err(JobRunContextError::InvalidSpecDigest)
+        ));
+        assert!(matches!(
+            JobCorrelation::new(JobId(Uuid::nil()), "b".repeat(64), started),
+            Err(JobRunContextError::InvalidJobId)
+        ));
     }
 }

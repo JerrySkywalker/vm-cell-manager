@@ -105,11 +105,44 @@ pub struct JobArtifactSpec {
 /// The canonicalized file and its validated contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedJobSpec {
-    pub path: PathBuf,
+    path: PathBuf,
     /// SHA-256 of the exact bounded source bytes.  It binds a later plan or
     /// result to an input document without serializing the document itself.
-    pub source_sha256: String,
-    pub spec: JobSpec,
+    source_sha256: String,
+    spec: JobSpec,
+}
+
+impl LoadedJobSpec {
+    /// Canonical path of the ordinary job document accepted by the loader.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// SHA-256 of the exact bounded source bytes accepted by the loader.
+    #[must_use]
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
+    /// Validated, normalized non-authorizing job configuration.
+    #[must_use]
+    pub fn spec(&self) -> &JobSpec {
+        &self.spec
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_validated_parts_for_test(
+        path: PathBuf,
+        source_sha256: String,
+        spec: JobSpec,
+    ) -> Self {
+        Self {
+            path,
+            source_sha256,
+            spec,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

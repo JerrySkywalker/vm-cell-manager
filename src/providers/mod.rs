@@ -638,6 +638,7 @@ pub(crate) fn test_mutation_fixture_for(
         updated_at: Utc::now(),
         expires_at: None,
         last_error: None,
+        job: None,
     };
     (directory, state, installation_authority, runtime, record)
 }
