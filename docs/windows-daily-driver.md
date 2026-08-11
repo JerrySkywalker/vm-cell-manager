@@ -1,8 +1,10 @@
 # Windows Daily Driver
 
-This is the canonical repository-local v0.2 Windows workflow. It joins the
-portable installation, state compatibility, image, run, retained-cell,
-diagnostic, shell, recovery, cleanup, and upgrade contracts into one sequence.
+This canonical Windows workflow was established for v0.2 and remains the
+Windows/Hyper-V daily-driver contract in the repository-local `0.3.0`
+candidate. It joins portable installation, state compatibility, image, run,
+retained-cell, diagnostic, shell, recovery, cleanup, and upgrade into one
+sequence.
 
 > **Release gate:** repository-local tests and core CI do not accept a real
 > Hyper-V host, PowerShell Direct session, VHDX, or guest account. Run the
@@ -20,7 +22,7 @@ Set the accepted version and downloaded files, verify the checksum, and keep
 the archive's versioned top-level directory:
 
 ```powershell
-$version = '0.2.0'
+$version = '0.3.0'
 $download = Join-Path $HOME 'Downloads\vmcell'
 $archive = Join-Path $download "vmcell-v$version-windows-x86_64.zip"
 $checksums = Join-Path $download 'SHA256SUMS.txt'

@@ -2,10 +2,10 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha. The repository-local v0.2 Windows Daily Driver
-> candidate is implemented on `dev` over the M1-M5 foundations. It is not a
-> public release. Real Hyper-V, PowerShell Direct, guest, QEMU, KVM, WHPX, and
-> HVF acceptance remains separately gated and is not run by core CI.
+> **Status:** pre-alpha. The repository-local `0.3.0` Cross-Platform Human MVP
+> candidate is complete on `dev` over the M1-M5 foundations. It is not a public
+> release. Real Hyper-V, PowerShell Direct, QEMU, WHPX, KVM, QGA, and HVF
+> acceptance remains separately gated and is not established by core CI.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -398,6 +398,10 @@ The first milestones are intentionally incremental:
   typed KVM admission, bounded Unix control endpoints, exact process/state
   identity, [walkthrough](docs/linux-kvm-qga.md), and non-mutating acceptance
   preflight are implemented; real KVM/QGA acceptance remains pending.
+- **v0.3 Linux distribution:** the deterministic `x86_64-unknown-linux-gnu`
+  portable candidate, exact build provenance, checksum layers, completions,
+  and unprivileged install/upgrade/remove contract are implemented; no package
+  repository or public release has been published.
 - **M5 — automation hardening:** repository-local implementation is merged; stable JSON, deterministic failures, reconciliation, contention, retention, and automation CLI contracts are covered by cross-provider tests.
 
 Provider-specific capabilities such as TPM, Secure Boot, nested virtualization, GPU/device support, or additional native providers come only after the core lifecycle is stable.
@@ -414,7 +418,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-Core CI runs Rust checks on a dedicated self-hosted Windows runner with no Hyper-V mutation responsibilities. Real provider integration belongs on a separate explicitly privileged and isolated runner; the existing `core` runner must never be repurposed for it.
+Core CI runs Rust checks on a dedicated self-hosted Windows runner with no
+Hyper-V mutation responsibilities. A manual exact-SHA GitHub-hosted Ubuntu lane
+provides non-privileged native-Linux compile, test, and package evidence without
+virtualization lifecycle mutation. Real provider integration belongs on a
+separate explicitly privileged and isolated runner; neither repository lane is
+real-platform acceptance.
 
 ## License
 

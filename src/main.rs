@@ -33,6 +33,8 @@ use vm_cell_manager::core::run_selection::{
     resolve_run_execution_plan,
 };
 use vm_cell_manager::core::support::{Accelerator, ProviderId};
+#[cfg(test)]
+use vm_cell_manager::core::support::{GuestTransportId, HostOs, SupportStatus};
 use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
     GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
@@ -2599,22 +2601,40 @@ fn emit<T: Serialize>(
 mod tests {
     use super::*;
 
-    fn test_run_plan() -> RunExecutionPlan {
+    fn test_run_plan_for(
+        image: &str,
+        host_os: HostOs,
+        guest_os: GuestOs,
+        provider: ProviderId,
+        accelerator: Accelerator,
+        guest_transport: GuestTransportId,
+    ) -> RunExecutionPlan {
         RunExecutionPlan {
             schema_version: vm_cell_manager::core::run_selection::RUN_PLAN_SCHEMA_VERSION,
             contract: vm_cell_manager::core::run_selection::RUN_PLAN_CONTRACT.to_owned(),
-            image: "windows-dev".parse().unwrap(),
-            host_os: vm_cell_manager::core::support::HostOs::Windows,
+            image: image.parse().unwrap(),
+            host_os,
             host_architecture: Architecture::X86_64,
-            guest_os: GuestOs::Windows,
+            guest_os,
             guest_architecture: Architecture::X86_64,
-            provider: ProviderId::Hyperv,
-            accelerator: Accelerator::HyperV,
-            guest_transport: vm_cell_manager::core::support::GuestTransportId::PowerShellDirect,
-            support_status: vm_cell_manager::core::support::SupportStatus::Untested,
+            provider,
+            accelerator,
+            guest_transport,
+            support_status: SupportStatus::Untested,
             selection_source: RunSelectionSource::NativeDefault,
             authorizing: false,
         }
+    }
+
+    fn test_run_plan() -> RunExecutionPlan {
+        test_run_plan_for(
+            "windows-dev",
+            HostOs::Windows,
+            GuestOs::Windows,
+            ProviderId::Hyperv,
+            Accelerator::HyperV,
+            GuestTransportId::PowerShellDirect,
+        )
     }
 
     #[test]
@@ -2774,29 +2794,67 @@ mod tests {
     }
 
     #[test]
-    fn run_plan_human_and_json_contracts_are_safe_and_versioned() {
-        let plan = test_run_plan();
-        let mut human = Vec::new();
-        write_human_run_plan(&plan, &mut human).unwrap();
-        let human = String::from_utf8(human).unwrap();
-        assert_eq!(
-            human,
-            "vmcell: run plan: image=windows-dev provider=hyperv accelerator=hyper-v transport=powershell-direct guest=windows/x86_64 support=untested source=native_default authority=none\n"
-        );
-        assert!(!human.contains("credential"));
-        assert!(!human.contains("cmd.exe"));
-        assert!(!human.contains("C:\\"));
+    fn cross_provider_run_plan_human_and_json_contracts_are_safe_and_versioned() {
+        let cases = [
+            (
+                test_run_plan(),
+                "vmcell: run plan: image=windows-dev provider=hyperv accelerator=hyper-v transport=powershell-direct guest=windows/x86_64 support=untested source=native_default authority=none\n",
+                "hyperv",
+                "hyper-v",
+                "powershell-direct",
+            ),
+            (
+                test_run_plan_for(
+                    "linux-whpx-dev",
+                    HostOs::Windows,
+                    GuestOs::Linux,
+                    ProviderId::Qemu,
+                    Accelerator::Whpx,
+                    GuestTransportId::Qga,
+                ),
+                "vmcell: run plan: image=linux-whpx-dev provider=qemu accelerator=whpx transport=qga guest=linux/x86_64 support=untested source=native_default authority=none\n",
+                "qemu",
+                "whpx",
+                "qga",
+            ),
+            (
+                test_run_plan_for(
+                    "linux-kvm-dev",
+                    HostOs::Linux,
+                    GuestOs::Linux,
+                    ProviderId::Qemu,
+                    Accelerator::Kvm,
+                    GuestTransportId::Qga,
+                ),
+                "vmcell: run plan: image=linux-kvm-dev provider=qemu accelerator=kvm transport=qga guest=linux/x86_64 support=untested source=native_default authority=none\n",
+                "qemu",
+                "kvm",
+                "qga",
+            ),
+        ];
 
-        let json = serde_json::to_value(&plan).unwrap();
-        assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["contract"], "vmcell.run-plan.v1");
-        assert_eq!(json["provider"], "hyperv");
-        assert_eq!(json["accelerator"], "hyper-v");
-        assert_eq!(json["guest_transport"], "powershell-direct");
-        assert_eq!(json["selection_source"], "native_default");
-        assert_eq!(json["authorizing"], false);
-        assert!(json.get("path").is_none());
-        assert!(json.get("command").is_none());
+        for (plan, expected_human, provider, accelerator, transport) in cases {
+            let mut human = Vec::new();
+            write_human_run_plan(&plan, &mut human).unwrap();
+            let human = String::from_utf8(human).unwrap();
+            assert_eq!(human, expected_human);
+            assert!(!human.contains("credential"));
+            assert!(!human.contains("cmd.exe"));
+            assert!(!human.contains("C:\\"));
+
+            let json = serde_json::to_value(&plan).unwrap();
+            assert_eq!(json["schema_version"], 1);
+            assert_eq!(json["contract"], "vmcell.run-plan.v1");
+            assert_eq!(json["provider"], provider);
+            assert_eq!(json["accelerator"], accelerator);
+            assert_eq!(json["guest_transport"], transport);
+            assert_eq!(json["support_status"], "untested");
+            assert_eq!(json["selection_source"], "native_default");
+            assert_eq!(json["authorizing"], false);
+            assert!(json.get("path").is_none());
+            assert!(json.get("command").is_none());
+            assert!(json.get("credential").is_none());
+        }
     }
 
     #[test]
