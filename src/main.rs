@@ -41,14 +41,17 @@ use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
     GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
     GuestOperationRecoveryReport, ImageDependencyReport, ImageUnregisterReport,
-    ImageValidationReport, ImageValidationStatus, RegisterImageRequest, RunCellError,
-    RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
-    ValidateImageRequest, inspect_image_dependencies, run_request_validation_error,
-    unregister_image, validate_run_resources,
+    ImageValidationReport, ImageValidationStatus, JobRunRequest, RegisterImageRequest,
+    RunCellError, RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver,
+    RunProgressEvent, ValidateImageRequest, build_job_run_request, inspect_image_dependencies,
+    run_request_validation_error, run_request_validation_error_with_job, unregister_image,
+    validate_run_resources,
 };
 use vm_cell_manager::guest::powershell_direct::PowerShellDirectTransport;
 use vm_cell_manager::guest::qga::QemuGuestAgentTransport;
-use vm_cell_manager::guest::{GuestCommand, GuestCredentials, GuestIoError, ReadinessPolicy};
+use vm_cell_manager::guest::{
+    DEFAULT_MAX_OUTPUT_BYTES, GuestCommand, GuestCredentials, GuestIoError, ReadinessPolicy,
+};
 use vm_cell_manager::providers::hyperv::HyperVProvider;
 use vm_cell_manager::providers::qemu::QemuProvider;
 use vm_cell_manager::providers::{
@@ -102,14 +105,19 @@ fn emit_run_error(
             |operation_id| operation_id.to_string(),
         );
         let cleanup_error = report.cleanup_error_code.as_deref().unwrap_or("none");
+        let job = report
+            .job
+            .as_ref()
+            .map_or_else(String::new, |job| format!(" job={}", job.job_id));
         eprintln!(
-            "vmcell: {}: {message}; run stage={} cell={} operation={} cleanup={} cleanup_error={}",
+            "vmcell: {}: {message}; run stage={} cell={} operation={} cleanup={} cleanup_error={}{}",
             classification.code,
             report.stage.as_str(),
             cell,
             operation,
             report.cleanup.as_str(),
-            cleanup_error
+            cleanup_error,
+            job,
         );
     }
     ExitCode::from(classification.exit_code.as_u8())
@@ -186,6 +194,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             CliHumanOutput::Quiet => HumanOutputPreference::Quiet,
         });
     if let Command::Run {
+        spec: None,
         cpu_count,
         memory_mib,
         ttl_seconds,
@@ -254,6 +263,90 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 write_human_job_plan(&plan, &mut std::io::stdout().lock())
                     .expect("stdout should remain writable");
             })?;
+        }
+        Command::Run {
+            spec: Some(spec),
+            plan_only,
+            credential,
+            ..
+        } => {
+            let root = state_root.unwrap_or_else(StateStore::default_root);
+            let state = StateStore::new(root.clone()).with_mutation_lock_timeout(lock_timeout);
+            let loaded = load_job_spec(&spec)?;
+            let image = state.load_image(&loaded.spec.image)?;
+            let host = HostPlatform::current()?;
+            let probes = builtin_provider_probes();
+            let plan = resolve_job_plan(&loaded, host, &image, &probes)?;
+            if plan_only {
+                emit(&plan, cli.json, || {
+                    write_human_job_plan(&plan, &mut std::io::stdout().lock())
+                        .expect("stdout should remain writable");
+                })?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let (plan, request) = build_job_run_request(&loaded, host, &image, &probes)?;
+            if !cli.json && human_output == HumanOutputPreference::Normal {
+                write_human_job_plan(&plan, &mut std::io::stderr().lock())?;
+            }
+            let interrupt = install_run_interrupt(request.plan())?;
+            let report = match plan.execution.provider {
+                ProviderId::Hyperv => {
+                    let engine = CellEngine::new(state, HyperVProvider::system());
+                    if cli.json || human_output == HumanOutputPreference::Quiet {
+                        let mut observer = |_event: &RunProgressEvent| {
+                            if interrupt.requested() {
+                                RunControl::Cancel
+                            } else {
+                                RunControl::Continue
+                            }
+                        };
+                        run_job_cell_guest(&engine, credential, request, &mut observer)?
+                    } else {
+                        let mut observer =
+                            HumanRunObserver::with_interrupt(std::io::stderr(), || {
+                                interrupt.requested()
+                            });
+                        let result =
+                            run_job_cell_guest(&engine, credential, request, &mut observer);
+                        let output_result = observer.finish().map(|_| ());
+                        let report = result?;
+                        output_result?;
+                        report
+                    }
+                }
+                ProviderId::Qemu => {
+                    let engine = CellEngine::new(state, QemuProvider::system(root));
+                    if cli.json || human_output == HumanOutputPreference::Quiet {
+                        let mut observer = |_event: &RunProgressEvent| {
+                            if interrupt.requested() {
+                                RunControl::Cancel
+                            } else {
+                                RunControl::Continue
+                            }
+                        };
+                        run_job_cell_guest(&engine, credential, request, &mut observer)?
+                    } else {
+                        let mut observer =
+                            HumanRunObserver::with_interrupt(std::io::stderr(), || {
+                                interrupt.requested()
+                            });
+                        let result =
+                            run_job_cell_guest(&engine, credential, request, &mut observer);
+                        let output_result = observer.finish().map(|_| ());
+                        let report = result?;
+                        output_result?;
+                        report
+                    }
+                }
+            };
+            if cli.json {
+                emit(&report, true, || {})?;
+            } else {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                write_human_run_result(&report, &mut stdout.lock(), &mut stderr.lock())?;
+            }
+            return Ok(guest_exit_status(report.result.exit_code));
         }
         Command::Image {
             command: ImageCommand::Dependencies { id },
@@ -337,7 +430,9 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     allow_tcg,
                     ..
                 } => {
-                    let image = state.load_image(image)?;
+                    let image = state.load_image(image.as_ref().ok_or_else(|| {
+                        CliInputError("--image is required unless --spec is supplied".to_owned())
+                    })?)?;
                     Some(resolve_run_execution_plan(
                         HostPlatform::current()?,
                         &image,
@@ -507,6 +602,7 @@ fn run_m2<P: LocalVmProvider>(
             })?;
         }
         Command::Run {
+            spec: _,
             image,
             cpu_count,
             memory_mib,
@@ -538,6 +634,9 @@ fn run_m2<P: LocalVmProvider>(
             if !json && human_output == HumanOutputPreference::Normal {
                 write_human_run_plan(&plan, &mut std::io::stderr().lock())?;
             }
+            let image = image.ok_or_else(|| {
+                CliInputError("--image is required unless --spec is supplied".to_owned())
+            })?;
             let program = command.remove(0);
             let request = RunCellRequest {
                 plan: plan.clone(),
@@ -557,7 +656,7 @@ fn run_m2<P: LocalVmProvider>(
                     timeout: Duration::from_secs(
                         action_timeout_seconds.unwrap_or(defaults.action_timeout_seconds),
                     ),
-                    max_output_bytes,
+                    max_output_bytes: max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
                 },
                 readiness: readiness(
                     readiness_timeout_seconds.unwrap_or(defaults.readiness_timeout_seconds),
@@ -2287,7 +2386,7 @@ fn run_cell_guest<P: LocalVmProvider>(
     observer: &mut impl RunObserver,
 ) -> Result<RunCellReport, Box<dyn Error>> {
     let credentials = read_credentials(engine.provider_name(), credential)
-        .map_err(|error| run_credential_error(&request.plan, error))?;
+        .map_err(|error| run_credential_error(&request.plan, None, error))?;
     Ok(match engine.provider_name() {
         "hyperv" => engine.run_cell_observed(
             &PowerShellDirectTransport::system(),
@@ -2309,7 +2408,40 @@ fn run_cell_guest<P: LocalVmProvider>(
     })
 }
 
-fn run_credential_error(plan: &RunExecutionPlan, error: Box<dyn Error>) -> RunCellError {
+fn run_job_cell_guest<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: JobRunRequest,
+    observer: &mut impl RunObserver,
+) -> Result<RunCellReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)
+        .map_err(|error| run_credential_error(request.plan(), Some(request.job()), error))?;
+    Ok(match engine.provider_name() {
+        "hyperv" => engine.run_job_cell_observed(
+            &PowerShellDirectTransport::system(),
+            &credentials,
+            request,
+            observer,
+        )?,
+        "qemu" => engine.run_job_cell_observed(
+            &QemuGuestAgentTransport::system(),
+            &credentials,
+            request,
+            observer,
+        )?,
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
+    })
+}
+
+fn run_credential_error(
+    plan: &RunExecutionPlan,
+    job: Option<&vm_cell_manager::core::job::JobRunContext>,
+    error: Box<dyn Error>,
+) -> RunCellError {
     let source = match error.downcast::<CliInputError>() {
         Ok(_) => EngineError::InvalidCellRequest(
             "guest credentials do not satisfy the selected transport requirements".to_owned(),
@@ -2319,7 +2451,7 @@ fn run_credential_error(plan: &RunExecutionPlan, error: Box<dyn Error>) -> RunCe
             Err(_) => EngineError::Guest(GuestIoError::Transport),
         },
     };
-    run_request_validation_error(plan, source)
+    run_request_validation_error_with_job(plan, job, source)
 }
 
 fn guest_exit_status(exit_code: i32) -> ExitCode {
@@ -2393,13 +2525,24 @@ fn write_human_run_result(
     if !report.result.stderr.is_empty() && !report.result.stderr.ends_with('\n') {
         stderr.write_all(b"\n")?;
     }
-    writeln!(
-        stderr,
-        "vmcell: run cell {}: exit={} cleanup={}",
-        report.cell_id,
-        report.result.exit_code,
-        report.cleanup.as_str()
-    )
+    if let Some(job) = &report.job {
+        writeln!(
+            stderr,
+            "vmcell: job {}: cell {} exit={} cleanup={}",
+            job.job_id,
+            report.cell_id,
+            report.result.exit_code,
+            report.cleanup.as_str()
+        )
+    } else {
+        writeln!(
+            stderr,
+            "vmcell: run cell {}: exit={} cleanup={}",
+            report.cell_id,
+            report.result.exit_code,
+            report.cleanup.as_str()
+        )
+    }
 }
 
 struct HumanRunObserver<W: Write, F: Fn() -> bool = fn() -> bool> {
@@ -2823,6 +2966,7 @@ mod tests {
         let report = RunCellReport {
             schema_version: 1,
             plan: Some(test_run_plan()),
+            job: None,
             cell_id: vm_cell_manager::core::cell::CellId::new(),
             operation_id: vm_cell_manager::core::guest::GuestOperationId::new(),
             outcome: vm_cell_manager::engine::RunOutcome::GuestNonZero,
@@ -2918,6 +3062,7 @@ mod tests {
         let plan = test_run_plan();
         let error = run_credential_error(
             &plan,
+            None,
             Box::new(CliInputError("credential-secret-sentinel".to_owned())),
         );
         let classification = classify_cli_error(&error);

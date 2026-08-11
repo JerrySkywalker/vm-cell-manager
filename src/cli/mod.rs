@@ -11,6 +11,7 @@ use crate::core::automation::{
 use crate::core::cell::{CellId, CellIdError, CellRecord};
 use crate::core::guest::{GuestOperationId, GuestOperationIdError, GuestOperationRecord};
 use crate::core::image::{Architecture, GuestOs, ImageId, ImageIdError, ImageRecord};
+use crate::core::job::JobResultMetadata;
 use crate::core::job_spec::JobSpecError;
 use crate::core::run_selection::{RunExecutionPlan, RunSelectionError};
 use crate::engine::{
@@ -131,8 +132,30 @@ pub enum Command {
 
     /// Create a disposable cell, run one guest command, and apply the cleanup policy.
     Run {
-        #[arg(long)]
-        image: ImageId,
+        /// Execute a validated declarative job spec through the existing run lifecycle.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = [
+                "image",
+                "cpu_count",
+                "memory_mib",
+                "ttl_seconds",
+                "provider",
+                "accelerator",
+                "allow_tcg",
+                "keep",
+                "keep_on_failure",
+                "readiness_timeout_seconds",
+                "action_timeout_seconds",
+                "max_output_bytes",
+                "command"
+            ]
+        )]
+        spec: Option<PathBuf>,
+
+        #[arg(long, required_unless_present = "spec")]
+        image: Option<ImageId>,
 
         #[arg(long = "cpu", visible_alias = "cpu-count")]
         cpu_count: Option<u16>,
@@ -174,11 +197,11 @@ pub enum Command {
         #[arg(long = "action-timeout-seconds")]
         action_timeout_seconds: Option<u64>,
 
-        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_BYTES)]
-        max_output_bytes: u64,
+        #[arg(long)]
+        max_output_bytes: Option<u64>,
 
         #[arg(
-            required_unless_present = "plan_only",
+            required_unless_present_any = ["plan_only", "spec"],
             trailing_var_arg = true,
             allow_hyphen_values = true
         )]
@@ -785,6 +808,8 @@ impl RunErrorEnvelope {
 pub struct RunErrorReport {
     pub schema_version: u32,
     pub plan: Option<RunExecutionPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobResultMetadata>,
     pub cell_id: Option<CellId>,
     pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
@@ -799,6 +824,7 @@ impl From<&RunFailureReport> for RunErrorReport {
         Self {
             schema_version: report.schema_version,
             plan: report.plan.clone(),
+            job: report.job.clone(),
             cell_id: report.cell_id,
             operation_id: report.operation_id,
             stage: report.stage,
@@ -1496,9 +1522,13 @@ mod tests {
 
     #[test]
     fn run_error_envelope_omits_guest_stream_contents() {
+        let job = crate::core::job::JobRunContext::new("a".repeat(64), chrono::Utc::now())
+            .unwrap()
+            .result_metadata(chrono::Utc::now());
         let report = RunFailureReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             plan: Some(test_run_plan()),
+            job: Some(job.clone()),
             cell_id: Some(CellId::new()),
             operation_id: Some(GuestOperationId::new()),
             stage: RunStage::Cleanup,
@@ -1531,6 +1561,10 @@ mod tests {
         assert_eq!(value["run"]["result"]["exit_code"], 23);
         assert_eq!(value["run"]["result"]["stdout_bytes"], 22);
         assert_eq!(value["run"]["result"]["stderr_bytes"], 22);
+        assert_eq!(value["run"]["job"]["schema_version"], 1);
+        assert_eq!(value["run"]["job"]["contract"], "vmcell.job-result.v1");
+        assert_eq!(value["run"]["job"]["job_id"], job.job_id.to_string());
+        assert_eq!(value["run"]["job"]["job_spec_sha256"], "a".repeat(64));
     }
 
     #[test]
@@ -1958,6 +1992,56 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_spec_backed_run_without_accepting_direct_run_authority_fields() {
+        let cli = Cli::try_parse_from(["vmcell", "run", "--spec", "job.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                spec: Some(path),
+                image: None,
+                plan_only: false,
+                command,
+                ..
+            } if path == std::path::Path::new("job.toml") && command.is_empty()
+        ));
+
+        let plan = Cli::try_parse_from([
+            "vmcell",
+            "--json",
+            "run",
+            "--spec",
+            "job.toml",
+            "--plan-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            plan.command,
+            Command::Run {
+                spec: Some(_),
+                image: None,
+                plan_only: true,
+                command,
+                ..
+            } if command.is_empty()
+        ));
+
+        for arguments in [
+            vec![
+                "vmcell",
+                "run",
+                "--spec",
+                "job.toml",
+                "--image",
+                "windows-dev",
+            ],
+            vec!["vmcell", "run", "--spec", "job.toml", "--cpu", "2"],
+            vec!["vmcell", "run", "--spec", "job.toml", "--", "cmd.exe"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
     }
 
     #[test]

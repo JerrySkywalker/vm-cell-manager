@@ -23,6 +23,9 @@ use crate::core::guest::{
 use crate::core::image::{
     Architecture, GuestOs, IMAGE_SCHEMA_VERSION, ImageBinding, ImageId, ImageRecord, ImageVariant,
 };
+use crate::core::job::{JobResultMetadata, JobRunContext};
+use crate::core::job_plan::{ResolvedJobPlan, resolve_job_plan};
+use crate::core::job_spec::LoadedJobSpec;
 use crate::core::ownership::{CellOwnership, OWNERSHIP_MARKER_SCHEMA, ProviderObjectIdentity};
 use crate::core::run_selection::{
     HostPlatform, RunExecutionPlan, RunSelectionError, revalidate_run_execution_plan,
@@ -35,8 +38,8 @@ use crate::guest::{
 };
 use crate::providers::{
     ClaimVmRequest, ConfigureVmRequest, CreateOverlayRequest, CreateVmRequest, LocalVmProvider,
-    ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderPowerState, ProviderVm,
-    ProviderVmIdentity, VmLookup,
+    ProviderError, ProviderImageInfo, ProviderMutationAuthority, ProviderPowerState, ProviderProbe,
+    ProviderVm, ProviderVmIdentity, VmLookup,
 };
 use crate::state::{InstallationAuthority, MutationGuard, StateError, StateStore};
 
@@ -208,6 +211,114 @@ pub struct RunCellRequest {
     pub cleanup: RunCleanupPolicy,
 }
 
+/// Opaque execution request produced from one validated declarative job spec.
+///
+/// Its canonical request and correlation context are bound together before a
+/// caller receives it.  The engine compares that binding before any lifecycle
+/// mutation, so a caller cannot substitute a plan, command, or cleanup policy
+/// while retaining the original job-spec digest in the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRunRequest {
+    request: RunCellRequest,
+    job: JobRunContext,
+    binding: JobRunRequestBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobRunRequestBinding {
+    request: RunCellRequest,
+    job: JobRunContext,
+}
+
+impl JobRunRequest {
+    fn new(request: RunCellRequest, job: JobRunContext) -> Self {
+        Self {
+            binding: JobRunRequestBinding {
+                request: request.clone(),
+                job: job.clone(),
+            },
+            request,
+            job,
+        }
+    }
+
+    /// Read-only execution plan used for interrupt setup and safe reporting.
+    #[must_use]
+    pub fn plan(&self) -> &RunExecutionPlan {
+        &self.binding.request.plan
+    }
+
+    /// Safe correlation context for errors detected before engine execution.
+    #[must_use]
+    pub fn job(&self) -> &JobRunContext {
+        &self.binding.job
+    }
+
+    fn into_parts(self) -> Result<(RunCellRequest, JobRunContext), EngineError> {
+        if self.request != self.binding.request || self.job != self.binding.job {
+            return Err(EngineError::Integrity(
+                "job execution request no longer matches its validated specification binding"
+                    .to_owned(),
+            ));
+        }
+        Ok((self.request, self.job))
+    }
+}
+
+/// Resolve one validated job document and convert it into the existing run
+/// request authority shape.  Accepting the read-only selection inputs rather
+/// than a caller-supplied plan prevents a public caller from substituting a
+/// different provider or accelerator after spec validation.  The engine will
+/// still revalidate the resulting plan immediately before mutation.  Copy and
+/// artifact actions deliberately fail closed here until the correlated
+/// operation slice can thread their durable records.
+pub fn build_job_run_request(
+    loaded: &LoadedJobSpec,
+    host: HostPlatform,
+    image: &ImageRecord,
+    probes: &[ProviderProbe],
+) -> Result<(ResolvedJobPlan, JobRunRequest), EngineError> {
+    let spec = &loaded.spec;
+    let plan = resolve_job_plan(loaded, host, image, probes)?;
+    if plan.execution.authorizing || plan.execution.image != spec.image {
+        return Err(EngineError::Integrity(
+            "resolved job plan is not bound to the validated job specification".to_owned(),
+        ));
+    }
+    if !spec.copy_in.is_empty() || !spec.artifacts.sources.is_empty() {
+        return Err(EngineError::InvalidCellRequest(
+            "job copy and artifact actions are unavailable until correlated operation support is enabled"
+                .to_owned(),
+        ));
+    }
+    let job = JobRunContext::new(loaded.source_sha256.clone(), Utc::now()).map_err(|_| {
+        EngineError::Integrity("validated job specification digest is malformed".to_owned())
+    })?;
+    let request = RunCellRequest {
+        plan: plan.execution.clone(),
+        spec: CellSpec {
+            image: spec.image.clone(),
+            provider: Some(plan.execution.provider.as_str().to_owned()),
+            cpu_count: spec.cpu_count,
+            memory_mib: spec.memory_mib,
+            ttl_seconds: spec.ttl_seconds,
+            accelerator: (plan.execution.provider == ProviderId::Qemu)
+                .then(|| plan.execution.accelerator.as_str().to_owned()),
+            allow_tcg: plan.execution.accelerator == Accelerator::Tcg,
+        },
+        command: spec.guest_command(),
+        readiness: ReadinessPolicy {
+            timeout: StdDuration::from_secs(spec.readiness_timeout_seconds),
+            poll_interval: StdDuration::from_secs(2),
+        },
+        cleanup: RunCleanupPolicy {
+            keep: spec.cleanup.keep,
+            keep_on_failure: spec.cleanup.keep_on_failure,
+        },
+    };
+    Ok((plan.clone(), JobRunRequest::new(request, job)))
+}
+
 pub fn validate_run_resources(
     cpu_count: u16,
     memory_mib: u64,
@@ -227,8 +338,20 @@ pub fn validate_run_resources(
 
 #[must_use]
 pub fn run_request_validation_error(plan: &RunExecutionPlan, source: EngineError) -> RunCellError {
+    run_request_validation_error_with_job(plan, None, source)
+}
+
+/// Build a request-validation run error while retaining optional declarative
+/// job result metadata.  This is used for out-of-band credential validation,
+/// whose failure must not erase an already-established job identity.
+#[must_use]
+pub fn run_request_validation_error_with_job(
+    plan: &RunExecutionPlan,
+    job: Option<&JobRunContext>,
+    source: EngineError,
+) -> RunCellError {
     run_cell_error(
-        RunFailureContext::new(Some(plan), None, None),
+        RunFailureContext::with_job(Some(plan), None, None, job),
         RunStage::RequestValidation,
         RunCleanupDisposition::NothingCreated,
         source,
@@ -319,6 +442,8 @@ pub struct RunCellReport {
     pub schema_version: u32,
     #[serde(default)]
     pub plan: Option<RunExecutionPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobResultMetadata>,
     pub cell_id: CellId,
     pub operation_id: GuestOperationId,
     pub outcome: RunOutcome,
@@ -331,6 +456,8 @@ pub struct RunFailureReport {
     pub schema_version: u32,
     #[serde(default)]
     pub plan: Option<RunExecutionPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobResultMetadata>,
     pub cell_id: Option<CellId>,
     pub operation_id: Option<GuestOperationId>,
     pub stage: RunStage,
@@ -1408,6 +1535,16 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.run_cell_observed(transport, credentials, request, &mut observer)
     }
 
+    pub fn run_job_cell<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: JobRunRequest,
+    ) -> Result<RunCellReport, RunCellError> {
+        let mut observer = |_event: &RunProgressEvent| RunControl::Continue;
+        self.run_job_cell_observed(transport, credentials, request, &mut observer)
+    }
+
     pub fn run_cell_observed<G: GuestTransport, O: RunObserver>(
         &self,
         transport: &G,
@@ -1415,10 +1552,49 @@ impl<P: LocalVmProvider> CellEngine<P> {
         request: RunCellRequest,
         observer: &mut O,
     ) -> Result<RunCellReport, RunCellError> {
+        self.run_cell_observed_with_job(transport, credentials, request, None, observer)
+    }
+
+    /// Execute an opaque, spec-bound job request through the canonical run
+    /// lifecycle.  Binding verification is deliberately before every state or
+    /// provider mutation.
+    pub fn run_job_cell_observed<G: GuestTransport, O: RunObserver>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: JobRunRequest,
+        observer: &mut O,
+    ) -> Result<RunCellReport, RunCellError> {
+        let plan = request.plan().clone();
+        let job = request.job().clone();
+        let (request, job) = match request.into_parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(run_cell_error(
+                    RunFailureContext::with_job(Some(&plan), None, None, Some(&job)),
+                    RunStage::RequestValidation,
+                    RunCleanupDisposition::NothingCreated,
+                    error,
+                    None,
+                    None,
+                ));
+            }
+        };
+        self.run_cell_observed_with_job(transport, credentials, request, Some(job), observer)
+    }
+
+    fn run_cell_observed_with_job<G: GuestTransport, O: RunObserver>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: RunCellRequest,
+        job: Option<JobRunContext>,
+        observer: &mut O,
+    ) -> Result<RunCellReport, RunCellError> {
         let plan = request.plan.clone();
         if let Err(error) = request.command.validate().map_err(EngineError::from) {
             return Err(run_cell_error(
-                RunFailureContext::new(Some(&plan), None, None),
+                RunFailureContext::with_job(Some(&plan), None, None, job.as_ref()),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1428,7 +1604,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if let Err(error) = validate_readiness_policy(request.readiness) {
             return Err(run_cell_error(
-                RunFailureContext::new(Some(&plan), None, None),
+                RunFailureContext::with_job(Some(&plan), None, None, job.as_ref()),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1438,7 +1614,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if let Err(error) = validate_cell_spec(&request.spec, self.provider.name()) {
             return Err(run_cell_error(
-                RunFailureContext::new(Some(&plan), None, None),
+                RunFailureContext::with_job(Some(&plan), None, None, job.as_ref()),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1448,7 +1624,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }
         if let Err(error) = self.revalidate_run_request(transport, &request) {
             return Err(run_cell_error(
-                RunFailureContext::new(Some(&plan), None, None),
+                RunFailureContext::with_job(Some(&plan), None, None, job.as_ref()),
                 RunStage::RequestValidation,
                 RunCleanupDisposition::NothingCreated,
                 error,
@@ -1471,7 +1647,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let (cleanup, cleanup_error) =
                     self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
                 return Err(run_cell_error(
-                    RunFailureContext::new(Some(&plan), Some(cell_id), None),
+                    RunFailureContext::with_job(Some(&plan), Some(cell_id), None, job.as_ref()),
                     stage,
                     cleanup,
                     error,
@@ -1486,14 +1662,21 @@ impl<P: LocalVmProvider> CellEngine<P> {
         }) == RunControl::Cancel
             || observer.observe(&RunProgressEvent::CellCreated { cell_id }) == RunControl::Cancel
         {
-            return Err(self.interrupted_run(&plan, cell_id, request.cleanup, false, observer));
+            return Err(self.interrupted_run(
+                &plan,
+                cell_id,
+                request.cleanup,
+                false,
+                job.as_ref(),
+                observer,
+            ));
         }
 
         if let Err(error) = self.start_cell(cell_id) {
             let (cleanup, cleanup_error) =
                 self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
             return Err(run_cell_error(
-                RunFailureContext::new(Some(&plan), Some(cell_id), None),
+                RunFailureContext::with_job(Some(&plan), Some(cell_id), None, job.as_ref()),
                 RunStage::ProviderStart,
                 cleanup,
                 error,
@@ -1502,7 +1685,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
             ));
         }
         if observer.observe(&RunProgressEvent::ProviderStarted { cell_id }) == RunControl::Cancel {
-            return Err(self.interrupted_run(&plan, cell_id, request.cleanup, false, observer));
+            return Err(self.interrupted_run(
+                &plan,
+                cell_id,
+                request.cleanup,
+                false,
+                job.as_ref(),
+                observer,
+            ));
         }
 
         let mut guest_was_ready = false;
@@ -1545,7 +1735,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 let (cleanup, cleanup_error) =
                     self.cleanup_failed_run(cell_id, request.cleanup, !terminal, observer);
                 return Err(run_cell_error(
-                    RunFailureContext::new(Some(&plan), Some(cell_id), guest_operation_id),
+                    RunFailureContext::with_job(
+                        Some(&plan),
+                        Some(cell_id),
+                        guest_operation_id,
+                        job.as_ref(),
+                    ),
                     stage,
                     cleanup,
                     error,
@@ -1571,7 +1766,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
             let (cleanup, cleanup_error) =
                 self.cleanup_failed_run(cell_id, request.cleanup, false, observer);
             return Err(run_cell_error(
-                RunFailureContext::new(Some(&plan), Some(cell_id), Some(execution.operation_id)),
+                RunFailureContext::with_job(
+                    Some(&plan),
+                    Some(cell_id),
+                    Some(execution.operation_id),
+                    job.as_ref(),
+                ),
                 RunStage::Interrupted,
                 cleanup,
                 error,
@@ -1607,10 +1807,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
                         let _ = observer.observe(&RunProgressEvent::CleanupRefused { cell_id });
                     }
                     return Err(run_cell_error(
-                        RunFailureContext::new(
+                        RunFailureContext::with_job(
                             Some(&plan),
                             Some(cell_id),
                             Some(execution.operation_id),
+                            job.as_ref(),
                         ),
                         RunStage::Cleanup,
                         disposition,
@@ -1625,6 +1826,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
         Ok(RunCellReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             plan: Some(plan),
+            job: job
+                .as_ref()
+                .map(|context| context.result_metadata(Utc::now())),
             cell_id,
             operation_id: execution.operation_id,
             outcome,
@@ -1639,6 +1843,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         cell_id: CellId,
         cleanup_policy: RunCleanupPolicy,
         ambiguous: bool,
+        job: Option<&JobRunContext>,
         observer: &mut O,
     ) -> RunCellError {
         let error =
@@ -1646,7 +1851,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let (cleanup, cleanup_error) =
             self.cleanup_failed_run(cell_id, cleanup_policy, ambiguous, observer);
         run_cell_error(
-            RunFailureContext::new(Some(plan), Some(cell_id), None),
+            RunFailureContext::with_job(Some(plan), Some(cell_id), None, job),
             RunStage::Interrupted,
             cleanup,
             error,
@@ -2863,6 +3068,7 @@ struct RunFailureContext<'a> {
     plan: Option<&'a RunExecutionPlan>,
     cell_id: Option<CellId>,
     operation_id: Option<GuestOperationId>,
+    job: Option<&'a JobRunContext>,
 }
 
 impl<'a> RunFailureContext<'a> {
@@ -2875,6 +3081,21 @@ impl<'a> RunFailureContext<'a> {
             plan,
             cell_id,
             operation_id,
+            job: None,
+        }
+    }
+
+    const fn with_job(
+        plan: Option<&'a RunExecutionPlan>,
+        cell_id: Option<CellId>,
+        operation_id: Option<GuestOperationId>,
+        job: Option<&'a JobRunContext>,
+    ) -> Self {
+        Self {
+            plan,
+            cell_id,
+            operation_id,
+            job,
         }
     }
 }
@@ -2891,6 +3112,7 @@ fn run_cell_error(
         report: Box::new(RunFailureReport {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             plan: context.plan.cloned(),
+            job: context.job.map(|job| job.result_metadata(Utc::now())),
             cell_id: context.cell_id,
             operation_id: context.operation_id,
             stage,
@@ -4787,6 +5009,20 @@ mod tests {
         }
     }
 
+    fn job_run_request(image: ImageId) -> JobRunRequest {
+        let mut request = run_request(image);
+        request.command = GuestCommand {
+            program: "job-command-secret".to_owned(),
+            args: vec!["job-argument-secret".to_owned()],
+            timeout: StdDuration::from_secs(30),
+            max_output_bytes: 1024,
+        };
+        JobRunRequest::new(
+            request,
+            JobRunContext::new("a".repeat(64), Utc::now()).unwrap(),
+        )
+    }
+
     fn run_fixture() -> (
         tempfile::TempDir,
         CellEngine<MockHyperV>,
@@ -5174,6 +5410,149 @@ mod tests {
             );
         }
         assert_eq!(guest.state.lock().unwrap().calls, ["probe_ready", "exec"]);
+    }
+
+    #[test]
+    fn job_run_reuses_the_run_lifecycle_and_emits_fresh_safe_result_identity() {
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        let first = engine
+            .run_job_cell(&guest, &credentials, job_run_request(image_id.clone()))
+            .unwrap();
+        guest.state.lock().unwrap().readiness = VecDeque::from([GuestReadiness::Ready]);
+        let second = engine
+            .run_job_cell(&guest, &credentials, job_run_request(image_id))
+            .unwrap();
+        let first_job = first.job.as_ref().unwrap();
+        let second_job = second.job.as_ref().unwrap();
+        let encoded = serde_json::to_string(&first).unwrap();
+
+        assert_eq!(
+            first_job.schema_version,
+            crate::core::job::JOB_RESULT_SCHEMA_VERSION
+        );
+        assert_eq!(first_job.contract, crate::core::job::JOB_RESULT_CONTRACT);
+        assert_eq!(first_job.job_spec_sha256, "a".repeat(64));
+        assert!(first_job.completed_at >= first_job.started_at);
+        assert_ne!(first_job.job_id, second_job.job_id);
+        assert_ne!(first.cell_id, second.cell_id);
+        assert_eq!(first.cleanup, RunCleanupDisposition::Destroyed);
+        assert!(first.plan.is_some());
+        for forbidden in ["job-command-secret", "job-argument-secret"] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn job_run_failure_retains_safe_result_identity_without_command_text() {
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        guest.state.lock().unwrap().failure = Some(InjectedGuestFailure::Timeout);
+
+        let error = engine
+            .run_job_cell(&guest, &credentials, job_run_request(image_id))
+            .unwrap_err();
+        let job = error.report().job.as_ref().unwrap();
+        let encoded = serde_json::to_string(error.report()).unwrap();
+
+        assert_eq!(job.contract, crate::core::job::JOB_RESULT_CONTRACT);
+        assert_eq!(job.job_spec_sha256, "a".repeat(64));
+        assert_eq!(error.report().stage, RunStage::GuestExecution);
+        assert!(error.report().plan.is_some());
+        for forbidden in ["job-command-secret", "job-argument-secret"] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn job_request_derives_selection_from_validated_spec_and_defers_operations() {
+        let (_directory, engine, image_id) = fixture();
+        let image = engine.state.load_image(&image_id).unwrap();
+        let host = HostPlatform {
+            os: crate::core::support::HostOs::Windows,
+            architecture: Architecture::X86_64,
+        };
+        let loaded = LoadedJobSpec {
+            path: PathBuf::from("job-secret-path.toml"),
+            source_sha256: "b".repeat(64),
+            spec: crate::core::job_spec::parse_job_spec(
+                r#"
+schema_version = 1
+image = "windows-dev"
+cpu_count = 2
+memory_mib = 4096
+
+[command]
+program = "job-command-secret"
+args = ["job-argument-secret"]
+
+[cleanup]
+keep = false
+keep_on_failure = false
+"#,
+            )
+            .unwrap(),
+        };
+        let probe = engine.provider.probe();
+        let (plan, request) = build_job_run_request(&loaded, host, &image, &[probe]).unwrap();
+
+        assert!(!plan.authorizing);
+        assert_eq!(request.plan(), &plan.execution);
+        assert_eq!(
+            request.binding.request.spec.provider.as_deref(),
+            Some("hyperv")
+        );
+        assert_eq!(
+            request.job().result_metadata(Utc::now()).job_spec_sha256,
+            "b".repeat(64)
+        );
+        assert_eq!(
+            request.binding.request.command.program,
+            "job-command-secret"
+        );
+
+        let with_artifact = LoadedJobSpec {
+            spec: crate::core::job_spec::parse_job_spec(
+                r#"
+schema_version = 1
+image = "windows-dev"
+cpu_count = 2
+memory_mib = 4096
+
+[command]
+program = "cmd.exe"
+
+[cleanup]
+
+[artifacts]
+sources = ["results/output.txt"]
+"#,
+            )
+            .unwrap(),
+            ..loaded
+        };
+        engine.provider.state.lock().unwrap().calls.clear();
+        assert!(matches!(
+            build_job_run_request(&with_artifact, host, &image, &[engine.provider.probe()]),
+            Err(EngineError::InvalidCellRequest(_))
+        ));
+        assert!(engine.state.list_cells().unwrap().is_empty());
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn tampered_job_request_is_rejected_before_state_or_provider_mutation() {
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        let mut request = job_run_request(image_id);
+        request.request.command.program = "tampered-command".to_owned();
+        engine.provider.state.lock().unwrap().calls.clear();
+
+        let error = engine
+            .run_job_cell(&guest, &credentials, request)
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::RequestValidation);
+        assert!(error.report().job.is_some());
+        assert!(engine.state.list_cells().unwrap().is_empty());
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
     }
 
     #[test]
