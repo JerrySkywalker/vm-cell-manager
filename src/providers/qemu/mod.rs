@@ -1656,6 +1656,7 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
 
 #[derive(Clone, Copy)]
 enum QemuFileSharePolicy {
+    #[cfg(windows)]
     AllowAll,
     DenyWrite,
     DenyWriteAndDelete,
@@ -1669,6 +1670,7 @@ fn configure_qemu_file_options(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let _ = share_policy;
 
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         if create {
