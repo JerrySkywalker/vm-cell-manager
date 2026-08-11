@@ -2766,9 +2766,10 @@ fn collect_guest_artifacts<P: LocalVmProvider>(
 }
 
 fn readiness(timeout_seconds: u64) -> ReadinessPolicy {
+    let timeout = Duration::from_secs(timeout_seconds);
     ReadinessPolicy {
-        timeout: Duration::from_secs(timeout_seconds),
-        poll_interval: Duration::from_secs(2),
+        timeout,
+        poll_interval: Duration::from_secs(2).min(timeout),
     }
 }
 
@@ -2895,6 +2896,14 @@ mod tests {
             Accelerator::HyperV,
             GuestTransportId::PowerShellDirect,
         )
+    }
+
+    #[test]
+    fn readiness_caps_poll_interval_to_short_timeout() {
+        let policy = readiness(1);
+
+        assert_eq!(policy.timeout, Duration::from_secs(1));
+        assert_eq!(policy.poll_interval, Duration::from_secs(1));
     }
 
     #[test]

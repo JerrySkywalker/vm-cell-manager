@@ -6,7 +6,8 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
-- Added the repository-local v0.4 reproducible-job surface: strict TOML job
+- Set the repository-local candidate identity to `0.4.0` and completed the
+  reproducible-job surface: strict TOML job
   specifications, read-only job planning, fresh invocation/result identities,
   safe durable operation/artifact correlation, and explicit repeatability and
   downgrade-provenance policy. Correlated durable records use a narrow v2

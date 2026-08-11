@@ -554,6 +554,11 @@ A Windows or Linux developer can install the appropriate binary and use substant
 
 # v0.4.0 — Reproducible Jobs
 
+**Repository-local status:** complete at candidate version `0.4.0` on `dev`.
+The implementation is not a public release and does not establish any real
+provider, accelerator, or guest-transport acceptance. Those gates remain
+separate from repository CI, package contracts, and this roadmap milestone.
+
 ## Product promise
 
 > A human or automation system can describe one disposable VM job once, inspect what vmcell will do, run it repeatedly, and obtain a coherent result bundle without scripting low-level lifecycle glue.
@@ -596,9 +601,13 @@ deduplication switch. vmcell guarantees deterministic interpretation of its
 execution contract, not bit-for-bit deterministic guest or application output;
 repository and planning evidence do not promote any platform support row.
 
-## Release gates
+## Repository-local and external gates
 
-Specification-driven and equivalent direct-CLI execution must resolve to the same authority, lifecycle, guest-control, artifact, and cleanup contracts across the accepted Windows/Linux paths.
+The repository-local gate requires specification-driven and equivalent
+direct-CLI execution to resolve to the same authority, lifecycle,
+guest-control, artifact, and cleanup contracts. Real-platform equivalence on
+an accepted Windows or Linux path remains a separate external release gate;
+the current support matrix has no accepted row.
 
 ## Human-visible completion criterion
 
@@ -953,8 +962,8 @@ v0.9  1.0 Contract Candidate
 v1.0  Stable Execution Cell Runtime
 ```
 
-Repository-local v0.3 Cross-Platform Human MVP implementation is complete on
-`dev`. The next repository-development milestone is **v0.4.0 — Reproducible
-Jobs**, subject to a separate admitted plan. Public release advancement remains
-separately blocked on dedicated real-platform acceptance, beginning with the
-frozen earlier candidates.
+Repository-local v0.4 Reproducible Jobs implementation is complete on `dev`.
+The next repository-development milestone is **v0.5.0 — Three-Host
+Portability**, subject to separate admission and a dedicated macOS environment.
+Public release advancement remains separately blocked on dedicated
+real-platform acceptance, beginning with the frozen earlier candidates.
