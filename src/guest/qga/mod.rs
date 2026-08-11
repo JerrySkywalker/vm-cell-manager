@@ -237,10 +237,7 @@ impl QgaClient {
             .stream
             .set_operation_deadline(client.deadline)
             .map_err(|_| GuestIoError::Timeout)?;
-        client
-            .stream
-            .write_all(&[0xff])
-            .map_err(|_| GuestIoError::Transport)?;
+        client.stream.write_all(&[0xff]).map_err(qga_io_error)?;
         let sync_id = Uuid::new_v4().as_u128() as u64;
         let response = client.execute("guest-sync-delimited", Some(json!({"id": sync_id})))?;
         if response.as_u64() != Some(sync_id) {
@@ -268,7 +265,7 @@ impl QgaClient {
         self.stream
             .write_all(&bytes)
             .and_then(|_| self.stream.flush())
-            .map_err(|_| GuestIoError::Transport)?;
+            .map_err(qga_io_error)?;
         let response = self.receive()?;
         if Instant::now() >= self.deadline {
             return Err(GuestIoError::Timeout);
@@ -291,12 +288,7 @@ impl QgaClient {
             self.stream
                 .set_operation_deadline(self.deadline)
                 .map_err(|_| GuestIoError::Timeout)?;
-            if self
-                .stream
-                .read(&mut byte)
-                .map_err(|_| GuestIoError::Transport)?
-                == 0
-            {
+            if self.stream.read(&mut byte).map_err(qga_io_error)? == 0 {
                 return Err(GuestIoError::InvalidResponse);
             }
             if !started {
@@ -593,6 +585,13 @@ fn remaining_guest_duration(deadline: Instant) -> Result<Duration, GuestIoError>
         .ok_or(GuestIoError::Timeout)
 }
 
+fn qga_io_error(error: std::io::Error) -> GuestIoError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => GuestIoError::Timeout,
+        _ => GuestIoError::Transport,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -651,6 +650,42 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct TimeoutQgaStream {
+        fail_write: bool,
+    }
+
+    impl Read for TimeoutQgaStream {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "scripted QGA read timeout",
+            ))
+        }
+    }
+
+    impl Write for TimeoutQgaStream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "scripted QGA write timeout",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ReadWrite for TimeoutQgaStream {
+        fn set_operation_deadline(&mut self, _: Instant) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
@@ -816,6 +851,27 @@ mod tests {
     }
 
     #[test]
+    fn qga_io_deadlines_preserve_timeout_classification() {
+        let mut write_timeout = QgaClient {
+            stream: Box::new(TimeoutQgaStream { fail_write: true }),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(
+            write_timeout.execute("guest-ping", None),
+            Err(GuestIoError::Timeout)
+        );
+
+        let mut read_timeout = QgaClient {
+            stream: Box::new(TimeoutQgaStream { fail_write: false }),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(
+            read_timeout.execute("guest-ping", None),
+            Err(GuestIoError::Timeout)
+        );
+    }
+
+    #[test]
     fn qga_copy_in_deny_never_treats_no_clobber_collision_as_success() {
         let stream = FakeQgaStream::scripted(&[
             json!({"return": {"pid": 1}}),
@@ -870,9 +926,30 @@ mod tests {
         let mut qmp = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
         assert!(prove_qmp_snapshot(&mut qmp, &expected).is_ok());
 
-        let mut drifted = lines;
+        let mut drifted = lines.clone();
         drifted[6] = json!({"return": [{"name": "foreign-nic"}], "id": 6});
         let stream = FakeQgaStream::scripted(&drifted);
+        let mut qmp = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            prove_qmp_snapshot(&mut qmp, &expected),
+            Err(GuestIoError::OwnershipChanged)
+        );
+
+        let mut missing_network = lines.clone();
+        missing_network[6] = json!({"return": {}, "id": 6});
+        let stream = FakeQgaStream::scripted(&missing_network);
+        let mut qmp = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            prove_qmp_snapshot(&mut qmp, &expected),
+            Err(GuestIoError::OwnershipChanged)
+        );
+
+        let mut missing_overlay_path = lines;
+        missing_overlay_path[7] = json!({"return": [{"inserted": {
+            "drv": "qcow2",
+            "backing_file_depth": 1
+        }}], "id": 7});
+        let stream = FakeQgaStream::scripted(&missing_overlay_path);
         let mut qmp = QmpClient::negotiate(stream, Duration::from_secs(1)).unwrap();
         assert_eq!(
             prove_qmp_snapshot(&mut qmp, &expected),
