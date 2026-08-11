@@ -454,6 +454,50 @@ fn job_plan_rejects_secret_like_input_before_state_or_provider_access() {
 }
 
 #[test]
+fn run_spec_rejects_secret_like_input_before_state_or_lifecycle_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("must-not-exist");
+    let config = directory.path().join("config.json");
+    write_config(
+        &config,
+        &serde_json::json!({"schema_version": 1, "defaults": {}}),
+    );
+    let spec = directory.path().join("job.toml");
+    fs::write(
+        &spec,
+        "schema_version = 1\npassword = \"run-spec-secret-sentinel",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&spec, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(["--json", "--config"])
+        .arg(&config)
+        .arg("--state-root")
+        .arg(&state_root)
+        .args(["run", "--spec"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!state_root.exists());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "vmcell.job_spec.invalid_document"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("run-spec-secret-sentinel"));
+    assert!(!stderr.contains(directory.path().to_string_lossy().as_ref()));
+}
+
+#[test]
 fn job_plan_missing_image_is_read_only() {
     let directory = tempfile::tempdir().unwrap();
     let state_root = directory.path().join("must-not-exist");
