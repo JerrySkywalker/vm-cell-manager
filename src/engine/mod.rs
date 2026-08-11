@@ -8562,15 +8562,18 @@ destination = "inputs/missing-input.bin"
                 .unwrap(),
         );
         drop(guard);
-        fs::write(
-            engine
-                .state
-                .root()
-                .join("operations")
-                .join(format!("{}.json", operation.id)),
-            serde_json::to_vec(&operation).unwrap(),
-        )
-        .unwrap();
+        let operation_path = engine
+            .state
+            .root()
+            .join("operations")
+            .join(format!("{}.json", operation.id));
+        fs::write(&operation_path, serde_json::to_vec(&operation).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&operation_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(
             engine.inspect_guest_operation(operation.id).unwrap(),
             operation
