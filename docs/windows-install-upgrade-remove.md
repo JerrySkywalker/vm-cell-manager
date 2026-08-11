@@ -44,7 +44,8 @@ same completion contract for custom layouts.
    Keep registered base images immutable and in place.
 3. Verify and extract the new version into a different versioned directory.
 4. With the new binary, run `vmcell --state-root PATH state check` before any
-   mutation. The v0.1-to-v0.2 format-1 path is read in place without rewrite.
+   mutation. Compatible format-1 roots from earlier candidates are read in
+   place without rewrite.
 5. On `vmcell.state.upgrade_required`, integrity failure, or ambiguous state,
    stop. Do not repair JSON manually or run lifecycle commands with the new
    binary. Return to the binary that owns the state schema or follow a future

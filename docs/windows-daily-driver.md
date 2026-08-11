@@ -51,8 +51,8 @@ virtual switch, package-manager entry, or completion profile line.
 ## 2. Bind the admitted state root and inspect capability
 
 Use the exact ordinary, non-reparse, ACL-exclusive state root admitted for the
-host. Before the first v0.2 mutation against an existing root, check its
-durable format without contacting a provider:
+host. Before the first mutation with this candidate against an existing root,
+check its durable format without contacting a provider:
 
 ```powershell
 $stateRoot = 'C:\Users\me\vmcell-state'
