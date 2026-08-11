@@ -4,6 +4,11 @@ VM Cell Manager's original M0-M5 milestones established the repository-local tec
 
 The roadmap remains capability-driven. A numbered release is promoted from `dev` only through the frozen `release/vX.Y.Z` workflow and its declared acceptance gates. Repository-local implementation may continue rapidly on `dev`, but unit, mock, WSL2, or core CI evidence never substitutes for real-platform acceptance.
 
+The exact frozen-candidate, tuple, host/image/guest, owner-packet, and
+correction rules for currently deferred gates are maintained in the
+[release acceptance matrix](release-acceptance-matrix.md). It is a readiness
+register, not a support-status or lifecycle authorization surface.
+
 ## Release model
 
 The persistent branch model is:
@@ -657,6 +662,8 @@ A documented Windows, Linux, or macOS user can install vmcell and recognize subs
 
 # v0.6.0 — Image and Distribution Maturity
 
+**Admission status:** architecture planning is recorded in [issue #44](https://github.com/JerrySkywalker/vm-cell-manager/issues/44). Product implementation remains sequenced after v0.5 closeout; publication and real-platform acceptance remain separate owner gates.
+
 ## Product promise
 
 > A normal user can maintain a trustworthy local library of execution images and move vmcell installations between machines without manually understanding internal state files.
@@ -698,6 +705,8 @@ A user can install vmcell on a new supported machine, import a known image defin
 ---
 
 # v0.7.0 — Public Beta
+
+**Admission status:** optional design-only planning is recorded in [issue #45](https://github.com/JerrySkywalker/vm-cell-manager/issues/45). Product implementation, release publication, and support promotion are not admitted until the declared preceding real-platform and release gates pass.
 
 ## Product promise
 
