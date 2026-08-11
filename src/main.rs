@@ -41,9 +41,9 @@ use vm_cell_manager::engine::{
     ArtifactCollectRequest, ArtifactPruneRequest, CellEngine, CellInspection, EngineError,
     GuestCopyInRequest, GuestCopyOutRequest, GuestExecReport, GuestExecRequest,
     GuestOperationRecoveryReport, ImageDependencyReport, ImageUnregisterReport,
-    ImageValidationReport, ImageValidationStatus, RegisterImageRequest, RunCellError,
-    RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver, RunProgressEvent,
-    ValidateImageRequest, build_job_run_request, inspect_image_dependencies,
+    ImageValidationReport, ImageValidationStatus, JobRunRequest, RegisterImageRequest,
+    RunCellError, RunCellReport, RunCellRequest, RunCleanupPolicy, RunControl, RunObserver,
+    RunProgressEvent, ValidateImageRequest, build_job_run_request, inspect_image_dependencies,
     run_request_validation_error, run_request_validation_error_with_job, unregister_image,
     validate_run_resources,
 };
@@ -288,7 +288,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             if !cli.json && human_output == HumanOutputPreference::Normal {
                 write_human_job_plan(&plan, &mut std::io::stderr().lock())?;
             }
-            let interrupt = install_run_interrupt(&request.plan)?;
+            let interrupt = install_run_interrupt(request.plan())?;
             let report = match plan.execution.provider {
                 ProviderId::Hyperv => {
                     let engine = CellEngine::new(state, HyperVProvider::system());
@@ -300,13 +300,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                                 RunControl::Continue
                             }
                         };
-                        run_cell_guest(&engine, credential, request, &mut observer)?
+                        run_job_cell_guest(&engine, credential, request, &mut observer)?
                     } else {
                         let mut observer =
                             HumanRunObserver::with_interrupt(std::io::stderr(), || {
                                 interrupt.requested()
                             });
-                        let result = run_cell_guest(&engine, credential, request, &mut observer);
+                        let result =
+                            run_job_cell_guest(&engine, credential, request, &mut observer);
                         let output_result = observer.finish().map(|_| ());
                         let report = result?;
                         output_result?;
@@ -323,13 +324,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                                 RunControl::Continue
                             }
                         };
-                        run_cell_guest(&engine, credential, request, &mut observer)?
+                        run_job_cell_guest(&engine, credential, request, &mut observer)?
                     } else {
                         let mut observer =
                             HumanRunObserver::with_interrupt(std::io::stderr(), || {
                                 interrupt.requested()
                             });
-                        let result = run_cell_guest(&engine, credential, request, &mut observer);
+                        let result =
+                            run_job_cell_guest(&engine, credential, request, &mut observer);
                         let output_result = observer.finish().map(|_| ());
                         let report = result?;
                         output_result?;
@@ -663,7 +665,6 @@ fn run_m2<P: LocalVmProvider>(
                     keep,
                     keep_on_failure,
                 },
-                job: None,
             };
             let interrupt = install_run_interrupt(&plan)?;
             let report = if json || human_output == HumanOutputPreference::Quiet {
@@ -2385,7 +2386,7 @@ fn run_cell_guest<P: LocalVmProvider>(
     observer: &mut impl RunObserver,
 ) -> Result<RunCellReport, Box<dyn Error>> {
     let credentials = read_credentials(engine.provider_name(), credential)
-        .map_err(|error| run_credential_error(&request.plan, request.job.as_ref(), error))?;
+        .map_err(|error| run_credential_error(&request.plan, None, error))?;
     Ok(match engine.provider_name() {
         "hyperv" => engine.run_cell_observed(
             &PowerShellDirectTransport::system(),
@@ -2394,6 +2395,35 @@ fn run_cell_guest<P: LocalVmProvider>(
             observer,
         )?,
         "qemu" => engine.run_cell_observed(
+            &QemuGuestAgentTransport::system(),
+            &credentials,
+            request,
+            observer,
+        )?,
+        value => {
+            return Err(
+                EngineError::Integrity(format!("unsupported guest provider: {value}")).into(),
+            );
+        }
+    })
+}
+
+fn run_job_cell_guest<P: LocalVmProvider>(
+    engine: &CellEngine<P>,
+    credential: CredentialArgs,
+    request: JobRunRequest,
+    observer: &mut impl RunObserver,
+) -> Result<RunCellReport, Box<dyn Error>> {
+    let credentials = read_credentials(engine.provider_name(), credential)
+        .map_err(|error| run_credential_error(request.plan(), Some(request.job()), error))?;
+    Ok(match engine.provider_name() {
+        "hyperv" => engine.run_job_cell_observed(
+            &PowerShellDirectTransport::system(),
+            &credentials,
+            request,
+            observer,
+        )?,
+        "qemu" => engine.run_job_cell_observed(
             &QemuGuestAgentTransport::system(),
             &credentials,
             request,

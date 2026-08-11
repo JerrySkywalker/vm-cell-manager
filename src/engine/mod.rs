@@ -209,9 +209,60 @@ pub struct RunCellRequest {
     pub command: GuestCommand,
     pub readiness: ReadinessPolicy,
     pub cleanup: RunCleanupPolicy,
-    /// Present only for a declarative job-backed invocation.  This is
-    /// correlation metadata, never a lifecycle authority token.
-    pub job: Option<JobRunContext>,
+}
+
+/// Opaque execution request produced from one validated declarative job spec.
+///
+/// Its canonical request and correlation context are bound together before a
+/// caller receives it.  The engine compares that binding before any lifecycle
+/// mutation, so a caller cannot substitute a plan, command, or cleanup policy
+/// while retaining the original job-spec digest in the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRunRequest {
+    request: RunCellRequest,
+    job: JobRunContext,
+    binding: JobRunRequestBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobRunRequestBinding {
+    request: RunCellRequest,
+    job: JobRunContext,
+}
+
+impl JobRunRequest {
+    fn new(request: RunCellRequest, job: JobRunContext) -> Self {
+        Self {
+            binding: JobRunRequestBinding {
+                request: request.clone(),
+                job: job.clone(),
+            },
+            request,
+            job,
+        }
+    }
+
+    /// Read-only execution plan used for interrupt setup and safe reporting.
+    #[must_use]
+    pub fn plan(&self) -> &RunExecutionPlan {
+        &self.binding.request.plan
+    }
+
+    /// Safe correlation context for errors detected before engine execution.
+    #[must_use]
+    pub fn job(&self) -> &JobRunContext {
+        &self.binding.job
+    }
+
+    fn into_parts(self) -> Result<(RunCellRequest, JobRunContext), EngineError> {
+        if self.request != self.binding.request || self.job != self.binding.job {
+            return Err(EngineError::Integrity(
+                "job execution request no longer matches its validated specification binding"
+                    .to_owned(),
+            ));
+        }
+        Ok((self.request, self.job))
+    }
 }
 
 /// Resolve one validated job document and convert it into the existing run
@@ -226,7 +277,7 @@ pub fn build_job_run_request(
     host: HostPlatform,
     image: &ImageRecord,
     probes: &[ProviderProbe],
-) -> Result<(ResolvedJobPlan, RunCellRequest), EngineError> {
+) -> Result<(ResolvedJobPlan, JobRunRequest), EngineError> {
     let spec = &loaded.spec;
     let plan = resolve_job_plan(loaded, host, image, probes)?;
     if plan.execution.authorizing || plan.execution.image != spec.image {
@@ -243,32 +294,29 @@ pub fn build_job_run_request(
     let job = JobRunContext::new(loaded.source_sha256.clone(), Utc::now()).map_err(|_| {
         EngineError::Integrity("validated job specification digest is malformed".to_owned())
     })?;
-    Ok((
-        plan.clone(),
-        RunCellRequest {
-            plan: plan.execution.clone(),
-            spec: CellSpec {
-                image: spec.image.clone(),
-                provider: Some(plan.execution.provider.as_str().to_owned()),
-                cpu_count: spec.cpu_count,
-                memory_mib: spec.memory_mib,
-                ttl_seconds: spec.ttl_seconds,
-                accelerator: (plan.execution.provider == ProviderId::Qemu)
-                    .then(|| plan.execution.accelerator.as_str().to_owned()),
-                allow_tcg: plan.execution.accelerator == Accelerator::Tcg,
-            },
-            command: spec.guest_command(),
-            readiness: ReadinessPolicy {
-                timeout: StdDuration::from_secs(spec.readiness_timeout_seconds),
-                poll_interval: StdDuration::from_secs(2),
-            },
-            cleanup: RunCleanupPolicy {
-                keep: spec.cleanup.keep,
-                keep_on_failure: spec.cleanup.keep_on_failure,
-            },
-            job: Some(job),
+    let request = RunCellRequest {
+        plan: plan.execution.clone(),
+        spec: CellSpec {
+            image: spec.image.clone(),
+            provider: Some(plan.execution.provider.as_str().to_owned()),
+            cpu_count: spec.cpu_count,
+            memory_mib: spec.memory_mib,
+            ttl_seconds: spec.ttl_seconds,
+            accelerator: (plan.execution.provider == ProviderId::Qemu)
+                .then(|| plan.execution.accelerator.as_str().to_owned()),
+            allow_tcg: plan.execution.accelerator == Accelerator::Tcg,
         },
-    ))
+        command: spec.guest_command(),
+        readiness: ReadinessPolicy {
+            timeout: StdDuration::from_secs(spec.readiness_timeout_seconds),
+            poll_interval: StdDuration::from_secs(2),
+        },
+        cleanup: RunCleanupPolicy {
+            keep: spec.cleanup.keep,
+            keep_on_failure: spec.cleanup.keep_on_failure,
+        },
+    };
+    Ok((plan.clone(), JobRunRequest::new(request, job)))
 }
 
 pub fn validate_run_resources(
@@ -1487,6 +1535,16 @@ impl<P: LocalVmProvider> CellEngine<P> {
         self.run_cell_observed(transport, credentials, request, &mut observer)
     }
 
+    pub fn run_job_cell<G: GuestTransport>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: JobRunRequest,
+    ) -> Result<RunCellReport, RunCellError> {
+        let mut observer = |_event: &RunProgressEvent| RunControl::Continue;
+        self.run_job_cell_observed(transport, credentials, request, &mut observer)
+    }
+
     pub fn run_cell_observed<G: GuestTransport, O: RunObserver>(
         &self,
         transport: &G,
@@ -1494,8 +1552,46 @@ impl<P: LocalVmProvider> CellEngine<P> {
         request: RunCellRequest,
         observer: &mut O,
     ) -> Result<RunCellReport, RunCellError> {
+        self.run_cell_observed_with_job(transport, credentials, request, None, observer)
+    }
+
+    /// Execute an opaque, spec-bound job request through the canonical run
+    /// lifecycle.  Binding verification is deliberately before every state or
+    /// provider mutation.
+    pub fn run_job_cell_observed<G: GuestTransport, O: RunObserver>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: JobRunRequest,
+        observer: &mut O,
+    ) -> Result<RunCellReport, RunCellError> {
+        let plan = request.plan().clone();
+        let job = request.job().clone();
+        let (request, job) = match request.into_parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(run_cell_error(
+                    RunFailureContext::with_job(Some(&plan), None, None, Some(&job)),
+                    RunStage::RequestValidation,
+                    RunCleanupDisposition::NothingCreated,
+                    error,
+                    None,
+                    None,
+                ));
+            }
+        };
+        self.run_cell_observed_with_job(transport, credentials, request, Some(job), observer)
+    }
+
+    fn run_cell_observed_with_job<G: GuestTransport, O: RunObserver>(
+        &self,
+        transport: &G,
+        credentials: &GuestCredentials,
+        request: RunCellRequest,
+        job: Option<JobRunContext>,
+        observer: &mut O,
+    ) -> Result<RunCellReport, RunCellError> {
         let plan = request.plan.clone();
-        let job = request.job.clone();
         if let Err(error) = request.command.validate().map_err(EngineError::from) {
             return Err(run_cell_error(
                 RunFailureContext::with_job(Some(&plan), None, None, job.as_ref()),
@@ -4910,11 +5006,10 @@ mod tests {
                 keep: false,
                 keep_on_failure: false,
             },
-            job: None,
         }
     }
 
-    fn job_run_request(image: ImageId) -> RunCellRequest {
+    fn job_run_request(image: ImageId) -> JobRunRequest {
         let mut request = run_request(image);
         request.command = GuestCommand {
             program: "job-command-secret".to_owned(),
@@ -4922,8 +5017,10 @@ mod tests {
             timeout: StdDuration::from_secs(30),
             max_output_bytes: 1024,
         };
-        request.job = Some(JobRunContext::new("a".repeat(64), Utc::now()).unwrap());
-        request
+        JobRunRequest::new(
+            request,
+            JobRunContext::new("a".repeat(64), Utc::now()).unwrap(),
+        )
     }
 
     fn run_fixture() -> (
@@ -5319,11 +5416,11 @@ mod tests {
     fn job_run_reuses_the_run_lifecycle_and_emits_fresh_safe_result_identity() {
         let (_directory, engine, image_id, guest, credentials) = run_fixture();
         let first = engine
-            .run_cell(&guest, &credentials, job_run_request(image_id.clone()))
+            .run_job_cell(&guest, &credentials, job_run_request(image_id.clone()))
             .unwrap();
         guest.state.lock().unwrap().readiness = VecDeque::from([GuestReadiness::Ready]);
         let second = engine
-            .run_cell(&guest, &credentials, job_run_request(image_id))
+            .run_job_cell(&guest, &credentials, job_run_request(image_id))
             .unwrap();
         let first_job = first.job.as_ref().unwrap();
         let second_job = second.job.as_ref().unwrap();
@@ -5351,7 +5448,7 @@ mod tests {
         guest.state.lock().unwrap().failure = Some(InjectedGuestFailure::Timeout);
 
         let error = engine
-            .run_cell(&guest, &credentials, job_run_request(image_id))
+            .run_job_cell(&guest, &credentials, job_run_request(image_id))
             .unwrap_err();
         let job = error.report().job.as_ref().unwrap();
         let encoded = serde_json::to_string(error.report()).unwrap();
@@ -5398,10 +5495,19 @@ keep_on_failure = false
         let (plan, request) = build_job_run_request(&loaded, host, &image, &[probe]).unwrap();
 
         assert!(!plan.authorizing);
-        assert_eq!(request.plan, plan.execution);
-        assert_eq!(request.spec.provider.as_deref(), Some("hyperv"));
-        assert!(request.job.is_some());
-        assert_eq!(request.command.program, "job-command-secret");
+        assert_eq!(request.plan(), &plan.execution);
+        assert_eq!(
+            request.binding.request.spec.provider.as_deref(),
+            Some("hyperv")
+        );
+        assert_eq!(
+            request.job().result_metadata(Utc::now()).job_spec_sha256,
+            "b".repeat(64)
+        );
+        assert_eq!(
+            request.binding.request.command.program,
+            "job-command-secret"
+        );
 
         let with_artifact = LoadedJobSpec {
             spec: crate::core::job_spec::parse_job_spec(
@@ -5428,6 +5534,23 @@ sources = ["results/output.txt"]
             build_job_run_request(&with_artifact, host, &image, &[engine.provider.probe()]),
             Err(EngineError::InvalidCellRequest(_))
         ));
+        assert!(engine.state.list_cells().unwrap().is_empty());
+        assert!(engine.provider.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn tampered_job_request_is_rejected_before_state_or_provider_mutation() {
+        let (_directory, engine, image_id, guest, credentials) = run_fixture();
+        let mut request = job_run_request(image_id);
+        request.request.command.program = "tampered-command".to_owned();
+        engine.provider.state.lock().unwrap().calls.clear();
+
+        let error = engine
+            .run_job_cell(&guest, &credentials, request)
+            .unwrap_err();
+
+        assert_eq!(error.report().stage, RunStage::RequestValidation);
+        assert!(error.report().job.is_some());
         assert!(engine.state.list_cells().unwrap().is_empty());
         assert!(engine.provider.state.lock().unwrap().calls.is_empty());
     }
