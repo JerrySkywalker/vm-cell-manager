@@ -7,6 +7,11 @@
     "slug": "JerrySkywalker/vm-cell-manager",
     "candidate_sha": "REQUIRED_EXACT_40_HEX_SHA"
   },
+  "candidate_binary": {
+    "version": "REQUIRED_VERSION",
+    "sha256": "REQUIRED_SHA256",
+    "checkout_clean": "REQUIRED_BOOLEAN"
+  },
   "host": {
     "os": "linux",
     "architecture": "x86_64",
