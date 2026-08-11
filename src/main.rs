@@ -16,10 +16,10 @@ use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliExitCode, CliHumanOutput, CliInputError, CliProvider, Command,
     CompletionCommand, CredentialArgs, DoctorReport, ErrorEnvelope, GuestOperationCommand,
-    ImageCommand, ListEnvelope, ProviderCommand, RunErrorEnvelope, StateCommand, StatusCellEntry,
-    StatusCellObservation, StatusCleanupGuidance, StatusImageEntry, StatusImageObservation,
-    StatusImageVariantObservation, StatusOperationEntry, StatusReport, StatusRetention,
-    classify_cli_error, public_error_message,
+    ImageCommand, JobCommand, ListEnvelope, ProviderCommand, RunErrorEnvelope, StateCommand,
+    StatusCellEntry, StatusCellObservation, StatusCleanupGuidance, StatusImageEntry,
+    StatusImageObservation, StatusImageVariantObservation, StatusOperationEntry, StatusReport,
+    StatusRetention, classify_cli_error, public_error_message,
 };
 use vm_cell_manager::config::{ConfigProvider, HumanOutputPreference, ResolvedConfig, load_config};
 use vm_cell_manager::core::automation::RequiredAction;
@@ -28,6 +28,8 @@ use vm_cell_manager::core::guest::{
     GuestFailureClass, GuestOperationKind, GuestOperationPhase, GuestOperationRecord,
 };
 use vm_cell_manager::core::image::{Architecture, GuestOs, ImageRecord};
+use vm_cell_manager::core::job_plan::{ResolvedJobPlan, resolve_job_plan};
+use vm_cell_manager::core::job_spec::load_job_spec;
 use vm_cell_manager::core::run_selection::{
     HostPlatform, RequestedAccelerator, RunExecutionPlan, RunSelectionIntent, RunSelectionSource,
     resolve_run_execution_plan,
@@ -234,6 +236,23 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     write_provider_probe(probe, &mut std::io::stdout().lock())
                         .expect("stdout should remain writable");
                 }
+            })?;
+        }
+        Command::Job {
+            command: JobCommand::Plan { spec },
+        } => {
+            let loaded = load_job_spec(&spec)?;
+            let state = StateStore::new(state_root.unwrap_or_else(StateStore::default_root));
+            let image = state.load_image(&loaded.spec.image)?;
+            let plan = resolve_job_plan(
+                &loaded,
+                HostPlatform::current()?,
+                &image,
+                &builtin_provider_probes(),
+            )?;
+            emit(&plan, cli.json, || {
+                write_human_job_plan(&plan, &mut std::io::stdout().lock())
+                    .expect("stdout should remain writable");
             })?;
         }
         Command::Image {
@@ -911,7 +930,8 @@ fn run_m2<P: LocalVmProvider>(
         | Command::Status
         | Command::State { .. }
         | Command::Completion { .. }
-        | Command::Provider { .. } => {
+        | Command::Provider { .. }
+        | Command::Job { .. } => {
             unreachable!("handled before engine creation")
         }
     }
@@ -1205,6 +1225,9 @@ fn provider_for_command(
         | Command::Doctor
         | Command::Status
         | Command::Provider { .. } => CliProvider::Hyperv.as_str().to_owned(),
+        Command::Job { .. } => {
+            return Err("job plan command was not routed before provider selection".into());
+        }
         Command::Reconcile { cell_id: None } | Command::Gc => {
             return Err("multi-provider command was not routed before provider selection".into());
         }
@@ -2324,6 +2347,39 @@ fn write_human_run_plan(plan: &RunExecutionPlan, output: &mut impl Write) -> std
         architecture_name(plan.guest_architecture),
         plan.support_status.as_str(),
         source,
+    )
+}
+
+fn write_human_job_plan(plan: &ResolvedJobPlan, output: &mut impl Write) -> std::io::Result<()> {
+    let source = match plan.execution.selection_source {
+        RunSelectionSource::ExplicitCli => "explicit_job_spec",
+        RunSelectionSource::ConfigPreference => "config_preference",
+        RunSelectionSource::NativeDefault => "native_default",
+    };
+    writeln!(
+        output,
+        "vmcell: job plan: image={} provider={} accelerator={} transport={} guest={}/{} support={} source={} cpu={} memory_mib={} ttl_seconds={} readiness_timeout_seconds={} action_timeout_seconds={} max_output_bytes={} keep={} keep_on_failure={} copy_in={} artifacts={} job_spec_sha256={} authority=none",
+        plan.execution.image,
+        plan.execution.provider.as_str(),
+        plan.execution.accelerator.as_str(),
+        plan.execution.guest_transport.as_str(),
+        guest_os_name(plan.execution.guest_os),
+        architecture_name(plan.execution.guest_architecture),
+        plan.execution.support_status.as_str(),
+        source,
+        plan.resources.cpu_count,
+        plan.resources.memory_mib,
+        plan.resources
+            .ttl_seconds
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        plan.timeouts.readiness_timeout_seconds,
+        plan.timeouts.action_timeout_seconds,
+        plan.timeouts.max_output_bytes,
+        plan.cleanup.keep,
+        plan.cleanup.keep_on_failure,
+        plan.declared_copy_in_count,
+        plan.declared_artifact_count,
+        plan.job_spec_sha256,
     )
 }
 

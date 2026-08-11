@@ -3,6 +3,7 @@ pub mod capability;
 pub mod cell;
 pub mod guest;
 pub mod image;
+pub mod job_plan;
 pub mod job_spec;
 pub mod lifecycle;
 pub mod ownership;
