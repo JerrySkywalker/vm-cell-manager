@@ -3329,7 +3329,7 @@ mod tests {
             symlink(&external, &request.overlay_path).unwrap();
             assert!(matches!(
                 provider.create_overlay(&authority, &request),
-                Err(ProviderError::Collision(_))
+                Err(ProviderError::OwnershipChanged(_))
             ));
             assert_eq!(fs::read(&external).unwrap(), b"retain");
         }
