@@ -406,15 +406,20 @@ pub fn build_job_run_request(
             "validated job specification path has no parent directory".to_owned(),
         )
     })?;
+    let source_root = source_root.canonicalize().map_err(|_| {
+        EngineError::Integrity(
+            "validated job specification parent is no longer available".to_owned(),
+        )
+    })?;
     let copy_in = spec
         .copy_in
         .iter()
         .map(|input| {
             let (source, source_sha256, source_size) =
-                bind_job_copy_source(source_root, &input.source, input.max_bytes)?;
+                bind_job_copy_source(&source_root, &input.source, input.max_bytes)?;
             Ok(JobCopyInAction {
                 source,
-                source_root: source_root.to_path_buf(),
+                source_root: source_root.clone(),
                 source_sha256,
                 source_size,
                 destination: input.destination.clone(),
