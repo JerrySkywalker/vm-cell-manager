@@ -109,10 +109,15 @@ try {
     Invoke-VmcellCiNativeCommand -Action { & $env:ComSpec /d /c exit 23 }
   } catch {
     $nativeFailureObserved = $true
+    # This fixture intentionally catches a native failure; do not let its
+    # ambient exit status turn a successful static-contract script into a CI
+    # failure after the expected assertion has completed.
+    $global:LASTEXITCODE = 0
   }
   if (-not $nativeFailureObserved) {
     throw 'timing helper failed to preserve an immediate native command failure'
   }
+  Invoke-VmcellCiTimedStage -Stage powershell-static -Action {}
 
   $failedActionObserved = $false
   try {
