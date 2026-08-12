@@ -2667,6 +2667,31 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         operation_id: GuestOperationId,
     ) -> Result<GuestOperationRecoveryReport, EngineError> {
+        let operation = self.state.load_guest_operation(operation_id)?;
+        self.state
+            .require_guest_operation_parent_for_mutation(&operation)?;
+        match operation.phase {
+            GuestOperationPhase::Completed | GuestOperationPhase::Failed => {
+                return Ok(GuestOperationRecoveryReport {
+                    schema_version: AUTOMATION_SCHEMA_VERSION,
+                    operation,
+                    disposition: GuestOperationRecoveryDisposition::AlreadyTerminal,
+                    required_action: RequiredAction::None,
+                    changed: false,
+                });
+            }
+            GuestOperationPhase::TransportActive => {
+                return Ok(GuestOperationRecoveryReport {
+                    schema_version: AUTOMATION_SCHEMA_VERSION,
+                    operation,
+                    disposition: GuestOperationRecoveryDisposition::RecoveryRequired,
+                    required_action: RequiredAction::ManualReview,
+                    changed: false,
+                });
+            }
+            GuestOperationPhase::IntentRecorded | GuestOperationPhase::ArtifactCommitted => {}
+        }
+
         let mutation = self.state.acquire_mutation_lock()?;
         let mut operation = self.state.load_guest_operation(operation_id)?;
         self.state
@@ -2674,6 +2699,9 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let (disposition, changed) = match operation.phase {
             GuestOperationPhase::Completed | GuestOperationPhase::Failed => {
                 (GuestOperationRecoveryDisposition::AlreadyTerminal, false)
+            }
+            GuestOperationPhase::TransportActive => {
+                (GuestOperationRecoveryDisposition::RecoveryRequired, false)
             }
             GuestOperationPhase::IntentRecorded => {
                 let now = Utc::now();
@@ -2710,9 +2738,6 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     GuestOperationRecoveryDisposition::ArtifactCompletionRecovered,
                     true,
                 )
-            }
-            GuestOperationPhase::TransportActive => {
-                (GuestOperationRecoveryDisposition::RecoveryRequired, false)
             }
         };
         Ok(GuestOperationRecoveryReport {

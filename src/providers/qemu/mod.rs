@@ -378,13 +378,49 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
     }
 
     fn inspect_config(&self, config: &QemuVmConfig) -> Result<ProviderVm, ProviderError> {
+        if config.spawn_pending {
+            return Err(ProviderError::OwnershipChanged(
+                "QEMU launch may have started before its process receipt was persisted".to_owned(),
+            ));
+        }
+
+        let Some((pid, token, executable_sha256)) = config
+            .process_id
+            .zip(config.process_start_token)
+            .zip(config.process_executable_sha256.as_deref())
+            .map(|((pid, token), executable_sha256)| (pid, token, executable_sha256))
+        else {
+            ensure_control_endpoints_absent(config)?;
+            return Ok(config.snapshot(ProviderPowerState::Off));
+        };
+
+        if !self.executor.process_matches(
+            pid,
+            token,
+            &self.system_binary,
+            &config.command_sha256,
+            executable_sha256,
+        ) {
+            if !self.executor.process_absence_proven(pid, token) {
+                return Err(ProviderError::OwnershipChanged(
+                    "recorded QEMU process absence cannot be proven".to_owned(),
+                ));
+            }
+            if !self.executor.process_group_absence_proven(pid) {
+                return Err(ProviderError::OwnershipChanged(
+                    "recorded QEMU process group is not empty".to_owned(),
+                ));
+            }
+            ensure_control_endpoints_absent(config)?;
+            return Ok(config.snapshot(ProviderPowerState::Off));
+        }
+
         let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
         let qmp = self
             .executor
             .connect_qmp(&config.qmp, Duration::from_millis(100));
         let power_state = match qmp {
             Ok(stream) => {
-                self.validate_live_process_receipt(config)?;
                 let mut qmp =
                     QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
                 validate_qmp_identity(&mut qmp, config)?;
@@ -401,38 +437,9 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
                 }
             }
             Err(_) => {
-                if config.spawn_pending {
-                    return Err(ProviderError::OwnershipChanged(
-                        "QEMU launch may have started before its process receipt was persisted"
-                            .to_owned(),
-                    ));
-                }
-                if let (Some(pid), Some(token)) = (config.process_id, config.process_start_token) {
-                    if self.executor.process_matches(
-                        pid,
-                        token,
-                        &self.system_binary,
-                        &config.command_sha256,
-                        config.process_executable_sha256.as_deref().unwrap_or(""),
-                    ) {
-                        return Err(ProviderError::OwnershipChanged(
-                            "recorded QEMU process is alive but its QMP identity is unavailable"
-                                .to_owned(),
-                        ));
-                    }
-                    if !self.executor.process_absence_proven(pid, token) {
-                        return Err(ProviderError::OwnershipChanged(
-                            "recorded QEMU process absence cannot be proven".to_owned(),
-                        ));
-                    }
-                    if !self.executor.process_group_absence_proven(pid) {
-                        return Err(ProviderError::OwnershipChanged(
-                            "recorded QEMU process group is not empty".to_owned(),
-                        ));
-                    }
-                }
-                ensure_control_endpoints_absent(config)?;
-                ProviderPowerState::Off
+                return Err(ProviderError::OwnershipChanged(
+                    "recorded QEMU process is alive but its QMP identity is unavailable".to_owned(),
+                ));
             }
         };
         Ok(config.snapshot(power_state))
@@ -1610,25 +1617,47 @@ fn unix_control_endpoint_is_safe(path: &Path) -> bool {
 
 fn ensure_control_endpoints_absent(config: &QemuVmConfig) -> Result<(), ProviderError> {
     for endpoint in [&config.qmp, &config.qga] {
-        let ControlEndpoint::Unix(path) = endpoint else {
-            continue;
-        };
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                return Err(ProviderError::OwnershipChanged(
-                    "QEMU control endpoint path already exists; stale or foreign state requires manual review"
-                        .to_owned(),
-                ));
-            }
-            Err(_) => {
-                return Err(ProviderError::OwnershipChanged(
-                    "QEMU control endpoint absence could not be proven".to_owned(),
-                ));
-            }
-        }
+        ensure_control_endpoint_absent(endpoint)?;
     }
     Ok(())
+}
+
+fn ensure_control_endpoint_absent(endpoint: &ControlEndpoint) -> Result<(), ProviderError> {
+    match endpoint {
+        ControlEndpoint::Unix(path) => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(ProviderError::OwnershipChanged(
+                "QEMU control endpoint path already exists; stale or foreign state requires manual review"
+                    .to_owned(),
+            )),
+            Err(_) => Err(ProviderError::OwnershipChanged(
+                "QEMU control endpoint absence could not be proven".to_owned(),
+            )),
+        },
+        ControlEndpoint::WindowsPipe(path) if windows_pipe_absence_proven(path) => Ok(()),
+        ControlEndpoint::WindowsPipe(_) => Err(ProviderError::OwnershipChanged(
+            "QEMU named-pipe control endpoint is live or its absence cannot be proven"
+                .to_owned(),
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_pipe_absence_proven(path: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    let wide = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe { WaitNamedPipeW(wide.as_ptr(), 0) == 0 && GetLastError() == ERROR_FILE_NOT_FOUND }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_pipe_absence_proven(_path: &str) -> bool {
+    false
 }
 
 fn remaining_provider_duration(deadline: std::time::Instant) -> Result<Duration, ProviderError> {
@@ -2544,6 +2573,36 @@ mod tests {
         backing: Option<PathBuf>,
         qmp_sessions: Mutex<VecDeque<Vec<u8>>>,
         process_matches: AtomicBool,
+        process_absence_proven: AtomicBool,
+    }
+
+    type QemuConfigDrift = (&'static str, fn(&mut QemuVmConfig));
+
+    impl Default for FakeExecutor {
+        fn default() -> Self {
+            Self {
+                accelerators: Vec::new(),
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: None,
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+                process_absence_proven: AtomicBool::new(true),
+            }
+        }
+    }
+
+    fn process_match_trace(
+        process_id: u32,
+        start_token: u64,
+        program: &OsStr,
+        command_sha256: &str,
+        executable_sha256: &str,
+    ) -> String {
+        format!(
+            "process_receipt pid={process_id} start_token={start_token} program={} command_sha256={command_sha256} executable_sha256={executable_sha256}",
+            program.to_string_lossy()
+        )
     }
 
     impl QemuCommandExecutor for FakeExecutor {
@@ -2609,16 +2668,21 @@ mod tests {
         }
         fn process_matches(
             &self,
-            _process_id: u32,
-            _start_token: u64,
-            _program: &OsStr,
-            _command_sha256: &str,
-            _executable_sha256: &str,
+            process_id: u32,
+            start_token: u64,
+            program: &OsStr,
+            command_sha256: &str,
+            executable_sha256: &str,
         ) -> bool {
-            self.calls
-                .lock()
-                .unwrap()
-                .push("process_matches".to_owned());
+            let mut calls = self.calls.lock().unwrap();
+            calls.push("process_matches".to_owned());
+            calls.push(process_match_trace(
+                process_id,
+                start_token,
+                program,
+                command_sha256,
+                executable_sha256,
+            ));
             self.process_matches.load(Ordering::SeqCst)
         }
         fn process_absence_proven(&self, _process_id: u32, _start_token: u64) -> bool {
@@ -2626,7 +2690,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push("process_absence_proven".to_owned());
-            true
+            self.process_absence_proven.load(Ordering::SeqCst)
         }
         fn process_group_absence_proven(&self, _process_group_id: u32) -> bool {
             self.calls
@@ -2664,6 +2728,7 @@ mod tests {
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -2712,6 +2777,7 @@ mod tests {
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -2729,6 +2795,7 @@ mod tests {
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -2761,6 +2828,7 @@ mod tests {
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -3007,6 +3075,41 @@ mod tests {
         assert!(!control_endpoint_is_safe(&ControlEndpoint::Unix(long_path)));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_control_pipe_collisions_are_retained() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT};
+
+        let path = format!(r"\\.\pipe\vmcell-qmp-{}", Uuid::new_v4());
+        let endpoint = ControlEndpoint::WindowsPipe(path.clone());
+        assert!(ensure_control_endpoint_absent(&endpoint).is_ok());
+
+        let wide = std::ffi::OsStr::new(&path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                64,
+                64,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let collision = ensure_control_endpoint_absent(&endpoint);
+        unsafe { CloseHandle(handle) };
+        assert!(matches!(collision, Err(ProviderError::OwnershipChanged(_))));
+        assert!(ensure_control_endpoint_absent(&endpoint).is_ok());
+    }
+
     #[test]
     fn launch_is_networkless_and_digest_binds_every_argument() {
         let config = QemuVmConfig {
@@ -3056,6 +3159,7 @@ mod tests {
                 backing: Some(record.image.path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             state.root().join("runtime"),
             "qemu-system-test".into(),
@@ -3121,14 +3225,24 @@ mod tests {
             .executor
             .process_matches
             .store(false, Ordering::SeqCst);
+        provider
+            .executor
+            .process_absence_proven
+            .store(false, Ordering::SeqCst);
         assert!(matches!(
             provider.inspect_vm(&VmLookup::Id(configured.id.clone())),
             Err(ProviderError::OwnershipChanged(_))
         ));
+        assert_eq!(provider.executor.qmp_sessions.lock().unwrap().len(), 1);
         provider
             .executor
             .process_matches
             .store(true, Ordering::SeqCst);
+        provider
+            .executor
+            .process_absence_proven
+            .store(true, Ordering::SeqCst);
+        provider.executor.qmp_sessions.lock().unwrap().clear();
         provider
             .executor
             .qmp_sessions
@@ -3223,6 +3337,205 @@ mod tests {
         );
     }
 
+    #[test]
+    fn receipt_tuple_drift_blocks_lifecycle_before_qmp_or_cleanup() {
+        let (_directory, state, installation, runtime, mut record) =
+            crate::providers::test_mutation_fixture_for(
+                "qemu",
+                "qcow2",
+                crate::core::image::GuestOs::Linux,
+            );
+        let mutation = state.acquire_mutation_lock().unwrap();
+        fs::write(&record.image.path, b"base").unwrap();
+        fs::write(&record.ownership.overlay_path, b"overlay").unwrap();
+        let provider = QemuProvider::new(
+            FakeExecutor {
+                accelerators: vec!["tcg".to_owned()],
+                calls: Mutex::new(Vec::new()),
+                failed_program: None,
+                backing: Some(record.image.path.clone()),
+                qmp_sessions: Mutex::new(VecDeque::new()),
+                process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
+            },
+            state.root().join("runtime"),
+            "qemu-system-test".into(),
+            "qemu-img".into(),
+        );
+        let request = CreateVmRequest {
+            name: record.ownership.provider_object_name.clone(),
+            configuration_path: record.ownership.configuration_path.clone(),
+            overlay_path: record.ownership.overlay_path.clone(),
+            parent_path: record.image.path.clone(),
+            memory_mib: record.spec.memory_mib,
+            cpu_count: record.spec.cpu_count,
+            accelerator: Some("tcg".to_owned()),
+            allow_tcg: true,
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+        let identity = provider.create_vm(&authority, &request).unwrap();
+        record.provider_object = Some(crate::core::ownership::ProviderObjectIdentity {
+            id: identity.id.clone(),
+            name: identity.name,
+        });
+        record.phase = crate::core::cell::CellPhase::ProviderObjectCreated;
+        let initial = provider
+            .inspect_vm(&VmLookup::Id(identity.id))
+            .unwrap()
+            .unwrap();
+        let claim = ClaimVmRequest {
+            expected: initial,
+            ownership_marker: record.ownership.provider_marker.clone(),
+        };
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+        let claimed = provider.claim_vm(&authority, &claim).unwrap();
+        record.phase = crate::core::cell::CellPhase::ProviderObjectClaimed;
+        let configured = {
+            let authority =
+                ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+            provider
+                .configure_vm(
+                    &authority,
+                    &ConfigureVmRequest {
+                        expected: claimed,
+                        cpu_count: record.spec.cpu_count,
+                    },
+                )
+                .unwrap()
+        };
+        record.phase = crate::core::cell::CellPhase::Ready;
+        record.state = crate::core::cell::CellState::Stopped;
+        let authority = ProviderMutationAuthority::new(&record, &installation, &runtime, &mutation);
+        assert!(provider.start_vm(&authority, &configured).is_err());
+
+        let config_path = QemuProvider::<FakeExecutor>::config_path(&configured.configuration_path);
+        let original = read_config(&config_path).unwrap();
+        let mut paused = configured.clone();
+        paused.power_state = ProviderPowerState::Paused;
+        let mut running = paused.clone();
+        running.power_state = ProviderPowerState::Running;
+        let drifts: [QemuConfigDrift; 3] = [
+            ("process_id", |config| config.process_id = Some(4243)),
+            ("process_start_token", |config| {
+                config.process_start_token = Some(8)
+            }),
+            ("process_executable_sha256", |config| {
+                config.process_executable_sha256 = Some("b".repeat(64))
+            }),
+        ];
+
+        for (field, apply) in drifts {
+            let mut drifted = original.clone();
+            apply(&mut drifted);
+            fs::write(&config_path, serde_json::to_vec_pretty(&drifted).unwrap()).unwrap();
+            provider
+                .executor
+                .process_matches
+                .store(false, Ordering::SeqCst);
+            provider
+                .executor
+                .process_absence_proven
+                .store(false, Ordering::SeqCst);
+            provider.executor.calls.lock().unwrap().clear();
+            let mut qmp_sessions = provider.executor.qmp_sessions.lock().unwrap();
+            qmp_sessions.clear();
+            for _ in 0..3 {
+                qmp_sessions.push_back(qmp_status_session(&configured, "paused"));
+            }
+            drop(qmp_sessions);
+
+            assert!(matches!(
+                provider.inspect_vm(&VmLookup::Id(configured.id.clone())),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+            assert!(matches!(
+                provider.start_vm(&authority, &paused),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+            assert!(matches!(
+                provider.stop_vm(&authority, &running),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+            assert_eq!(
+                provider.executor.qmp_sessions.lock().unwrap().len(),
+                3,
+                "{field} drift must not reach QMP"
+            );
+
+            let expected = process_match_trace(
+                drifted.process_id.unwrap(),
+                drifted.process_start_token.unwrap(),
+                OsStr::new("qemu-system-test"),
+                &drifted.command_sha256,
+                drifted.process_executable_sha256.as_deref().unwrap(),
+            );
+            let calls = provider.executor.calls.lock().unwrap();
+            let traces = calls
+                .iter()
+                .filter(|call| call.starts_with("process_receipt "))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                traces.len(),
+                3,
+                "{field} drift must probe every lifecycle entrypoint"
+            );
+            assert!(
+                traces.iter().all(|trace| **trace == expected),
+                "{field} drift receipt probe mismatch: traces={traces:?} expected={expected}"
+            );
+            drop(calls);
+            fs::write(&config_path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+            provider
+                .executor
+                .process_absence_proven
+                .store(true, Ordering::SeqCst);
+        }
+
+        let mut launch_digest_drift = original.clone();
+        launch_digest_drift.command_sha256 = "b".repeat(64);
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&launch_digest_drift).unwrap(),
+        )
+        .unwrap();
+        provider.executor.calls.lock().unwrap().clear();
+        let mut qmp_sessions = provider.executor.qmp_sessions.lock().unwrap();
+        qmp_sessions.clear();
+        for _ in 0..3 {
+            qmp_sessions.push_back(qmp_status_session(&paused, "paused"));
+        }
+        drop(qmp_sessions);
+
+        assert!(matches!(
+            provider.inspect_vm(&VmLookup::Id(configured.id.clone())),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            provider.start_vm(&authority, &paused),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            provider.stop_vm(&authority, &running),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert!(
+            !provider
+                .executor
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "process_matches"),
+            "launch digest drift must fail before receipt probing"
+        );
+        assert_eq!(provider.executor.qmp_sessions.lock().unwrap().len(), 3);
+        fs::write(&config_path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        provider
+            .executor
+            .process_matches
+            .store(true, Ordering::SeqCst);
+    }
+
     #[cfg(unix)]
     #[test]
     fn create_vm_rejects_overlong_control_endpoints_before_persisting_config() {
@@ -3253,6 +3566,7 @@ mod tests {
                 backing: Some(record.image.path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             state.root().join("runtime"),
             "qemu-system-test".into(),
@@ -3296,6 +3610,7 @@ mod tests {
                 backing: Some(record.image.path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             state.root().join("runtime"),
             "qemu-system-test".into(),
@@ -3345,6 +3660,7 @@ mod tests {
                 backing: None,
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             PathBuf::from("runtime"),
             "qemu-system-test".into(),
@@ -3674,6 +3990,7 @@ mod tests {
                 backing: Some(config.parent_path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                ..FakeExecutor::default()
             },
             directory.path().to_path_buf(),
             "qemu-system-test".into(),

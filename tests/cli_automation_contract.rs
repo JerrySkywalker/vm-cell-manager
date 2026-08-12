@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -7,6 +8,7 @@ const MISSING_CELL_ID: &str = "00000000-0000-0000-0000-000000000001";
 const CORRELATED_CELL_ID: &str = "00000000-0000-0000-0000-000000000124";
 const CORRELATED_OPERATION_ID: &str = "00000000-0000-0000-0000-000000000125";
 const CORRELATED_JOB_ID: &str = "00000000-0000-0000-0000-000000000126";
+const TRANSPORT_ACTIVE_OPERATION_ID: &str = "00000000-0000-0000-0000-000000000127";
 
 fn inspect_missing_cell(state_root: &std::path::Path, json: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vmcell"));
@@ -114,6 +116,34 @@ fn write_config(path: &std::path::Path, value: &serde_json::Value) {
     }
 }
 
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+    fn collect(root: &Path, directory: &Path, entries: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+        let mut paths = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                entries.push((relative, true, Vec::new()));
+                collect(root, &path, entries);
+            } else {
+                assert!(
+                    metadata.is_file(),
+                    "fixture state tree unexpectedly contains a non-ordinary entry: {path:?}"
+                );
+                entries.push((relative, false, fs::read(path).unwrap()));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    collect(root, root, &mut entries);
+    entries
+}
+
 fn invalid_run(state_root: &std::path::Path, json: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vmcell"));
     if json {
@@ -182,6 +212,7 @@ fn write_active_cell_fixture(state_root: &std::path::Path, base_path: &std::path
     {
         use std::os::unix::fs::PermissionsExt;
 
+        fs::set_permissions(state_root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&cells, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let cell_id = "00000000-0000-0000-0000-000000000123";
@@ -236,6 +267,39 @@ fn write_active_cell_fixture(state_root: &std::path::Path, base_path: &std::path
 
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
     }
+}
+
+fn write_transport_active_operation_fixture(state_root: &std::path::Path) -> std::path::PathBuf {
+    let operations = state_root.join("operations");
+    fs::create_dir_all(&operations).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&operations, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let operation_path = operations.join(format!("{TRANSPORT_ACTIVE_OPERATION_ID}.json"));
+    write_config(
+        &operation_path,
+        &serde_json::json!({
+            "schema_version": 1,
+            "id": TRANSPORT_ACTIVE_OPERATION_ID,
+            "cell_id": "00000000-0000-0000-0000-000000000123",
+            "kind": "copy_in",
+            "phase": "transport_active",
+            "created_at": "2026-08-12T00:00:00Z",
+            "updated_at": "2026-08-12T00:00:01Z",
+            "completed_at": null,
+            "failure": "timeout",
+            "exit_code": null,
+            "stdout_bytes": null,
+            "stderr_bytes": null,
+            "artifact_id": null,
+            "artifact_pruned_at": null
+        }),
+    );
+    operation_path
 }
 
 fn write_v2_correlated_operation_and_artifact_fixture(state_root: &std::path::Path) {
@@ -368,6 +432,50 @@ fn write_v2_correlated_operation_and_artifact_fixture(state_root: &std::path::Pa
             fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
         }
     }
+}
+
+#[test]
+fn transport_active_reconcile_is_fresh_process_read_only_and_nonreplaying() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let base_path = directory.path().join("base.vhdx");
+    fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+    write_active_cell_fixture(&state_root, &base_path);
+    let operation_path = write_transport_active_operation_fixture(&state_root);
+    let before = fs::read(&operation_path).unwrap();
+    let state_before = snapshot_tree(&state_root);
+    let base_before = fs::read(&base_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .arg("--json")
+        .arg("--state-root")
+        .arg(&state_root)
+        .arg("operation")
+        .arg("reconcile")
+        .arg(TRANSPORT_ACTIVE_OPERATION_ID)
+        .output()
+        .expect("vmcell CLI should start");
+
+    assert!(
+        output.status.success(),
+        "fresh-process reconciliation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["disposition"], "recovery_required");
+    assert_eq!(report["required_action"], "manual_review");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["operation"]["id"], TRANSPORT_ACTIVE_OPERATION_ID);
+    assert_eq!(report["operation"]["phase"], "transport_active");
+    assert_eq!(report["operation"]["failure"], "timeout");
+    assert_eq!(fs::read(&operation_path).unwrap(), before);
+    assert_eq!(snapshot_tree(&state_root), state_before);
+    assert_eq!(fs::read(&base_path).unwrap(), base_before);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains(state_root.to_string_lossy().as_ref()));
+    assert!(!stdout.contains(base_path.to_string_lossy().as_ref()));
 }
 
 #[test]
