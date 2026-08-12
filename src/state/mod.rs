@@ -4633,24 +4633,29 @@ mod tests {
                 "guarded write must not create a record in the replacement directory"
             );
         } else if child_emitted_marker(&replacement.stdout, "blocked") {
-            assert!(cfg!(windows), "only Windows may block the pinned rename");
-            guard.validate_filesystem_identity().unwrap();
-            drop(guard);
+            #[cfg(not(windows))]
+            panic!("only Windows may block the pinned rename");
 
-            let mut release_command = subprocess_for(
-                "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
-            );
-            release_command
-                .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "replace_cells")
-                .env("VMCELL_TEST_STATE_ROOT", store.root());
-            let released = run_test_child(release_command);
-            assert!(
-                released.status.success(),
-                "post-release replacement probe failed: {}",
-                child_diagnostic(&released.stderr)
-            );
-            assert_child_marker(&released.stdout, "replaced");
-            return;
+            #[cfg(windows)]
+            {
+                guard.validate_filesystem_identity().unwrap();
+                drop(guard);
+
+                let mut release_command = subprocess_for(
+                    "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+                );
+                release_command
+                    .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "replace_cells")
+                    .env("VMCELL_TEST_STATE_ROOT", store.root());
+                let released = run_test_child(release_command);
+                assert!(
+                    released.status.success(),
+                    "post-release replacement probe failed: {}",
+                    child_diagnostic(&released.stderr)
+                );
+                assert_child_marker(&released.stdout, "replaced");
+                return;
+            }
         } else {
             panic!(
                 "unexpected replacement child marker: {}",
