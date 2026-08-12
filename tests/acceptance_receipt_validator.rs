@@ -304,6 +304,17 @@ fn required_nullable_contract_fields_cannot_be_omitted() {
 }
 
 #[test]
+fn a_pass_requires_a_non_nil_real_run_cell_id() {
+    let mut request = valid_request();
+    request["receipt"]["run"]["cell_id"] =
+        Value::String("00000000-0000-0000-0000-000000000000".to_owned());
+    let validation = report(request);
+    assert!(!validation.document_valid);
+    assert_eq!(validation.disposition, AcceptanceReceiptDisposition::Rejected);
+    assert!(validation.has_finding("receipt.required_evidence_missing"));
+}
+
+#[test]
 fn malformed_duplicate_and_disclosing_input_fails_closed_without_echoing_it() {
     let duplicate = r#"{"schema_version":1,"schema_version":1,"contract":"vmcell.acceptance-receipt-validation-request.v1"}"#;
     let duplicate_report = validate_acceptance_receipt_bytes(duplicate.as_bytes());

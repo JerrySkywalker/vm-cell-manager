@@ -14,8 +14,8 @@ vmcell --json receipt validate < sanitized-validation-request.json
 The command reads at most 256 KiB. It accepts only strict UTF-8 JSON with no
 duplicate keys, unknown fields, raw host paths, URLs, credentials, commands,
 guest output, control characters, or bidirectional controls. Evidence values
-are bounded opaque identifiers or SHA-256 digests; the validator never echoes
-input values in its report.
+are bounded opaque identifiers or SHA-256 digests; a completed run also needs
+a non-nil UUID cell ID. The validator never echoes input values in its report.
 
 ## Scope and binding
 

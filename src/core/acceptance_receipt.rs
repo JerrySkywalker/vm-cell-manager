@@ -443,7 +443,7 @@ fn validate_receipt_ids(receipt: &FilledReceipt, reject: &mut impl FnMut(&'stati
             .run
             .cell_id
             .as_deref()
-            .is_some_and(|value| Uuid::parse_str(value).is_err())
+            .is_some_and(|value| !is_non_nil_uuid(value))
     {
         reject("receipt.required_evidence_missing");
     }
@@ -462,6 +462,10 @@ fn validate_receipt_ids(receipt: &FilledReceipt, reject: &mut impl FnMut(&'stati
     {
         reject("receipt.required_evidence_missing");
     }
+}
+
+fn is_non_nil_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|id| !id.is_nil())
 }
 
 fn validate_cross_fields(request: &ValidationRequest, reject: &mut impl FnMut(&'static str)) {
@@ -820,7 +824,18 @@ fn string_discloses_host_data(value: &str) -> bool {
         character.is_control()
             || matches!(
                 character,
-                '\u{202a}' | '\u{202b}' | '\u{202c}' | '\u{202d}' | '\u{202e}'
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'
+                    | '\u{202b}'
+                    | '\u{202c}'
+                    | '\u{202d}'
+                    | '\u{202e}'
+                    | '\u{2066}'
+                    | '\u{2067}'
+                    | '\u{2068}'
+                    | '\u{2069}'
             )
     }) || value.starts_with('/')
         || value.starts_with("\\\\")
@@ -865,5 +880,8 @@ mod tests {
         assert!(!is_opaque_id("REQUIRED_EVIDENCE"));
         assert!(!is_opaque_id("secret-evidence-123"));
         assert!(!is_opaque_id("C:\\private\\host"));
+        assert!(is_non_nil_uuid("00000000-0000-0000-0000-000000000001"));
+        assert!(!is_non_nil_uuid("00000000-0000-0000-0000-000000000000"));
+        assert!(string_discloses_host_data("evidence\u{2066}hidden"));
     }
 }
