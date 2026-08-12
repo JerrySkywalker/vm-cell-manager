@@ -67,6 +67,7 @@
   "ownership": {
     "exact_owned_namespace": "REQUIRED_VM_CELL_NAMESPACE",
     "process_identity": "REQUIRED_EXECUTABLE_HASH_PID_START_TOKEN_LAUNCH_DIGEST",
+    "process_tree_containment": "REQUIRED_ATOMIC_WINDOWS_JOB_OBJECT_AND_EMPTY_TREE_EVIDENCE",
     "overlay_identity": "REQUIRED_BASE_AND_OVERLAY_EVIDENCE",
     "qmp_identity": "REQUIRED_UUID_NAME_CPU_MEMORY_DISK_NETWORK_EVIDENCE"
   },
