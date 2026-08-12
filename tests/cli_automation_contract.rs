@@ -31,6 +31,25 @@ fn run_vmcell(arguments: &[&str]) -> std::process::Output {
         .expect("vmcell CLI should start")
 }
 
+fn run_vmcell_with_stdin(arguments: &[&str], stdin: &[u8]) -> std::process::Output {
+    use std::io::Write;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vmcell"))
+        .args(arguments)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("vmcell CLI should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(stdin)
+        .expect("receipt stdin should be writable");
+    child.wait_with_output().expect("vmcell CLI should finish")
+}
+
 #[test]
 fn version_help_and_shell_completions_are_stable_and_state_free() {
     let version = run_vmcell(&["--version"]);
@@ -49,6 +68,7 @@ fn version_help_and_shell_completions_are_stable_and_state_free() {
         "status",
         "state",
         "completion",
+        "receipt",
         "job",
         "run",
         "shell",
@@ -104,6 +124,79 @@ fn version_help_and_shell_completions_are_stable_and_state_free() {
     let envelope: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
     assert_eq!(envelope["error"]["code"], "vmcell.invalid_input");
     assert!(!absent_state.exists());
+}
+
+#[test]
+fn receipt_validation_is_bounded_json_only_and_skips_config_state_and_providers() {
+    let directory = tempfile::tempdir().unwrap();
+    let invalid_config = directory.path().join("malformed-config.json");
+    fs::write(&invalid_config, b"{").unwrap();
+    let absent_state = directory.path().join("receipt-state-must-not-exist");
+    let config = invalid_config.to_string_lossy().into_owned();
+    let state = absent_state.to_string_lossy().into_owned();
+    let valid = include_bytes!("fixtures/acceptance-receipts/v03-windows-pass.json");
+
+    let output = run_vmcell_with_stdin(
+        &[
+            "--json",
+            "--config",
+            config.as_str(),
+            "--state-root",
+            state.as_str(),
+            "receipt",
+            "validate",
+        ],
+        valid,
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["contract"],
+        "vmcell.acceptance-receipt-validation.v1"
+    );
+    assert_eq!(report["disposition"], "pass");
+    assert_eq!(report["authorizing"], false);
+    assert_eq!(report["support_promotion"], "not_evaluated");
+    assert!(!absent_state.exists());
+
+    let human = run_vmcell_with_stdin(&["receipt", "validate"], valid);
+    assert!(human.status.success());
+    assert!(human.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        "receipt validation: disposition=pass document_valid=true authorizing=false support_promotion=not_evaluated\n"
+    );
+
+    let sentinel = b"C:\\private\\guest-command-output";
+    let rejected = run_vmcell_with_stdin(
+        &[
+            "--json",
+            "--state-root",
+            state.as_str(),
+            "receipt",
+            "validate",
+        ],
+        sentinel,
+    );
+    assert_eq!(rejected.status.code(), Some(9));
+    assert!(rejected.stderr.is_empty());
+    let rejected_stdout = rejected.stdout;
+    let rejected: serde_json::Value = serde_json::from_slice(&rejected_stdout).unwrap();
+    assert_eq!(rejected["disposition"], "rejected");
+    assert_eq!(rejected["findings"][0]["code"], "receipt.invalid_json");
+    assert!(!String::from_utf8_lossy(&rejected_stdout).contains("guest-command-output"));
+    assert!(!absent_state.exists());
+
+    let rejected_human = run_vmcell_with_stdin(&["receipt", "validate"], sentinel);
+    assert_eq!(rejected_human.status.code(), Some(9));
+    assert!(rejected_human.stderr.is_empty());
+    let rejected_human = String::from_utf8(rejected_human.stdout).unwrap();
+    assert_eq!(
+        rejected_human,
+        "receipt validation: disposition=rejected document_valid=false authorizing=false support_promotion=not_evaluated\nfinding=receipt.invalid_json\n"
+    );
+    assert!(!rejected_human.contains("guest-command-output"));
 }
 
 fn write_config(path: &std::path::Path, value: &serde_json::Value) {

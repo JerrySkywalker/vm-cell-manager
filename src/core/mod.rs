@@ -1,3 +1,4 @@
+pub mod acceptance_receipt;
 pub mod automation;
 pub mod capability;
 pub mod cell;

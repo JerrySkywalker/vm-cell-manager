@@ -108,6 +108,12 @@ pub enum Command {
         command: JobCommand,
     },
 
+    /// Validate one sanitized real-platform receipt against supplied offline bindings.
+    Receipt {
+        #[command(subcommand)]
+        command: ReceiptCommand,
+    },
+
     /// Create one stopped, networkless Hyper-V or QEMU cell.
     Create {
         #[arg(long)]
@@ -338,6 +344,12 @@ pub enum JobCommand {
         #[arg(long, value_name = "PATH")]
         spec: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum ReceiptCommand {
+    /// Read one bounded JSON validation request from stdin without loading config or state.
+    Validate,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2355,6 +2367,19 @@ mod tests {
                 command: JobCommand::Plan { spec }
             } if spec == std::path::Path::new("vmcell.toml")
         ));
+    }
+
+    #[test]
+    fn parses_state_free_receipt_validation_surface() {
+        let cli = Cli::try_parse_from(["vmcell", "--json", "receipt", "validate"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Receipt {
+                command: ReceiptCommand::Validate
+            }
+        ));
+        assert!(Cli::try_parse_from(["vmcell", "receipt"]).is_err());
     }
 
     #[test]

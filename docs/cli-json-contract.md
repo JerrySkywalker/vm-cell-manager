@@ -28,6 +28,7 @@ vmcell image inspect IMAGE
 vmcell image dependencies IMAGE
 vmcell image unregister IMAGE
 vmcell job plan --spec PATH
+vmcell receipt validate < SANITIZED_VALIDATION_REQUEST.json
 vmcell create --image IMAGE [--provider hyperv|qemu] [--cpu-count N] [--memory-mib N] [--ttl-seconds N]
               [--accelerator auto|whpx|kvm|hvf|tcg] [--allow-tcg]
 vmcell run --image IMAGE [--provider hyperv|qemu] [--accelerator auto|whpx|kvm|hvf|tcg]
@@ -69,6 +70,16 @@ records. It does not create a missing root or rewrite compatible v0.1 JSON.
 Unsupported durable schemas use `vmcell.state.upgrade_required`, integrity exit
 9, and require the operator to stop mutation and follow
 [`state-compatibility.md`](state-compatibility.md).
+
+`receipt validate` is also state-, config-, provider-, and guest-free. It reads
+one bounded sanitized JSON validation request from stdin and emits
+`vmcell.acceptance-receipt-validation.v1`. Its report contains only a request
+digest, document-valid flag, disposition, and stable value-free finding codes.
+Only a structurally consistent completed v0.3 receipt and caller-supplied
+frozen binding returns exit `0`; a preflight, non-pass terminal record, or
+invalid document emits its report and exits with integrity code `9`. It is
+non-authorizing and does not evaluate support promotion. See
+[`acceptance-receipt-validator.md`](acceptance-receipt-validator.md).
 
 `completion powershell` is human-only shell integration. It is generated from
 the exact binary's Clap command graph before configuration, state, or provider
@@ -168,6 +179,12 @@ version `1`, while v0.4 job-correlated records are version `2`. Thus `operation
 inspect --json` and `artifact inspect --json` may return a v2 durable record;
 `operation list --json` and `status --json` retain their v1 outer envelope but
 may contain v2 records. List responses use:
+
+`receipt validate --json` emits `vmcell.acceptance-receipt-validation.v1`.
+The `authorizing` field is always `false` and `support_promotion` is always
+`not_evaluated`; a `pass` disposition proves only the strict offline request
+contract, never host behavior or a support row. Findings are stable
+`receipt.*` codes and deliberately omit all values from the input document.
 
 `doctor --json` additionally reports `contract: "vmcell.doctor.v1"`, overall
 `status` (`ready` or `unavailable`), and typed provider probe status (`ready`,

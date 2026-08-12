@@ -74,6 +74,11 @@ template. A future filled acceptance record must still have a separate operator
 authorization and a sanitized Markdown receipt; neither a template nor a
 preflight grants support-promotion authority.
 
+The offline [`acceptance-receipt validator`](acceptance-receipt-validator.md)
+adds a strict, sanitized JSON *validation request* for the two v0.3 QEMU
+tuples. It validates supplied binding consistency only: it does not replace the
+Markdown receipt, contact a host, authorize a lifecycle, or promote support.
+
 ## Owner packets
 
 All packets bind one accountable operator, clean exact candidate, isolated time
