@@ -836,6 +836,12 @@ fn string_discloses_host_data(value: &str) -> bool {
                     | '\u{2067}'
                     | '\u{2068}'
                     | '\u{2069}'
+                    | '\u{206a}'
+                    | '\u{206b}'
+                    | '\u{206c}'
+                    | '\u{206d}'
+                    | '\u{206e}'
+                    | '\u{206f}'
             )
     }) || value.starts_with('/')
         || value.starts_with("\\\\")
@@ -882,6 +888,14 @@ mod tests {
         assert!(!is_opaque_id("C:\\private\\host"));
         assert!(is_non_nil_uuid("00000000-0000-0000-0000-000000000001"));
         assert!(!is_non_nil_uuid("00000000-0000-0000-0000-000000000000"));
-        assert!(string_discloses_host_data("evidence\u{2066}hidden"));
+        for bidi_control in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{206a}', '\u{206b}',
+            '\u{206c}', '\u{206d}', '\u{206e}', '\u{206f}',
+        ] {
+            assert!(string_discloses_host_data(&format!(
+                "evidence{bidi_control}hidden"
+            )));
+        }
     }
 }
