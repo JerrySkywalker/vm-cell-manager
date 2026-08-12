@@ -97,6 +97,35 @@ ioctl and creates no VM. The lane never repairs device permissions, loads
 modules, or runs provider lifecycle commands. Hosted Linux evidence is native
 repository compile/test evidence, not real KVM/QGA acceptance.
 
+`Linux Reliability` is a separate manual `workflow_dispatch` R3 lane. It
+accepts the same exact lowercase 40-hex source SHA, proves the same hosted
+Ubuntu 24.04 x86_64/Rust 1.85 baseline, and uses only ephemeral Cargo, Rustup,
+and target directories. GitHub's normal owner-repository dispatch authorization
+is the source-trust admission: a job-level condition rejects a fork or
+non-dispatch context before runner allocation, then the lane checks out that
+owner repository's exact input SHA and proves it after
+checkout. A SHA syntax check alone is never a trust or support claim. It runs
+exactly the five fixed, ignored cases named in
+`tools/reliability-campaign.json`; it does not call `tools/check-linux.sh`,
+the package gate, provider commands, or a guest. The campaign script creates a
+short-lived, strict receipt under the ephemeral runner temp directory binding
+the exact source SHA, manifest digest, case count, toolchain, and terminal
+result. It is never uploaded or used as real-platform, release, or support
+evidence. The normal Linux lane remains the sole owner of the full repository
+and package gates. Windows core checks only the lane's committed static safety
+contract; it never runs the extended Linux campaign. The campaign has a hard
+600-second workflow boundary, while each named case remains independently
+bounded to 120 seconds and one MiB of captured test output.
+
+The trusted Windows core gate keeps its fixed 30-minute timeout and canonical
+commands. Its timing helper writes only allowlisted stage names, UTC timestamps,
+and bounded durations to runner-temp records, then aggregates valid records into
+the final Actions job summary. A partial, malformed, or absent record is ignored;
+timing remains best-effort diagnostic evidence, never a gate result. It never
+records commands, paths, runner identity, process data, environment values, logs,
+or error text. Those markers cannot classify a product failure, authorize
+recovery, replace an exact-head gate, or promote support.
+
 ## Provider safety rule
 
 M0 probes remain read-only. M1 Hyper-V mutation is reachable only through ownership-checked lifecycle commands carrying an engine-issued installation/runtime authority and must not be invoked as part of ordinary unit/core CI. No code path may automatically enable host virtualization features, reboot, modify switches, or mutate a VM by name alone.

@@ -168,48 +168,87 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo fmt --all -- --check
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'format' -Action {
+            Invoke-VmcellCiNativeCommand -Action { cargo fmt --all -- --check }
+          }
 
       - name: PowerShell AST and static safety
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & .\tools\check-powershell.ps1
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'powershell-static' -Action {
+            & .\tools\check-powershell.ps1
+            & .\tools\test-ci-timing.ps1
+          }
 
       - name: Windows WHPX preflight contract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & .\tools\test-windows-whpx-preflight.ps1
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'windows-preflight-contract' -Action {
+            & .\tools\test-windows-whpx-preflight.ps1
+          }
 
       - name: Linux validation workflow contract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & .\tools\test-linux-validation-workflow.ps1
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'linux-validation-contract' -Action {
+            & .\tools\test-linux-validation-workflow.ps1
+          }
+
+      - name: Linux reliability workflow contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'linux-reliability-contract' -Action {
+            & .\tools\test-linux-reliability-workflow.ps1
+          }
 
       - name: Clippy
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo clippy --all-targets --all-features -- -D warnings
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'clippy' -Action {
+            Invoke-VmcellCiNativeCommand -Action { cargo clippy --all-targets --all-features -- -D warnings }
+          }
 
       - name: Test
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo test --all-targets --all-features
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'test' -Action {
+            Invoke-VmcellCiNativeCommand -Action { cargo test --all-targets --all-features }
+          }
 
       - name: Portable Windows package contract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo build --locked --release --bin vmcell
-          $metadata = cargo metadata --locked --no-deps --format-version 1 |
-            ConvertFrom-Json
-          $package = @($metadata.packages | Where-Object name -eq 'vm-cell-manager')
-          if ($package.Count -ne 1) { throw 'Cargo package metadata was ambiguous' }
-          $binary = Join-Path $env:CARGO_TARGET_DIR 'release\vmcell.exe'
-          & .\tools\test-windows-package.ps1 `
-            -BinaryPath $binary `
-            -Version $package[0].version
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'windows-package-contract' -Action {
+            Invoke-VmcellCiNativeCommand -Action { cargo build --locked --release --bin vmcell }
+            $metadata = Invoke-VmcellCiNativeCommand -Action { cargo metadata --locked --no-deps --format-version 1 } |
+              ConvertFrom-Json
+            $package = @($metadata.packages | Where-Object name -eq 'vm-cell-manager')
+            if ($package.Count -ne 1) { throw 'Cargo package metadata was ambiguous' }
+            $binary = Join-Path $env:CARGO_TARGET_DIR 'release\vmcell.exe'
+            & .\tools\test-windows-package.ps1 `
+              -BinaryPath $binary `
+              -Version $package[0].version
+          }
+
+      - name: Sanitized CI timing summary
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tools\ci-timing.ps1
+          Write-VmcellCiTimingSummary

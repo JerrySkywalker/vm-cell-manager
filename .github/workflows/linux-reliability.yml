@@ -1,0 +1,120 @@
+name: Linux Reliability
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact trusted repository commit to run the bounded reliability campaign
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vmcell-linux-reliability-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  linux-reliability:
+    name: Linux Reliability / GitHub-hosted
+    if: github.repository == 'JerrySkywalker/vm-cell-manager' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.0
+      EXPECTED_RUSTC: rustc 1.85.0 (4d91de4e4 2025-02-17)
+      EXPECTED_CARGO_PREFIX: cargo 1.85.0
+
+    steps:
+      - name: Validate requested source identity
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'source_sha must be exactly 40 lowercase hexadecimal characters' >&2
+            exit 1
+          fi
+
+      - name: Checkout exact supplied SHA
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Bind ephemeral reliability build state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="$RUNNER_TEMP/vmcell-reliability-cargo"
+          rustup_home="$RUNNER_TEMP/vmcell-reliability-rustup"
+          cargo_target="$RUNNER_TEMP/vmcell-reliability-target"
+          for path in "$cargo_home" "$rustup_home" "$cargo_target"; do
+            mkdir -p "$path"
+            test "$(realpath "$path")" = "$(realpath "$RUNNER_TEMP")/$(basename "$path")"
+          done
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nCARGO_TARGET_DIR=%s\n' \
+            "$cargo_home" "$rustup_home" "$cargo_target" >> "$GITHUB_ENV"
+
+      - name: Prove hosted baseline and exact source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_EVENT_NAME:-}" = 'workflow_dispatch'
+          test "${GITHUB_REPOSITORY:-}" = 'JerrySkywalker/vm-cell-manager'
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$SOURCE_SHA"
+          test "${RUNNER_ENVIRONMENT:-}" = 'github-hosted'
+          test "${RUNNER_OS:-}" = 'Linux'
+          test "${RUNNER_ARCH:-}" = 'X64'
+          test "$(uname -s)" = 'Linux'
+          test "$(uname -m)" = 'x86_64'
+          . /etc/os-release
+          test "$ID" = 'ubuntu'
+          test "$VERSION_ID" = '24.04'
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf 'source_sha=%s\nrunner_environment=%s\nos=%s\narchitecture=%s\nbaseline=%s-%s\n' \
+            "$actual_sha" "$RUNNER_ENVIRONMENT" "$RUNNER_OS" "$RUNNER_ARCH" "$ID" "$VERSION_ID"
+
+      - name: Install exact repository toolchain in the ephemeral job
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.85.0 --profile minimal
+          test "$(rustc --version)" = "$EXPECTED_RUSTC"
+          case "$(cargo --version)" in
+            "$EXPECTED_CARGO_PREFIX"*) ;;
+            *) echo 'cargo version mismatch' >&2; exit 1 ;;
+          esac
+
+      - name: Fetch locked Rust dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+
+      - name: Run fixed reliability campaign
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          timeout --kill-after=1s 600s sh tools/check-reliability-campaign.sh \
+            --manifest tools/reliability-campaign.json \
+            --source-sha "$SOURCE_SHA" \
+            --receipt "$RUNNER_TEMP/vmcell-reliability-receipt.json"
+
+      - name: Prove reliability campaign was repository-read-only
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test ! -e "$GITHUB_WORKSPACE/target"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
