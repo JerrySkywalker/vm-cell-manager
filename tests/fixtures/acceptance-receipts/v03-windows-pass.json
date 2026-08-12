@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.acceptance-receipt-validation-request.v1",
+  "expected_binding": {
+    "release_ref": "release/v0.3.0",
+    "candidate_sha": "d0af04b2e84cf2226628173d2ed0d295aed01f2b",
+    "candidate_version": "0.3.0",
+    "candidate_binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "preflight_receipt_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "tuple": {
+      "host_os": "windows",
+      "host_architecture": "x86_64",
+      "provider": "qemu",
+      "accelerator": "whpx",
+      "guest_os": "linux",
+      "guest_architecture": "x86_64",
+      "guest_transport": "qga"
+    },
+    "immutable_base": {
+      "format": "qcow2",
+      "size_bytes": 1048576,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "receipt": {
+    "schema_version": 1,
+    "contract": "vmcell.real-platform-acceptance-receipt.v1",
+    "authorizing": false,
+    "real_platform_acceptance": "completed",
+    "result": "PASS",
+    "repository": {
+      "slug": "JerrySkywalker/vm-cell-manager",
+      "release_ref": "release/v0.3.0",
+      "candidate_sha": "d0af04b2e84cf2226628173d2ed0d295aed01f2b",
+      "checkout_clean": true
+    },
+    "candidate_binary": {
+      "version": "0.3.0",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "tuple": {
+      "host_os": "windows",
+      "host_architecture": "x86_64",
+      "provider": "qemu",
+      "accelerator": "whpx",
+      "guest_os": "linux",
+      "guest_architecture": "x86_64",
+      "guest_transport": "qga"
+    },
+    "preflight": {
+      "receipt_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "evidence_id": "evidence-preflight-123"
+    },
+    "immutable_base": {
+      "format": "qcow2",
+      "size_bytes": 1048576,
+      "sha256_before": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256_after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "backing_parent": null
+    },
+    "overlay": {
+      "base_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "identity_evidence_id": "evidence-overlay-123",
+      "cleanup_completed": true
+    },
+    "run": {
+      "mode": "authorized-real-run",
+      "authorization_evidence_id": "evidence-authorize-123",
+      "isolation_evidence_id": "evidence-isolate-123",
+      "exact_owned_namespace": "evidence-namespace-123",
+      "cell_id": "550e8400-e29b-41d4-a716-446655440000",
+      "provider_object_evidence_id": "evidence-provider-123",
+      "runtime_receipt_evidence_id": "evidence-runtime-123",
+      "lifecycle_evidence_id": "evidence-lifecycle-123",
+      "guest_evidence_id": "evidence-guest-123",
+      "unknown_guest_effect_replayed": false
+    },
+    "cleanup": {
+      "policy": "exact-owned-only",
+      "evidence_id": "evidence-cleanup-123",
+      "immutable_base_sha256_after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "foreign_state_unchanged": true,
+      "manual_review_retained": false
+    },
+    "support_status": "untested",
+    "support_promotion": "not_evaluated"
+  }
+}

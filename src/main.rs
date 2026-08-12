@@ -1,7 +1,5 @@
 use std::error::Error;
-#[cfg(test)]
-use std::io::Read;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,12 +14,16 @@ use serde::Serialize;
 use vm_cell_manager::cli::{
     ArtifactCommand, Cli, CliExitCode, CliHumanOutput, CliInputError, CliProvider, Command,
     CompletionCommand, CredentialArgs, DoctorReport, ErrorEnvelope, GuestOperationCommand,
-    ImageCommand, JobCommand, ListEnvelope, ProviderCommand, RunErrorEnvelope, StateCommand,
-    StatusCellEntry, StatusCellObservation, StatusCleanupGuidance, StatusImageEntry,
+    ImageCommand, JobCommand, ListEnvelope, ProviderCommand, ReceiptCommand, RunErrorEnvelope,
+    StateCommand, StatusCellEntry, StatusCellObservation, StatusCleanupGuidance, StatusImageEntry,
     StatusImageObservation, StatusImageVariantObservation, StatusOperationEntry, StatusReport,
     StatusRetention, classify_cli_error, public_error_message,
 };
 use vm_cell_manager::config::{ConfigProvider, HumanOutputPreference, ResolvedConfig, load_config};
+use vm_cell_manager::core::acceptance_receipt::{
+    AcceptanceReceiptDisposition, AcceptanceReceiptValidationReport, MAX_ACCEPTANCE_RECEIPT_BYTES,
+    validate_acceptance_receipt_bytes,
+};
 use vm_cell_manager::core::automation::RequiredAction;
 use vm_cell_manager::core::cell::{CellPhase, CellRecord, CellSpec, CellState};
 use vm_cell_manager::core::guest::{
@@ -181,6 +183,28 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         write_completion(*command, &mut std::io::stdout().lock());
         return Ok(ExitCode::SUCCESS);
     }
+    if matches!(
+        &cli.command,
+        Command::Receipt {
+            command: ReceiptCommand::Validate
+        }
+    ) {
+        let stdin = std::io::stdin();
+        let bytes = read_bounded_acceptance_receipt(&mut stdin.lock())?;
+        let report = validate_acceptance_receipt_bytes(&bytes);
+        emit(&report, cli.json, || {
+            write_acceptance_receipt_validation(&report, &mut std::io::stdout().lock())
+                .expect("stdout should remain writable");
+        })?;
+        return Ok(ExitCode::from(
+            if report.disposition == AcceptanceReceiptDisposition::Pass {
+                CliExitCode::Success
+            } else {
+                CliExitCode::Integrity
+            }
+            .as_u8(),
+        ));
+    }
     let defaults = load_config(cli.config.as_deref())?;
     let state_root = cli
         .state_root
@@ -237,6 +261,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             })?;
         }
         Command::Completion { .. } => unreachable!("handled before configuration loading"),
+        Command::Receipt { .. } => unreachable!("handled before configuration loading"),
         Command::Provider {
             command: ProviderCommand::List,
         } => {
@@ -494,6 +519,34 @@ fn write_completion(command: CompletionCommand, output: &mut dyn Write) {
             generate(Zsh, &mut command_line, "vmcell", output);
         }
     }
+}
+
+fn read_bounded_acceptance_receipt(input: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bounded = input.take((MAX_ACCEPTANCE_RECEIPT_BYTES + 1) as u64);
+    let mut bytes = Vec::with_capacity(MAX_ACCEPTANCE_RECEIPT_BYTES.min(8192));
+    bounded.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_acceptance_receipt_validation(
+    report: &AcceptanceReceiptValidationReport,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let disposition = match report.disposition {
+        AcceptanceReceiptDisposition::Pass => "pass",
+        AcceptanceReceiptDisposition::PreflightOnly => "preflight_only",
+        AcceptanceReceiptDisposition::TerminalNotPass => "terminal_not_pass",
+        AcceptanceReceiptDisposition::Rejected => "rejected",
+    };
+    writeln!(
+        output,
+        "receipt validation: disposition={disposition} document_valid={} authorizing=false support_promotion=not_evaluated",
+        report.document_valid
+    )?;
+    for finding in &report.findings {
+        writeln!(output, "finding={}", finding.code)?;
+    }
+    Ok(())
 }
 
 fn run_m2<P: LocalVmProvider>(
@@ -1030,6 +1083,7 @@ fn run_m2<P: LocalVmProvider>(
         | Command::Status
         | Command::State { .. }
         | Command::Completion { .. }
+        | Command::Receipt { .. }
         | Command::Provider { .. }
         | Command::Job { .. } => {
             unreachable!("handled before engine creation")
@@ -1322,6 +1376,7 @@ fn provider_for_command(
         | Command::Operation { .. }
         | Command::State { .. }
         | Command::Completion { .. }
+        | Command::Receipt { .. }
         | Command::Doctor
         | Command::Status
         | Command::Provider { .. } => CliProvider::Hyperv.as_str().to_owned(),

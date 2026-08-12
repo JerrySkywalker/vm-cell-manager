@@ -7,6 +7,7 @@ const LINUX_KVM_TEMPLATE: &str =
 const ACCEPTANCE_MATRIX: &str = include_str!("../docs/release-acceptance-matrix.md");
 const OWNER_PACKET_TEMPLATE: &str =
     include_str!("../docs/receipts/real-platform-owner-packet-template.md");
+const ACCEPTANCE_VALIDATOR_DOC: &str = include_str!("../docs/acceptance-receipt-validator.md");
 
 fn template(name: &str, source: &str) -> Value {
     serde_json::from_str(source)
@@ -327,6 +328,25 @@ fn owner_packet_template_is_sanitized_and_non_authorizing() {
         assert!(
             !OWNER_PACKET_TEMPLATE.contains(prohibited_text),
             "owner packet template must not model disclosure field {prohibited_text}"
+        );
+    }
+}
+
+#[test]
+fn offline_acceptance_validator_document_retains_the_real_platform_boundary() {
+    for required_text in [
+        "vmcell receipt validate",
+        "vmcell.acceptance-receipt-validation-request.v1",
+        "authorizing: false",
+        "support_promotion: \"not_evaluated\"",
+        "preflight can never be relabelled as `PASS`",
+        "does not mark a support row supported or experimental",
+        "does not contact a host, GitHub, a provider, or a guest",
+        "release/v0.3.0@d0af04b2e84cf2226628173d2ed0d295aed01f2b",
+    ] {
+        assert!(
+            ACCEPTANCE_VALIDATOR_DOC.contains(required_text),
+            "acceptance validator documentation omitted required boundary: {required_text}"
         );
     }
 }
