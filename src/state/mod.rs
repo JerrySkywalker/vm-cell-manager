@@ -2320,6 +2320,11 @@ fn validate_guest_operation_schema(
             record.completed_at.is_none()
                 && record.failure.is_none()
                 && record.artifact_id == Some(record.id)
+                && matches!(
+                    record.kind,
+                    crate::core::guest::GuestOperationKind::CopyOut
+                        | crate::core::guest::GuestOperationKind::ArtifactCollect
+                )
                 && record.artifact_pruned_at.is_none()
                 && record.exit_code.is_none()
                 && record.stdout_bytes.is_none()
@@ -3566,6 +3571,52 @@ mod tests {
                 Err(StateError::UnsafeRuntimePath(_))
             ));
         }
+    }
+
+    #[test]
+    fn artifact_committed_phase_is_limited_to_artifact_operations() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let _mutation = store.acquire_mutation_lock().unwrap();
+        let cell_id = CellId::new();
+        store.save_cell(&test_cell_record(&store, cell_id)).unwrap();
+        let now = Utc::now();
+
+        for kind in [GuestOperationKind::Exec, GuestOperationKind::CopyIn] {
+            let mut operation = GuestOperationRecord::intent(cell_id, kind, now);
+            operation.phase = GuestOperationPhase::ArtifactCommitted;
+            operation.artifact_id = Some(operation.id);
+            assert!(matches!(
+                store.save_guest_operation(&operation),
+                Err(StateError::GuestOperationIntegrity { .. })
+            ));
+        }
+
+        for kind in [
+            GuestOperationKind::CopyOut,
+            GuestOperationKind::ArtifactCollect,
+        ] {
+            let mut operation = GuestOperationRecord::intent(cell_id, kind, now);
+            operation.phase = GuestOperationPhase::ArtifactCommitted;
+            operation.artifact_id = Some(operation.id);
+            store.save_guest_operation(&operation).unwrap();
+            assert_eq!(store.load_guest_operation(operation.id).unwrap(), operation);
+        }
+
+        let mut externally_tampered =
+            GuestOperationRecord::intent(cell_id, GuestOperationKind::Exec, now);
+        store.save_guest_operation(&externally_tampered).unwrap();
+        externally_tampered.phase = GuestOperationPhase::ArtifactCommitted;
+        externally_tampered.artifact_id = Some(externally_tampered.id);
+        write_json_atomic(
+            &store.guest_operation_path(externally_tampered.id),
+            &externally_tampered,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_guest_operation(externally_tampered.id),
+            Err(StateError::GuestOperationIntegrity { .. })
+        ));
     }
 
     #[test]
