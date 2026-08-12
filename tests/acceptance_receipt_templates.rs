@@ -161,6 +161,7 @@ fn windows_whpx_acceptance_template_is_complete_and_non_authorizing() {
         "/writer_exclusivity/violations",
         "/ownership/exact_owned_namespace",
         "/ownership/process_identity",
+        "/ownership/process_tree_containment",
         "/ownership/overlay_identity",
         "/ownership/qmp_identity",
         "/cleanup/rollback_evidence",

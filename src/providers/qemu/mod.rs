@@ -2287,23 +2287,32 @@ fn process_group_id(process_id: u32) -> Option<u32> {
 
 #[cfg(target_os = "windows")]
 fn process_start_token(process_id: u32) -> Option<u64> {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
         if handle.is_null() {
             return None;
         }
+        let result = process_start_token_from_handle(handle);
+        CloseHandle(handle);
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_start_token_from_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    unsafe {
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
-        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
-        CloseHandle(handle);
-        ok.then(|| (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+        (GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0)
+            .then(|| (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
     }
 }
 
@@ -2383,7 +2392,11 @@ fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn process_group_absence_proven(_process_group_id: u32) -> bool {
-    true
+    // CREATE_NEW_PROCESS_GROUP is a console-control boundary, not a durable
+    // descendant-containment receipt. Until QEMU launches atomically inside a
+    // persisted Windows Job Object, cleanup must retain an exited leader rather
+    // than asserting that no descendant can still hold its runtime resources.
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -2456,8 +2469,9 @@ fn process_matches(
         let mut buffer = vec![0_u16; length as usize];
         let image_ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) != 0;
         let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+        let token_matches = process_start_token_from_handle(handle) == Some(start_token);
         CloseHandle(handle);
-        if !image_ok || !alive || process_start_token(process_id) != Some(start_token) {
+        if !image_ok || !alive || !token_matches {
             return false;
         }
         buffer.truncate(length as usize);
@@ -2478,22 +2492,76 @@ fn process_matches(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsProcessAbsenceObservation {
+    Missing,
+    Live(u64),
+    Signaled(u64),
+    Unknown,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_process_absence_proven(
+    recorded_start_token: u64,
+    observation: WindowsProcessAbsenceObservation,
+) -> bool {
+    if recorded_start_token == 0 {
+        return false;
+    }
+    match observation {
+        WindowsProcessAbsenceObservation::Missing => true,
+        WindowsProcessAbsenceObservation::Live(actual)
+        | WindowsProcessAbsenceObservation::Signaled(actual)
+            if actual != recorded_start_token =>
+        {
+            true
+        }
+        WindowsProcessAbsenceObservation::Signaled(_) => true,
+        WindowsProcessAbsenceObservation::Live(_) | WindowsProcessAbsenceObservation::Unknown => {
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
 
     if start_token == 0 {
         return false;
     }
     unsafe {
-        let handle = OpenProcess(0x0010_0000, 0, process_id);
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000,
+            0,
+            process_id,
+        );
         if handle.is_null() {
-            return GetLastError() == ERROR_INVALID_PARAMETER;
+            return windows_process_absence_proven(
+                start_token,
+                if GetLastError() == ERROR_INVALID_PARAMETER {
+                    WindowsProcessAbsenceObservation::Missing
+                } else {
+                    WindowsProcessAbsenceObservation::Unknown
+                },
+            );
         }
-        let result = WaitForSingleObject(handle, 0) == 0;
+        let observation = match process_start_token_from_handle(handle) {
+            Some(actual_start_token) => match WaitForSingleObject(handle, 0) {
+                WAIT_OBJECT_0 => WindowsProcessAbsenceObservation::Signaled(actual_start_token),
+                WAIT_TIMEOUT => WindowsProcessAbsenceObservation::Live(actual_start_token),
+                _ => WindowsProcessAbsenceObservation::Unknown,
+            },
+            None => WindowsProcessAbsenceObservation::Unknown,
+        };
         CloseHandle(handle);
-        result
+        windows_process_absence_proven(start_token, observation)
     }
 }
 
@@ -2574,6 +2642,7 @@ mod tests {
         qmp_sessions: Mutex<VecDeque<Vec<u8>>>,
         process_matches: AtomicBool,
         process_absence_proven: AtomicBool,
+        process_group_absence_proven: AtomicBool,
     }
 
     type QemuConfigDrift = (&'static str, fn(&mut QemuVmConfig));
@@ -2588,6 +2657,7 @@ mod tests {
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
                 process_absence_proven: AtomicBool::new(true),
+                process_group_absence_proven: AtomicBool::new(true),
             }
         }
     }
@@ -2697,7 +2767,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push("process_group_absence_proven".to_owned());
-            true
+            self.process_group_absence_proven.load(Ordering::SeqCst)
         }
         fn connect_qmp(
             &self,
@@ -3217,6 +3287,29 @@ mod tests {
         assert_eq!(persisted.process_executable_sha256, Some("a".repeat(64)));
         provider
             .executor
+            .process_matches
+            .store(false, Ordering::SeqCst);
+        provider
+            .executor
+            .process_group_absence_proven
+            .store(false, Ordering::SeqCst);
+        assert!(matches!(
+            provider.inspect_vm(&VmLookup::Id(configured.id.clone())),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+        assert!(matches!(
+            provider.remove_vm(&authority, &configured),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+        assert!(
+            QemuProvider::<FakeExecutor>::config_path(&configured.configuration_path).is_file()
+        );
+        provider
+            .executor
+            .process_group_absence_proven
+            .store(true, Ordering::SeqCst);
+        provider
+            .executor
             .qmp_sessions
             .lock()
             .unwrap()
@@ -3295,6 +3388,32 @@ mod tests {
             .executor
             .process_matches
             .store(true, Ordering::SeqCst);
+        provider
+            .executor
+            .process_group_absence_proven
+            .store(false, Ordering::SeqCst);
+        assert!(matches!(
+            provider.stop_vm(&authority, &running),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+        assert_eq!(
+            read_config(&QemuProvider::<FakeExecutor>::config_path(
+                &running.configuration_path,
+            ))
+            .unwrap()
+            .process_id,
+            Some(4242)
+        );
+        provider
+            .executor
+            .process_group_absence_proven
+            .store(true, Ordering::SeqCst);
+        provider
+            .executor
+            .qmp_sessions
+            .lock()
+            .unwrap()
+            .push_back(qmp_stop_session(&running));
         provider.stop_vm(&authority, &running).unwrap();
         assert!(
             provider
@@ -4010,6 +4129,25 @@ mod tests {
         assert_ne!(start_token, 0);
         assert!(!process_absence_proven(process_id, 0));
         assert!(!process_absence_proven(process_id, start_token));
+    }
+
+    #[test]
+    fn windows_receipt_absence_classifier_binds_the_start_instance() {
+        use WindowsProcessAbsenceObservation::{Live, Missing, Signaled, Unknown};
+
+        assert!(!windows_process_absence_proven(0, Missing));
+        assert!(windows_process_absence_proven(7, Missing));
+        assert!(!windows_process_absence_proven(7, Live(7)));
+        assert!(windows_process_absence_proven(7, Live(8)));
+        assert!(windows_process_absence_proven(7, Signaled(7)));
+        assert!(windows_process_absence_proven(7, Signaled(8)));
+        assert!(!windows_process_absence_proven(7, Unknown));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_process_group_receipt_is_fail_closed_without_job_containment() {
+        assert!(!process_group_absence_proven(std::process::id()));
     }
 
     #[cfg(target_os = "windows")]

@@ -146,6 +146,15 @@ requires the exact base/overlay identity. PID, process name, pipe name, socket,
 or QEMU name alone never authorizes stop, kill, adoption, or deletion. Any
 drift is retained for manual review.
 
+Windows PID reuse is checked against the receipt's process-creation token. The
+current repository does **not** yet have an atomically created, durable Windows
+Job Object receipt for QEMU descendants: `CREATE_NEW_PROCESS_GROUP` is not that
+proof. Consequently, if the QEMU leader exits, Windows recovery and cleanup
+fail closed and retain the cell whenever descendant absence cannot be proven.
+An authorized real-platform acceptance run must include a separately reviewed
+atomic Job Object containment and empty-tree receipt; repository tests and a
+WHPX capability probe do not substitute for it.
+
 ## Diagnostics and operator response
 
 | Observation | Stable distinction | Response |
