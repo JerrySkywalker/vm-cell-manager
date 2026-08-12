@@ -261,7 +261,34 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
     use super::*;
+
+    fn wait_for_marker(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match fs::read(path) {
+                Ok(contents) if contents == b"ready" => return,
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(contents) => panic!(
+                    "child/grandchild handshake published unexpected marker contents: {contents:?}"
+                ),
+                Err(error) => {
+                    panic!("child/grandchild handshake did not reach ready state: {error}")
+                }
+            }
+        }
+    }
+
+    fn publish_marker(path: &Path) {
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, b"ready").unwrap();
+        fs::rename(temporary, path).unwrap();
+    }
 
     #[test]
     fn output_reader_enforces_exact_limit() {
@@ -298,34 +325,55 @@ mod tests {
     #[test]
     #[allow(clippy::zombie_processes)] // The parent intentionally exits while its owned grandchild holds the test pipes.
     fn inherited_descendant_pipes_are_closed_with_the_owned_tree() {
-        if std::env::var_os("VMCELL_PIPE_GRANDCHILD").is_some() {
-            thread::sleep(Duration::from_secs(30));
+        #[cfg(not(any(unix, windows)))]
+        {
             return;
         }
-        if std::env::var_os("VMCELL_PIPE_CHILD").is_some() {
-            thread::sleep(Duration::from_millis(100));
-            Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("process::tests::inherited_descendant_pipes_are_closed_with_the_owned_tree")
-                .arg("--nocapture")
-                .env_remove("VMCELL_PIPE_CHILD")
-                .env("VMCELL_PIPE_GRANDCHILD", "1")
-                .spawn()
-                .unwrap();
-            return;
+        let mode = std::env::var("VMCELL_PIPE_HANDSHAKE_MODE")
+            .ok()
+            .filter(|_| std::env::var_os("VMCELL_PIPE_HANDSHAKE_MARKER").is_some());
+        if let Some(mode) = mode.as_deref() {
+            let marker = std::path::PathBuf::from(
+                std::env::var_os("VMCELL_PIPE_HANDSHAKE_MARKER")
+                    .expect("handshake child needs a marker path"),
+            );
+            match mode {
+                "grandchild" => {
+                    publish_marker(&marker);
+                    loop {
+                        thread::park();
+                    }
+                }
+                "child" => {
+                    Command::new(std::env::current_exe().unwrap())
+                        .arg("--exact")
+                        .arg("process::tests::inherited_descendant_pipes_are_closed_with_the_owned_tree")
+                        .env_remove("VMCELL_PIPE_HANDSHAKE_MODE")
+                        .env_remove("VMCELL_PIPE_HANDSHAKE_MARKER")
+                        .env("VMCELL_PIPE_HANDSHAKE_MODE", "grandchild")
+                        .env("VMCELL_PIPE_HANDSHAKE_MARKER", &marker)
+                        .spawn()
+                        .unwrap();
+                    wait_for_marker(&marker);
+                    return;
+                }
+                value => panic!("unknown handshake mode {value}"),
+            }
         }
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("ready");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
             .arg("process::tests::inherited_descendant_pipes_are_closed_with_the_owned_tree")
-            .arg("--nocapture")
-            .env("VMCELL_PIPE_CHILD", "1");
-        let started = Instant::now();
-        // A saturated Windows runner can spend several seconds starting the
-        // nested test executables. The owned grandchild sleeps for 30 seconds,
-        // so this still proves the process tree closes inherited pipes.
-        let output = run_bounded(&mut command, &[], Duration::from_secs(15), 64 * 1024).unwrap();
+            .env_remove("VMCELL_PIPE_HANDSHAKE_MODE")
+            .env_remove("VMCELL_PIPE_HANDSHAKE_MARKER")
+            .env("VMCELL_PIPE_HANDSHAKE_MODE", "child")
+            .env("VMCELL_PIPE_HANDSHAKE_MARKER", &marker);
+
+        let output = run_bounded(&mut command, &[], Duration::from_secs(20), 64 * 1024).unwrap();
         assert!(output.status.success());
-        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(fs::read(marker).unwrap(), b"ready");
     }
 }

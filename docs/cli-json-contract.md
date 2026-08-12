@@ -236,7 +236,8 @@ and `destroyed`. Ownership is `proven`, `phase_proven`, `unproven`, `mismatch`,
 or `not_applicable`; `phase_proven` is the narrower durable provisioning proof.
 Required action is `none`, `retry_lifecycle`, `recovery_required`, or
 `manual_review`. This classification is descriptive and never authorizes
-mutation. Reconciliation itself is read-only.
+mutation. Reconciliation may persist only the safe state transitions described
+below.
 
 Guest exec returns a generated `operation_id`, exact `cell_id`, exit code,
 UTF-8 stdout/stderr, byte counts, encoding, and truncation status. Output is
