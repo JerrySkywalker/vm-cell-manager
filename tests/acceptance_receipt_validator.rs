@@ -310,7 +310,10 @@ fn a_pass_requires_a_non_nil_real_run_cell_id() {
         Value::String("00000000-0000-0000-0000-000000000000".to_owned());
     let validation = report(request);
     assert!(!validation.document_valid);
-    assert_eq!(validation.disposition, AcceptanceReceiptDisposition::Rejected);
+    assert_eq!(
+        validation.disposition,
+        AcceptanceReceiptDisposition::Rejected
+    );
     assert!(validation.has_finding("receipt.required_evidence_missing"));
 }
 
