@@ -1088,7 +1088,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         request: RegisterImageRequest,
     ) -> Result<ImageRecord, EngineError> {
         self.require_provider_available()?;
-        let _mutation = self.state.acquire_mutation_lock()?;
+        let mutation = self.state.acquire_mutation_lock()?;
         let validation = self.validate_image_path(
             None,
             request.guest_os,
@@ -1134,7 +1134,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
             Ok(existing) if same_image_identity(&existing, &record) => Ok(existing),
             Ok(_) => Err(EngineError::ImageConflict(request.id)),
             Err(StateError::NotFound(_)) => {
-                self.state.save_image_new(&record)?;
+                self.state
+                    .save_image_new_with_mutation(&mutation, &record)?;
                 Ok(record)
             }
             Err(error) => Err(error.into()),
@@ -1370,7 +1371,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         let variant = provider_variant(&image_record, self.provider.name())?;
         let parent_handle = self.verify_registered_image(variant)?;
 
-        let installation = self.state.installation()?;
+        let installation = self.state.installation_with_mutation(&mutation)?;
         let installation_authority = self.state.acquire_installation_authority()?;
         if installation != *installation_authority.record() {
             return Err(EngineError::OwnershipNotProven(
@@ -1410,20 +1411,22 @@ impl<P: LocalVmProvider> CellEngine<P> {
             last_error: None,
             job,
         };
-        self.state.save_cell(&record)?;
-        let runtime_authority = match self.state.prepare_cell_runtime_for(
+        self.state.save_cell_with_mutation(&mutation, &record)?;
+        let runtime_authority = match self.state.prepare_cell_runtime_for_with_mutation(
+            &mutation,
             cell_id,
             record.ownership.configuration_path.clone(),
             record.ownership.overlay_path.clone(),
         ) {
             Ok(runtime) => runtime,
-            Err(error) => return self.fail_record(record, error.into()),
+            Err(error) => return self.fail_record(&mutation, record, error.into()),
         };
 
         if let Some(existing) = self.provider.inspect_vm(&VmLookup::Name(
             record.ownership.provider_object_name.clone(),
         ))? {
             return self.fail_record(
+                &mutation,
                 record,
                 EngineError::OwnershipNotProven(format!(
                     "VM name collision with provider id {}",
@@ -1443,21 +1446,21 @@ impl<P: LocalVmProvider> CellEngine<P> {
             &mutation,
         );
         if let Err(error) = parent_handle.validate_path_identity(&record.image.path) {
-            return self.fail_record(record, error);
+            return self.fail_record(&mutation, record, error);
         }
         let overlay = match self.provider.create_overlay(&authority, &overlay_request) {
             Ok(overlay) => overlay,
-            Err(error) => return self.fail_record(record, error.into()),
+            Err(error) => return self.fail_record(&mutation, record, error.into()),
         };
         if let Err(error) = parent_handle.validate_path_identity(&record.image.path) {
-            return self.fail_record(record, error);
+            return self.fail_record(&mutation, record, error);
         }
         if let Err(error) = validate_overlay(&record, &overlay) {
-            return self.fail_record(record, error);
+            return self.fail_record(&mutation, record, error);
         }
         record.phase = CellPhase::OverlayCreated;
         record.updated_at = Utc::now();
-        self.state.save_cell(&record)?;
+        self.state.save_cell_with_mutation(&mutation, &record)?;
         drop(parent_handle);
 
         let create_request = CreateVmRequest {
@@ -1478,11 +1481,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
         );
         let provider_identity = match self.provider.create_vm(&authority, &create_request) {
             Ok(provider_identity) => provider_identity,
-            Err(error) => return self.fail_record(record, error.into()),
+            Err(error) => return self.fail_record(&mutation, record, error.into()),
         };
         let provider_identity = match normalize_provider_identity(&record, provider_identity) {
             Ok(identity) => identity,
-            Err(error) => return self.fail_record(record, error),
+            Err(error) => return self.fail_record(&mutation, record, error),
         };
         record.provider_object = Some(ProviderObjectIdentity {
             id: provider_identity.id.clone(),
@@ -1490,7 +1493,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         });
         record.phase = CellPhase::ProviderObjectCreated;
         record.updated_at = Utc::now();
-        self.state.save_cell(&record)?;
+        self.state.save_cell_with_mutation(&mutation, &record)?;
 
         let provider_vm = match self
             .provider
@@ -1499,6 +1502,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
             Some(provider_vm) => provider_vm,
             None => {
                 return self.fail_record(
+                    &mutation,
                     record,
                     EngineError::ProviderDrift(
                         "new provider object disappeared after its id was persisted".to_owned(),
@@ -1508,10 +1512,11 @@ impl<P: LocalVmProvider> CellEngine<P> {
         };
 
         if let Err(error) = prove_creation_identity(&record, &provider_vm, false) {
-            return self.fail_record(record, error);
+            return self.fail_record(&mutation, record, error);
         }
         if provider_vm.power_state != ProviderPowerState::Off {
             return self.fail_record(
+                &mutation,
                 record,
                 EngineError::UnexpectedPowerState(provider_vm.power_state),
             );
@@ -1529,14 +1534,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
         );
         let claimed_vm = match self.provider.claim_vm(&authority, &claim_request) {
             Ok(provider_vm) => provider_vm,
-            Err(error) => return self.fail_record(record, error.into()),
+            Err(error) => return self.fail_record(&mutation, record, error.into()),
         };
         if let Err(error) = prove_creation_identity(&record, &claimed_vm, true) {
-            return self.fail_record(record, error);
+            return self.fail_record(&mutation, record, error);
         }
         record.phase = CellPhase::ProviderObjectClaimed;
         record.updated_at = Utc::now();
-        self.state.save_cell(&record)?;
+        self.state.save_cell_with_mutation(&mutation, &record)?;
 
         let configure_request = ConfigureVmRequest {
             expected: claimed_vm,
@@ -1550,16 +1555,16 @@ impl<P: LocalVmProvider> CellEngine<P> {
         );
         let provider_vm = match self.provider.configure_vm(&authority, &configure_request) {
             Ok(provider_vm) => provider_vm,
-            Err(error) => return self.fail_record(record, error.into()),
+            Err(error) => return self.fail_record(&mutation, record, error.into()),
         };
         if let Err(error) = prove_ownership(&record, &provider_vm) {
-            return self.fail_record(record, error);
+            return self.fail_record(&mutation, record, error);
         }
 
         record.state = CellState::Stopped;
         record.phase = CellPhase::Ready;
         record.updated_at = Utc::now();
-        self.state.save_cell(&record)?;
+        self.state.save_cell_with_mutation(&mutation, &record)?;
         Ok(record)
     }
 
@@ -1592,7 +1597,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 record.state = CellState::Running;
                 record.phase = CellPhase::Ready;
                 record.updated_at = Utc::now();
-                self.state.save_cell(&record)?;
+                self.state.save_cell_with_mutation(&mutation, &record)?;
                 Ok(operation_report(&record, changed))
             }
             ProviderPowerState::Off if record.state != CellState::Destroyed => {
@@ -1624,7 +1629,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 record.state = CellState::Running;
                 record.phase = CellPhase::Ready;
                 record.updated_at = Utc::now();
-                self.state.save_cell(&record)?;
+                self.state.save_cell_with_mutation(&mutation, &record)?;
                 Ok(operation_report(&record, true))
             }
             ProviderPowerState::Paused
@@ -1654,7 +1659,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 record.state = CellState::Running;
                 record.phase = CellPhase::Ready;
                 record.updated_at = Utc::now();
-                self.state.save_cell(&record)?;
+                self.state.save_cell_with_mutation(&mutation, &record)?;
                 Ok(operation_report(&record, true))
             }
             state => Err(EngineError::UnexpectedPowerState(state)),
@@ -1673,7 +1678,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 record.state = CellState::Stopped;
                 record.phase = CellPhase::Ready;
                 record.updated_at = Utc::now();
-                self.state.save_cell(&record)?;
+                self.state.save_cell_with_mutation(&mutation, &record)?;
                 Ok(operation_report(&record, changed))
             }
             ProviderPowerState::Running => {
@@ -1694,7 +1699,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 record.state = CellState::Stopped;
                 record.phase = CellPhase::Ready;
                 record.updated_at = Utc::now();
-                self.state.save_cell(&record)?;
+                self.state.save_cell_with_mutation(&mutation, &record)?;
                 Ok(operation_report(&record, true))
             }
             state => Err(EngineError::UnexpectedPowerState(state)),
@@ -2313,7 +2318,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 },
             },
             on_recorded,
-            |authority, expected, operation_id| {
+            |authority, expected, _mutation, operation_id| {
                 on_ready()?;
                 let result = transport.exec(authority, expected, credentials, &command)?;
                 validate_guest_command_result(&command, &result)?;
@@ -2425,7 +2430,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 },
             },
             on_recorded,
-            |authority, expected, operation_id| {
+            |authority, expected, _mutation, operation_id| {
                 transport.copy_in(
                     authority,
                     expected,
@@ -2630,7 +2635,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 if !is_recovery {
                     operation.updated_at = evaluated_at;
                     operation.artifact_pruned_at = Some(evaluated_at);
-                    self.state.save_guest_operation(&operation)?;
+                    self.state
+                        .save_guest_operation_with_mutation(&mutation, &operation)?;
                 }
                 self.state
                     .remove_artifact_root(&mutation, operation.cell_id, operation.id)?;
@@ -2661,7 +2667,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         &self,
         operation_id: GuestOperationId,
     ) -> Result<GuestOperationRecoveryReport, EngineError> {
-        let _mutation = self.state.acquire_mutation_lock()?;
+        let mutation = self.state.acquire_mutation_lock()?;
         let mut operation = self.state.load_guest_operation(operation_id)?;
         self.state
             .require_guest_operation_parent_for_mutation(&operation)?;
@@ -2675,7 +2681,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 operation.failure = Some(GuestFailureClass::Interrupted);
                 operation.updated_at = now;
                 operation.completed_at = Some(now);
-                self.state.save_guest_operation(&operation)?;
+                self.state
+                    .save_guest_operation_with_mutation(&mutation, &operation)?;
                 (
                     GuestOperationRecoveryDisposition::InterruptedBeforeTransport,
                     true,
@@ -2697,7 +2704,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 operation.phase = GuestOperationPhase::Completed;
                 operation.updated_at = now;
                 operation.completed_at = Some(now);
-                self.state.save_guest_operation(&operation)?;
+                self.state
+                    .save_guest_operation_with_mutation(&mutation, &operation)?;
                 (
                     GuestOperationRecoveryDisposition::ArtifactCompletionRecovered,
                     true,
@@ -2852,7 +2860,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     prove_creation_identity(&record, &vm, true)?;
                     record.phase = CellPhase::ProviderObjectClaimed;
                     record.updated_at = Utc::now();
-                    self.state.save_cell(&record)?;
+                    self.state.save_cell_with_mutation(mutation, &record)?;
                     true
                 }
                 CellPhase::ProviderObjectClaimed => {
@@ -2880,7 +2888,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 CellPhase::Destroying
             };
             record.updated_at = Utc::now();
-            self.state.save_cell(&record)?;
+            self.state.save_cell_with_mutation(mutation, &record)?;
 
             if vm.power_state != ProviderPowerState::Off {
                 self.validate_local_ownership_against(&record, &installation)?;
@@ -2927,7 +2935,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
             }
 
             self.validate_local_ownership_against(&record, &installation)?;
-            self.state.remove_cell_runtime(cell_id, runtime)?;
+            self.state
+                .remove_cell_runtime_with_mutation(mutation, cell_id, runtime)?;
         } else if record.provider_object.is_some() {
             if self
                 .provider
@@ -2947,7 +2956,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     record.ownership.overlay_path.clone(),
                 )?;
                 self.validate_local_ownership_against(&record, &installation)?;
-                self.state.remove_cell_runtime(cell_id, runtime)?;
+                self.state
+                    .remove_cell_runtime_with_mutation(mutation, cell_id, runtime)?;
             }
         }
 
@@ -2955,7 +2965,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         record.state = CellState::Destroyed;
         record.phase = CellPhase::Destroyed;
         record.updated_at = Utc::now();
-        self.state.save_cell(&record)?;
+        self.state.save_cell_with_mutation(mutation, &record)?;
         Ok(operation_report(&record, true))
     }
 
@@ -3328,8 +3338,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 },
             },
             on_recorded,
-            |authority, expected, operation_id| {
-                let artifact_guard = self.state.prepare_artifact_root(cell_id, operation_id)?;
+            |authority, expected, mutation, operation_id| {
+                let artifact_guard = self.state.prepare_artifact_root_with_mutation(
+                    mutation,
+                    cell_id,
+                    operation_id,
+                )?;
                 let mut entries = Vec::with_capacity(sources.len());
                 for (index, source) in sources.iter().enumerate() {
                     let bytes = transport.copy_out(
@@ -3346,9 +3360,12 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     if bytes.len() as u64 > max_bytes {
                         return Err(GuestIoError::InvalidResponse.into());
                     }
-                    let host_relative_path =
-                        self.state
-                            .write_artifact_file(&artifact_guard, index, &bytes)?;
+                    let host_relative_path = self.state.write_artifact_file_with_mutation(
+                        mutation,
+                        &artifact_guard,
+                        index,
+                        &bytes,
+                    )?;
                     entries.push(ArtifactEntry {
                         guest_path: source.as_str().to_owned(),
                         host_relative_path,
@@ -3364,7 +3381,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     entries,
                     job_id,
                 };
-                self.state.save_artifact_new(&artifact_guard, &artifact)?;
+                self.state
+                    .save_artifact_new_with_mutation(mutation, &artifact_guard, &artifact)?;
                 Ok((
                     ArtifactReport {
                         schema_version: AUTOMATION_SCHEMA_VERSION,
@@ -3395,6 +3413,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
         F: FnOnce(
             &GuestActionAuthority<'_>,
             &ProviderVm,
+            &MutationGuard,
             GuestOperationId,
         ) -> Result<(T, GuestCompletion), EngineError>,
     {
@@ -3440,7 +3459,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
             Utc::now(),
             dispatch.job_id,
         );
-        self.state.save_guest_operation(&operation)?;
+        self.state
+            .save_guest_operation_with_mutation(&mutation, &operation)?;
         on_recorded(operation.id);
         let execution = (|| {
             let installation = self.state.acquire_installation_authority()?;
@@ -3454,7 +3474,8 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 GuestActionAuthority::new(&record, &expected, &installation, &runtime, &mutation)?;
             operation.phase = GuestOperationPhase::TransportActive;
             operation.updated_at = Utc::now();
-            self.state.save_guest_operation(&operation)?;
+            self.state
+                .save_guest_operation_with_mutation(&mutation, &operation)?;
             wait_for_guest_ready(
                 transport,
                 &authority,
@@ -3462,7 +3483,7 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 credentials,
                 dispatch.plan.readiness,
             )?;
-            action(&authority, &expected, operation.id)
+            action(&authority, &expected, &mutation, operation.id)
         })();
 
         match execution {
@@ -3478,12 +3499,14 @@ impl<P: LocalVmProvider> CellEngine<P> {
                 operation.stderr_bytes = completion.stderr_bytes;
                 operation.artifact_id = completion.artifact_id;
                 if operation.phase == GuestOperationPhase::ArtifactCommitted {
-                    self.state.save_guest_operation(&operation)?;
+                    self.state
+                        .save_guest_operation_with_mutation(&mutation, &operation)?;
                     operation.phase = GuestOperationPhase::Completed;
                     operation.updated_at = Utc::now();
                 }
                 operation.completed_at = Some(operation.updated_at);
-                self.state.save_guest_operation(&operation)?;
+                self.state
+                    .save_guest_operation_with_mutation(&mutation, &operation)?;
                 Ok(value)
             }
             Err(error) => {
@@ -3494,17 +3517,23 @@ impl<P: LocalVmProvider> CellEngine<P> {
                     operation.phase = GuestOperationPhase::Failed;
                     operation.completed_at = Some(operation.updated_at);
                 }
-                self.state.save_guest_operation(&operation)?;
+                self.state
+                    .save_guest_operation_with_mutation(&mutation, &operation)?;
                 Err(error)
             }
         }
     }
 
-    fn fail_record<T>(&self, mut record: CellRecord, error: EngineError) -> Result<T, EngineError> {
+    fn fail_record<T>(
+        &self,
+        mutation: &MutationGuard,
+        mut record: CellRecord,
+        error: EngineError,
+    ) -> Result<T, EngineError> {
         record.state = CellState::Failed;
         record.updated_at = Utc::now();
         record.last_error = Some(durable_error_code(&error).to_owned());
-        self.state.save_cell(&record)?;
+        self.state.save_cell_with_mutation(mutation, &record)?;
         Err(error)
     }
 }

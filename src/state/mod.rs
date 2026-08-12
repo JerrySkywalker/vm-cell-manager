@@ -249,6 +249,13 @@ impl MutationGuard {
         }
         Ok(())
     }
+
+    fn validate_for_state_root(&self, state_root: &Path) -> Result<(), StateError> {
+        if self.state_root.0 != state_root {
+            return Err(StateError::UnsafeRuntimePath(state_root.to_path_buf()));
+        }
+        self.validate_filesystem_identity()
+    }
 }
 
 impl StateStore {
@@ -427,16 +434,30 @@ impl StateStore {
             return Err(error);
         }
 
-        Ok(MutationGuard {
+        let guard = MutationGuard {
             file,
             lock_path,
             state_root: (self.root.clone(), state_root_handle),
             state_directories,
             process_key,
-        })
+        };
+        guard.validate_filesystem_identity()?;
+        Ok(guard)
     }
 
-    pub(crate) fn installation(&self) -> Result<InstallationRecord, StateError> {
+    /// Load or create installation identity only while the caller retains a
+    /// mutation guard for this exact state root.
+    pub(crate) fn installation_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+    ) -> Result<InstallationRecord, StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        let installation = self.installation_unchecked()?;
+        mutation.validate_for_state_root(&self.root)?;
+        Ok(installation)
+    }
+
+    fn installation_unchecked(&self) -> Result<InstallationRecord, StateError> {
         let path = self.root.join("installation.json");
         if path.exists() {
             return self.load_installation();
@@ -449,6 +470,11 @@ impl StateStore {
         };
         write_json_new(&path, &record)?;
         Ok(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installation(&self) -> Result<InstallationRecord, StateError> {
+        self.installation_unchecked()
     }
 
     /// Load the existing installation identity without creating a replacement.
@@ -482,10 +508,33 @@ impl StateStore {
         })
     }
 
-    pub(crate) fn save_image_new(&self, record: &ImageRecord) -> Result<(), StateError> {
+    /// Persist a new image only while the caller retains a mutation guard for
+    /// this exact state root.  Revalidate before and after the atomic write so
+    /// a detectable state-directory replacement fails closed rather than
+    /// being treated as authority for the replacement path.
+    pub(crate) fn save_image_new_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        record: &ImageRecord,
+    ) -> Result<(), StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        self.save_image_new_unchecked(record)?;
+        mutation.validate_for_state_root(&self.root)
+    }
+
+    fn save_image_new_unchecked(&self, record: &ImageRecord) -> Result<(), StateError> {
         let path = self.image_path(&record.id);
         validate_image_schema(&path, record)?;
         write_json_new(&path, record)
+    }
+
+    // Unit fixtures deliberately construct durable records without invoking a
+    // lifecycle mutation. Production callers must use the guard-bound API
+    // above so a stale MutationGuard cannot authorize a write after state-root
+    // replacement.
+    #[cfg(test)]
+    pub(crate) fn save_image_new(&self, record: &ImageRecord) -> Result<(), StateError> {
+        self.save_image_new_unchecked(record)
     }
 
     pub fn load_image(&self, image_id: &ImageId) -> Result<ImageRecord, StateError> {
@@ -529,7 +578,7 @@ impl StateStore {
         mutation: &MutationGuard,
         image_id: &ImageId,
     ) -> Result<bool, StateError> {
-        mutation.validate_filesystem_identity()?;
+        mutation.validate_for_state_root(&self.root)?;
         let images_root = self.root.join("images");
         let images_handle = open_ordinary_directory(&images_root)?;
         let path = self.image_path(image_id);
@@ -567,7 +616,20 @@ impl StateStore {
 
         #[cfg(test)]
         abort_at_test_checkpoint("before_image_remove");
+        mutation.validate_for_state_root(&self.root)?;
+        validate_open_path_identity(&images_root, &images_handle)?;
+        // Unix permits a rename while the authority handle remains open, so
+        // keep it through the destructive boundary and prove the pathname has
+        // not been substituted. Windows must release the read handle before
+        // rename because its sharing rules may otherwise reject this exact
+        // cleanup; that platform retains the documented same-user observable
+        // invalidation boundary.
+        #[cfg(not(windows))]
+        validate_open_path_identity(&path, &file)?;
+        #[cfg(windows)]
         drop(file);
+        mutation.validate_for_state_root(&self.root)?;
+        validate_open_path_identity(&images_root, &images_handle)?;
         let retired_path = physical_images_root.join(format!(
             "{}.json.unregistered-{}",
             image_id.as_str(),
@@ -576,17 +638,31 @@ impl StateStore {
         fs::rename(&physical_path, &retired_path)
             .map_err(|source| io_error(&physical_path, source))?;
         #[cfg(not(windows))]
+        validate_open_path_identity(&retired_path, &file)?;
+        #[cfg(not(windows))]
         images_handle
             .sync_all()
             .map_err(|source| io_error(&physical_images_root, source))?;
         #[cfg(test)]
         abort_at_test_checkpoint("after_image_remove");
-        mutation.validate_filesystem_identity()?;
+        mutation.validate_for_state_root(&self.root)?;
         drop(images_handle);
         Ok(true)
     }
 
-    pub(crate) fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
+    /// Persist a cell record only while the caller retains a mutation guard
+    /// whose pinned root and state directories still match the filesystem.
+    pub(crate) fn save_cell_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        record: &CellRecord,
+    ) -> Result<(), StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        self.save_cell_unchecked(record)?;
+        mutation.validate_for_state_root(&self.root)
+    }
+
+    fn save_cell_unchecked(&self, record: &CellRecord) -> Result<(), StateError> {
         let path = self.cell_path(record.id);
         let mut record = record.clone();
         redact_cell_diagnostic(&mut record);
@@ -603,6 +679,11 @@ impl StateStore {
         }
         self.validate_unique_cell_job_id(&path, &record)?;
         write_json_atomic(&path, &record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_cell(&self, record: &CellRecord) -> Result<(), StateError> {
+        self.save_cell_unchecked(record)
     }
 
     pub fn load_cell(&self, cell_id: CellId) -> Result<CellRecord, StateError> {
@@ -642,7 +723,20 @@ impl StateStore {
         validate_unique_cell_job_ids_for_path(path, &cells)
     }
 
-    pub(crate) fn save_guest_operation(
+    /// Persist a guest operation only while the caller retains a mutation
+    /// guard whose pinned root and state directories still match the
+    /// filesystem.
+    pub(crate) fn save_guest_operation_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        record: &GuestOperationRecord,
+    ) -> Result<(), StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        self.save_guest_operation_unchecked(record)?;
+        mutation.validate_for_state_root(&self.root)
+    }
+
+    fn save_guest_operation_unchecked(
         &self,
         record: &GuestOperationRecord,
     ) -> Result<(), StateError> {
@@ -660,6 +754,14 @@ impl StateStore {
         }
         self.validate_operation_parent_binding_for_write(&path, record)?;
         write_json_atomic(&path, record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_guest_operation(
+        &self,
+        record: &GuestOperationRecord,
+    ) -> Result<(), StateError> {
+        self.save_guest_operation_unchecked(record)
     }
 
     pub fn load_guest_operation(
@@ -745,7 +847,22 @@ impl StateStore {
         validate_operation_job_binding(path, &cell, operation)
     }
 
-    pub(crate) fn prepare_artifact_root(
+    /// Create and pin an artifact subtree only while the caller retains the
+    /// exact state-root mutation guard.
+    pub(crate) fn prepare_artifact_root_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<ArtifactGuard, StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        let guard = self.prepare_artifact_root_unchecked(cell_id, operation_id)?;
+        mutation.validate_for_state_root(&self.root)?;
+        self.validate_artifact_guard(&guard)?;
+        Ok(guard)
+    }
+
+    fn prepare_artifact_root_unchecked(
         &self,
         cell_id: CellId,
         operation_id: GuestOperationId,
@@ -778,7 +895,32 @@ impl StateStore {
         })
     }
 
-    pub(crate) fn write_artifact_file(
+    #[cfg(test)]
+    pub(crate) fn prepare_artifact_root(
+        &self,
+        cell_id: CellId,
+        operation_id: GuestOperationId,
+    ) -> Result<ArtifactGuard, StateError> {
+        self.prepare_artifact_root_unchecked(cell_id, operation_id)
+    }
+
+    /// Write an artifact file only while the global mutation guard and the
+    /// narrower artifact guard both still bind to their original paths.
+    pub(crate) fn write_artifact_file_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        guard: &ArtifactGuard,
+        index: usize,
+        bytes: &[u8],
+    ) -> Result<String, StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        let relative = self.write_artifact_file_unchecked(guard, index, bytes)?;
+        mutation.validate_for_state_root(&self.root)?;
+        self.validate_artifact_guard(guard)?;
+        Ok(relative)
+    }
+
+    fn write_artifact_file_unchecked(
         &self,
         guard: &ArtifactGuard,
         index: usize,
@@ -795,7 +937,31 @@ impl StateStore {
         ))
     }
 
-    pub(crate) fn save_artifact_new(
+    #[cfg(test)]
+    pub(crate) fn write_artifact_file(
+        &self,
+        guard: &ArtifactGuard,
+        index: usize,
+        bytes: &[u8],
+    ) -> Result<String, StateError> {
+        self.write_artifact_file_unchecked(guard, index, bytes)
+    }
+
+    /// Commit an artifact manifest only while the global mutation guard and
+    /// narrower artifact guard remain valid.
+    pub(crate) fn save_artifact_new_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        guard: &ArtifactGuard,
+        record: &ArtifactRecord,
+    ) -> Result<(), StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        self.save_artifact_new_unchecked(guard, record)?;
+        mutation.validate_for_state_root(&self.root)?;
+        self.validate_artifact_guard(guard)
+    }
+
+    fn save_artifact_new_unchecked(
         &self,
         guard: &ArtifactGuard,
         record: &ArtifactRecord,
@@ -824,6 +990,15 @@ impl StateStore {
         write_json_new(&path, record)?;
         self.validate_artifact_guard(guard)?;
         validate_artifact_files(&guard.root, record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_artifact_new(
+        &self,
+        guard: &ArtifactGuard,
+        record: &ArtifactRecord,
+    ) -> Result<(), StateError> {
+        self.save_artifact_new_unchecked(guard, record)
     }
 
     pub fn load_artifact(
@@ -856,7 +1031,7 @@ impl StateStore {
         cell_id: CellId,
         operation_id: GuestOperationId,
     ) -> Result<bool, StateError> {
-        mutation.validate_filesystem_identity()?;
+        mutation.validate_for_state_root(&self.root)?;
         let artifacts_root = self.root.join("artifacts");
         let artifacts_handle = open_ordinary_directory(&artifacts_root)?;
         let cell_root = artifacts_root.join(cell_id.to_string());
@@ -904,7 +1079,7 @@ impl StateStore {
 
         #[cfg(test)]
         abort_at_test_checkpoint("before_artifact_remove");
-        mutation.validate_filesystem_identity()?;
+        mutation.validate_for_state_root(&self.root)?;
         validate_open_path_identity(&artifacts_root, &artifacts_handle)?;
         validate_open_path_identity(&cell_root, &cell_handle)?;
         validate_open_path_identity(&operation_root, &operation_handle)?;
@@ -914,7 +1089,7 @@ impl StateStore {
             .map_err(|source| io_error(&physical_operation_root, source))?;
         #[cfg(not(windows))]
         drop(operation_handle);
-        mutation.validate_filesystem_identity()?;
+        mutation.validate_for_state_root(&self.root)?;
         drop(cell_handle);
         drop(artifacts_handle);
         Ok(true)
@@ -978,7 +1153,24 @@ impl StateStore {
         )
     }
 
-    pub(crate) fn prepare_cell_runtime_for(
+    /// Create and pin the runtime subtree only while the caller retains the
+    /// exact state-root mutation guard.
+    pub(crate) fn prepare_cell_runtime_for_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        cell_id: CellId,
+        configuration_path: PathBuf,
+        overlay_path: PathBuf,
+    ) -> Result<CellRuntimeGuard, StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        let guard =
+            self.prepare_cell_runtime_for_unchecked(cell_id, configuration_path, overlay_path)?;
+        mutation.validate_for_state_root(&self.root)?;
+        guard.validate_filesystem_identity()?;
+        Ok(guard)
+    }
+
+    fn prepare_cell_runtime_for_unchecked(
         &self,
         cell_id: CellId,
         configuration_path: PathBuf,
@@ -1013,6 +1205,16 @@ impl StateStore {
             cell_handle: Some(cell_handle),
             configuration_handle: Some(configuration_handle),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_cell_runtime_for(
+        &self,
+        cell_id: CellId,
+        configuration_path: PathBuf,
+        overlay_path: PathBuf,
+    ) -> Result<CellRuntimeGuard, StateError> {
+        self.prepare_cell_runtime_for_unchecked(cell_id, configuration_path, overlay_path)
     }
 
     #[cfg(test)]
@@ -1066,7 +1268,20 @@ impl StateStore {
         }
     }
 
-    pub(crate) fn remove_cell_runtime(
+    /// Remove a runtime subtree only while the global mutation guard still
+    /// binds to this state root and the runtime guard proves exact ownership.
+    pub(crate) fn remove_cell_runtime_with_mutation(
+        &self,
+        mutation: &MutationGuard,
+        cell_id: CellId,
+        guard: CellRuntimeGuard,
+    ) -> Result<(), StateError> {
+        mutation.validate_for_state_root(&self.root)?;
+        self.remove_cell_runtime_unchecked(cell_id, guard)?;
+        mutation.validate_for_state_root(&self.root)
+    }
+
+    fn remove_cell_runtime_unchecked(
         &self,
         cell_id: CellId,
         mut guard: CellRuntimeGuard,
@@ -1118,6 +1333,15 @@ impl StateStore {
         #[cfg(not(windows))]
         drop(guard.cell_handle.take());
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_cell_runtime(
+        &self,
+        cell_id: CellId,
+        guard: CellRuntimeGuard,
+    ) -> Result<(), StateError> {
+        self.remove_cell_runtime_unchecked(cell_id, guard)
     }
 
     fn image_path(&self, image_id: &ImageId) -> PathBuf {
@@ -2406,7 +2630,7 @@ fn is_reparse_point(path: &Path) -> Result<bool, StateError> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
+    use std::process::{Command, Output, Stdio};
     use std::str::FromStr;
 
     use chrono::Utc;
@@ -2581,6 +2805,69 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command.arg("--exact").arg(test_name).arg("--nocapture");
         command
+    }
+
+    const CHILD_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+    const CHILD_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    fn child_emitted_marker(stdout: &[u8], expected: &str) -> bool {
+        let stdout = String::from_utf8_lossy(stdout);
+        stdout.lines().any(|line| line == expected)
+    }
+
+    fn assert_child_marker(stdout: &[u8], expected: &str) {
+        assert!(
+            child_emitted_marker(stdout, expected),
+            "child did not emit expected marker {expected:?}: {}",
+            child_diagnostic(stdout)
+        );
+    }
+
+    fn child_diagnostic(output: &[u8]) -> String {
+        format!("{} bytes sha256={:x}", output.len(), Sha256::digest(output))
+    }
+
+    /// Run a test child with an explicit bounded wait. The poll interval only
+    /// bounds cleanup of a hung child; exit status and marker assertions remain
+    /// the test oracle. Always kill and reap on timeout so a failed test cannot
+    /// leave a process holding a state-root lock.
+    fn run_test_child(mut command: Command) -> Output {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("test child must start");
+        let deadline = Instant::now() + CHILD_PROCESS_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output().expect("test child must reap"),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(CHILD_PROCESS_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("timed-out test child must reap");
+                    panic!(
+                        "test child exceeded {CHILD_PROCESS_TIMEOUT:?}; stdout={} stderr={}",
+                        child_diagnostic(&output.stdout),
+                        child_diagnostic(&output.stderr)
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("unpollable test child must reap");
+                    panic!(
+                        "test child wait failed: {error}; stdout={} stderr={}",
+                        child_diagnostic(&output.stdout),
+                        child_diagnostic(&output.stderr)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4199,6 +4486,183 @@ mod tests {
         assert!(elapsed < Duration::from_secs(5));
         drop(second);
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn mutation_guard_cannot_authorize_a_different_state_root() {
+        let directory = tempdir().unwrap();
+        let first = StateStore::new(directory.path().join("first-state"));
+        let second = StateStore::new(directory.path().join("second-state"));
+        let guard = first.acquire_mutation_lock().unwrap();
+        let record = test_cell_record(&second, CellId::new());
+        let record_path = second.cell_path(record.id);
+
+        assert!(matches!(
+            second.save_cell_with_mutation(&guard, &record),
+            Err(StateError::UnsafeRuntimePath(_))
+        ));
+        assert!(!record_path.exists());
+        assert!(!second.root().exists());
+    }
+
+    #[test]
+    fn mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement() {
+        if let Some(mode) = std::env::var_os("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD") {
+            let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
+            let store = StateStore::new(root);
+            match mode.to_string_lossy().as_ref() {
+                "abort_with_lock" => {
+                    let _guard = store.acquire_mutation_lock().unwrap();
+                    let marker = PathBuf::from(
+                        std::env::var_os("VMCELL_TEST_MUTATION_GUARD_ABORT_MARKER")
+                            .expect("abort child must receive an acquisition marker path"),
+                    );
+                    fs::write(marker, b"lock_acquired").unwrap();
+                    std::process::abort();
+                }
+                "available" => {
+                    drop(store.acquire_mutation_lock().unwrap());
+                    println!("available");
+                }
+                "contended" => {
+                    assert!(matches!(
+                        store.acquire_mutation_lock(),
+                        Err(StateError::MutationBusy)
+                    ));
+                    println!("mutation_busy");
+                }
+                "replace_cells" => {
+                    let cells = store.root().join("cells");
+                    let moved = store.root().join("cells-moved-by-child");
+                    match fs::rename(&cells, &moved) {
+                        Ok(()) => {
+                            fs::create_dir(&cells).unwrap();
+                            println!("replaced");
+                        }
+                        Err(error)
+                            if cfg!(windows)
+                                && (error.kind() == std::io::ErrorKind::PermissionDenied
+                                    || matches!(error.raw_os_error(), Some(5 | 32))) =>
+                        {
+                            println!("blocked");
+                        }
+                        Err(error) => panic!("unexpected cells replacement error: {error}"),
+                    }
+                }
+                value => panic!("unknown child mode {value}"),
+            }
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("state"));
+        let abort_marker = directory.path().join("mutation-lock-acquired");
+
+        let mut abort_command = subprocess_for(
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+        );
+        abort_command
+            .env(
+                "VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD",
+                "abort_with_lock",
+            )
+            .env("VMCELL_TEST_STATE_ROOT", store.root())
+            .env("VMCELL_TEST_MUTATION_GUARD_ABORT_MARKER", &abort_marker);
+        let aborted = run_test_child(abort_command);
+        assert!(
+            !aborted.status.success(),
+            "post-lock abort child unexpectedly succeeded: {}",
+            child_diagnostic(&aborted.stderr)
+        );
+        assert_eq!(fs::read(&abort_marker).unwrap(), b"lock_acquired");
+
+        let mut reopen_command = subprocess_for(
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+        );
+        reopen_command
+            .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "available")
+            .env("VMCELL_TEST_STATE_ROOT", store.root());
+        let reopened = run_test_child(reopen_command);
+        assert!(
+            reopened.status.success(),
+            "fresh-process reopen failed: {}",
+            child_diagnostic(&reopened.stderr)
+        );
+        assert_child_marker(&reopened.stdout, "available");
+
+        let guard = store.acquire_mutation_lock().unwrap();
+        let mut contention_command = subprocess_for(
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+        );
+        contention_command
+            .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "contended")
+            .env("VMCELL_TEST_STATE_ROOT", store.root());
+        let contended = run_test_child(contention_command);
+        assert!(
+            contended.status.success(),
+            "cross-process contention probe failed: {}",
+            child_diagnostic(&contended.stderr)
+        );
+        assert_child_marker(&contended.stdout, "mutation_busy");
+
+        let mut replacement_command = subprocess_for(
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+        );
+        replacement_command
+            .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "replace_cells")
+            .env("VMCELL_TEST_STATE_ROOT", store.root());
+        let replacement = run_test_child(replacement_command);
+        assert!(
+            replacement.status.success(),
+            "cross-process replacement probe failed: {}",
+            child_diagnostic(&replacement.stderr)
+        );
+        if child_emitted_marker(&replacement.stdout, "replaced") {
+            assert!(matches!(
+                guard.validate_filesystem_identity(),
+                Err(StateError::UnsafeRuntimePath(_))
+            ));
+            let rejected_record = test_cell_record(&store, CellId::new());
+            let rejected_path = store.cell_path(rejected_record.id);
+            assert!(matches!(
+                store.save_cell_with_mutation(&guard, &rejected_record),
+                Err(StateError::UnsafeRuntimePath(_))
+            ));
+            assert!(
+                !rejected_path.exists(),
+                "guarded write must not create a record in the replacement directory"
+            );
+        } else if child_emitted_marker(&replacement.stdout, "blocked") {
+            #[cfg(not(windows))]
+            panic!("only Windows may block the pinned rename");
+
+            #[cfg(windows)]
+            {
+                guard.validate_filesystem_identity().unwrap();
+                drop(guard);
+
+                let mut release_command = subprocess_for(
+                    "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+                );
+                release_command
+                    .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "replace_cells")
+                    .env("VMCELL_TEST_STATE_ROOT", store.root());
+                let released = run_test_child(release_command);
+                assert!(
+                    released.status.success(),
+                    "post-release replacement probe failed: {}",
+                    child_diagnostic(&released.stderr)
+                );
+                assert_child_marker(&released.stdout, "replaced");
+                return;
+            }
+        } else {
+            panic!(
+                "unexpected replacement child marker: {}",
+                child_diagnostic(&replacement.stdout)
+            );
+        }
+        drop(guard);
     }
 
     #[cfg(windows)]
