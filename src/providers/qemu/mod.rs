@@ -2,7 +2,7 @@ pub mod protocol;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::providers::{
 };
 
 const QEMU_CONFIG_SCHEMA: u32 = 1;
+const QEMU_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -639,6 +640,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
     }
 
     fn inspect_image(&self, path: PathBuf) -> Result<ProviderImageInfo, ProviderError> {
+        if !qemu_argument_path_is_safe(&path) {
+            return Err(ProviderError::Authority(
+                "QEMU image path contains an unsafe argument or Windows alias".to_owned(),
+            ));
+        }
         let output = self.run_checked(
             &self.image_binary,
             &[
@@ -673,6 +679,11 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         request: &CreateOverlayRequest,
     ) -> Result<ProviderImageInfo, ProviderError> {
         authority.validate_overlay_request(request)?;
+        if !qemu_argument_path_is_safe(&request.parent_path) {
+            return Err(ProviderError::Authority(
+                "QEMU parent image path contains an unsafe argument or Windows alias".to_owned(),
+            ));
+        }
         prove_path_absent(&request.overlay_path, "QEMU overlay")?;
         let parent = request.overlay_path.parent().ok_or_else(|| {
             ProviderError::Authority("QEMU overlay path has no runtime parent".to_owned())
@@ -708,7 +719,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let staged = match self.inspect_image(staged_path.clone()) {
             Ok(staged) => staged,
             Err(error) => {
-                cleanup_exact_staged_overlay(&staged_path, &staged_file);
+                cleanup_exact_qemu_file(&staged_path, staged_file);
                 return Err(error);
             }
         };
@@ -719,28 +730,26 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 .as_ref()
                 .is_none_or(|path| !provider_path_equal(path, &request.parent_path))
         {
-            cleanup_exact_staged_overlay(&staged_path, &staged_file);
+            cleanup_exact_qemu_file(&staged_path, staged_file);
             return Err(ProviderError::OwnershipChanged(
                 "staged QEMU overlay did not bind the exact immutable parent".to_owned(),
             ));
         }
         ensure_private_qemu_file(&staged_path, &staged_file)?;
         prove_path_absent(&request.overlay_path, "QEMU overlay")?;
-        fs::hard_link(&staged_path, &request.overlay_path).map_err(|error| {
-            cleanup_exact_staged_overlay(&staged_path, &staged_file);
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
+        if let Err(error) = fs::hard_link(&staged_path, &request.overlay_path) {
+            cleanup_exact_qemu_file(&staged_path, staged_file);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ProviderError::Collision("QEMU overlay already exists".to_owned())
             } else {
                 ProviderError::Command(format!(
                     "failed to publish QEMU overlay without replacement: {error}"
                 ))
-            }
-        })?;
+            });
+        }
         ensure_private_qemu_file(&request.overlay_path, &staged_file)?;
         authority.validate_overlay_request(request)?;
-        fs::remove_file(&staged_path).map_err(|error| {
-            ProviderError::Command(format!("failed to retire staged QEMU overlay: {error}"))
-        })?;
+        remove_exact_qemu_file(&staged_path, staged_file)?;
         sync_parent_directory(&request.overlay_path).map_err(|error| {
             ProviderError::Command(format!(
                 "failed to persist QEMU overlay publication: {error}"
@@ -806,7 +815,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
     ) -> Result<ProviderVm, ProviderError> {
         authority.validate_claim_request(request)?;
         let path = Self::config_path(&request.expected.configuration_path);
-        let mut config = read_config(&path)?;
+        let snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete)?;
+        let mut config = snapshot.config.clone();
         authorize_config(authority, &config, false)?;
         validate_config_snapshot(&config, &request.expected, false)?;
         if !config.ownership_marker.is_empty()
@@ -817,7 +827,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ));
         }
         config.ownership_marker = request.ownership_marker.clone();
-        replace_config(&path, &config)?;
+        replace_config(&path, snapshot, &config)?;
         self.inspect_config(&config)
     }
 
@@ -828,12 +838,13 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
     ) -> Result<ProviderVm, ProviderError> {
         authority.validate_configure_request(request)?;
         let path = Self::config_path(&request.expected.configuration_path);
-        let mut config = read_config(&path)?;
+        let snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete)?;
+        let mut config = snapshot.config.clone();
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, &request.expected, true)?;
         config.cpu_count = request.cpu_count;
         config.command_sha256 = launch_digest(&config);
-        replace_config(&path, &config)?;
+        replace_config(&path, snapshot, &config)?;
         self.inspect_config(&config)
     }
 
@@ -850,7 +861,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
     ) -> Result<(), ProviderError> {
         authority.validate_vm(expected)?;
         let path = Self::config_path(&expected.configuration_path);
-        let mut config = read_config(&path)?;
+        let snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete)?;
+        let mut config = snapshot.config.clone();
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
         self.validate_overlay_chain(&config)?;
@@ -862,14 +874,20 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         if expected.power_state == ProviderPowerState::Off {
             ensure_control_endpoints_absent(&config)?;
             config.spawn_pending = true;
-            replace_config(&path, &config)?;
+            replace_config(&path, snapshot, &config)?;
             let args = launch_args(&config);
             let receipt = self.executor.spawn_vm(&self.system_binary, &args)?;
+            let snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete)?;
+            if snapshot.bytes_sha256 != qemu_config_bytes_sha256(&encode_qemu_config(&config)?) {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU launch intent changed before its process receipt was recorded".to_owned(),
+                ));
+            }
             config.process_id = Some(receipt.process_id);
             config.process_start_token = Some(receipt.process_start_token);
             config.process_executable_sha256 = Some(receipt.executable_sha256);
             config.spawn_pending = false;
-            replace_config(&path, &config)?;
+            replace_config(&path, snapshot, &config)?;
         } else if expected.power_state != ProviderPowerState::Paused {
             return Err(ProviderError::OwnershipChanged(
                 "QEMU start expected an off or prelaunch VM".to_owned(),
@@ -897,7 +915,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
     ) -> Result<(), ProviderError> {
         authority.validate_vm(expected)?;
         let path = Self::config_path(&expected.configuration_path);
-        let mut config = read_config(&path)?;
+        let snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete)?;
+        let mut config = snapshot.config.clone();
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
         let (process_id, process_start_token) = self.validate_live_process_receipt(&config)?;
@@ -927,7 +946,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 config.process_start_token = None;
                 config.process_executable_sha256 = None;
                 config.spawn_pending = false;
-                replace_config(&path, &config)?;
+                replace_config(&path, snapshot, &config)?;
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -949,7 +968,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             ));
         }
         let path = Self::config_path(&expected.configuration_path);
-        let config = read_config(&path)?;
+        let mut snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWrite)?;
+        let config = snapshot.config.clone();
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
         if config.spawn_pending {
@@ -990,9 +1010,8 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             }
         }
         ensure_control_endpoints_absent(&config)?;
-        fs::remove_file(&path).map_err(|error| {
-            ProviderError::Command(format!("failed to remove QEMU configuration: {error}"))
-        })?;
+        validate_pinned_config_snapshot(&path, &mut snapshot)?;
+        remove_exact_qemu_file(&path, snapshot.file)?;
         sync_parent_directory(&path).map_err(|error| {
             ProviderError::Command(format!(
                 "failed to persist QEMU configuration removal: {error}"
@@ -1002,6 +1021,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QemuVmConfig {
     schema_version: u32,
     id: String,
@@ -1022,6 +1042,17 @@ struct QemuVmConfig {
     process_start_token: Option<u64>,
     #[serde(default)]
     process_executable_sha256: Option<String>,
+}
+
+struct QemuConfigSnapshot {
+    config: QemuVmConfig,
+    bytes_sha256: String,
+    file: File,
+}
+
+struct QemuConfigWrite {
+    bytes_sha256: String,
+    file: File,
 }
 
 impl QemuVmConfig {
@@ -1090,6 +1121,7 @@ struct QemuImgInfo {
 }
 
 fn prove_path_absent(path: &Path, label: &str) -> Result<(), ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(ProviderError::Collision(format!(
@@ -1102,6 +1134,7 @@ fn prove_path_absent(path: &Path, label: &str) -> Result<(), ProviderError> {
 }
 
 fn open_private_qemu_file(path: &Path) -> Result<File, ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
     let current = fs::symlink_metadata(path).map_err(|_| {
         ProviderError::OwnershipChanged(
             "QEMU staged overlay path metadata could not be pinned".to_owned(),
@@ -1114,7 +1147,7 @@ fn open_private_qemu_file(path: &Path) -> Result<File, ProviderError> {
     }
     let mut options = OpenOptions::new();
     options.read(true);
-    configure_qemu_file_options(&mut options, false);
+    configure_qemu_file_options(&mut options, false, QemuFileSharePolicy::DenyWrite);
     let file = options.open(path).map_err(|error| {
         ProviderError::OwnershipChanged(format!("QEMU staged overlay could not be pinned: {error}"))
     })?;
@@ -1145,19 +1178,36 @@ fn open_private_qemu_file(path: &Path) -> Result<File, ProviderError> {
 
 fn cleanup_staged_overlay(path: &Path) {
     if let Ok(file) = open_private_qemu_file(path) {
-        cleanup_exact_staged_overlay(path, &file);
+        cleanup_exact_qemu_file(path, file);
     }
 }
 
-fn cleanup_exact_staged_overlay(path: &Path, file: &File) {
-    if ensure_private_qemu_file(path, file).is_ok() {
-        let _ = fs::remove_file(path);
+fn cleanup_exact_qemu_file(path: &Path, file: File) {
+    let _ = remove_exact_qemu_file(path, file);
+}
+
+fn remove_exact_qemu_file(path: &Path, file: File) -> Result<(), ProviderError> {
+    ensure_private_qemu_file(path, &file)?;
+    #[cfg(windows)]
+    {
+        let delete_file = open_private_qemu_delete_file(path, &file)?;
+        drop(file);
+        remove_open_qemu_file(&delete_file)?;
+        drop(delete_file);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path).map_err(|error| {
+            ProviderError::Command(format!("failed to remove exact QEMU file: {error}"))
+        })
     }
 }
 
 fn create_ordinary_directory(path: &Path) -> Result<(), ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+        Ok(metadata) if metadata.is_dir() && !qemu_metadata_is_reparse(&metadata) => {
             ensure_private_qemu_directory(path)
         }
         Ok(_) => Err(ProviderError::Authority(
@@ -1186,31 +1236,108 @@ fn create_ordinary_directory(path: &Path) -> Result<(), ProviderError> {
 }
 
 fn read_config(path: &Path) -> Result<QemuVmConfig, ProviderError> {
+    Ok(read_config_snapshot(path, QemuFileSharePolicy::DenyWriteAndDelete)?.config)
+}
+
+fn read_config_snapshot(
+    path: &Path,
+    share_policy: QemuFileSharePolicy,
+) -> Result<QemuConfigSnapshot, ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
-    configure_qemu_file_options(&mut options, false);
+    configure_qemu_file_options(&mut options, false, share_policy);
     let mut file = options.open(path).map_err(|error| {
         ProviderError::Command(format!("failed to read QEMU configuration: {error}"))
     })?;
     ensure_private_qemu_file(path, &file)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        ProviderError::Command(format!("failed to read QEMU configuration: {error}"))
+    let bytes = read_qemu_config_bytes(&mut file)?;
+    let config = decode_qemu_config(path, &bytes)?;
+    let bytes_sha256 = qemu_config_bytes_sha256(&bytes);
+    Ok(QemuConfigSnapshot {
+        config,
+        bytes_sha256,
+        file,
+    })
+}
+
+fn read_qemu_config_bytes(file: &mut File) -> Result<Vec<u8>, ProviderError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        ProviderError::Command(format!("failed to seek QEMU configuration: {error}"))
     })?;
-    let config: QemuVmConfig = serde_json::from_slice(&bytes).map_err(|_| {
+    let mut bytes = Vec::new();
+    file.take((QEMU_CONFIG_MAX_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ProviderError::Command(format!("failed to read QEMU configuration: {error}"))
+        })?;
+    if bytes.len() > QEMU_CONFIG_MAX_BYTES {
+        return Err(ProviderError::InvalidResponse(
+            "QEMU configuration exceeds the maximum size".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn decode_qemu_config(path: &Path, bytes: &[u8]) -> Result<QemuVmConfig, ProviderError> {
+    let config: QemuVmConfig = serde_json::from_slice(bytes).map_err(|_| {
         ProviderError::InvalidResponse("QEMU configuration JSON is invalid".to_owned())
     })?;
     config.validate(path)?;
     Ok(config)
 }
 
-fn write_config_new(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderError> {
+fn encode_qemu_config(config: &QemuVmConfig) -> Result<Vec<u8>, ProviderError> {
     let bytes = serde_json::to_vec_pretty(config).map_err(|_| {
         ProviderError::InvalidResponse("QEMU configuration could not be encoded".to_owned())
     })?;
+    if bytes.len() > QEMU_CONFIG_MAX_BYTES {
+        return Err(ProviderError::InvalidResponse(
+            "QEMU configuration exceeds the maximum size".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn qemu_config_bytes_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn validate_pinned_config_snapshot(
+    path: &Path,
+    snapshot: &mut QemuConfigSnapshot,
+) -> Result<(), ProviderError> {
+    let bytes =
+        validate_pinned_qemu_config_bytes(path, &mut snapshot.file, &snapshot.bytes_sha256)?;
+    decode_qemu_config(path, &bytes)?;
+    Ok(())
+}
+
+fn validate_pinned_qemu_config_bytes(
+    path: &Path,
+    file: &mut File,
+    expected_sha256: &str,
+) -> Result<Vec<u8>, ProviderError> {
+    ensure_private_qemu_file(path, file)?;
+    let bytes = read_qemu_config_bytes(file)?;
+    if qemu_config_bytes_sha256(&bytes) != expected_sha256 {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU configuration changed while it was pinned".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_config_new_pinned(
+    path: &Path,
+    config: &QemuVmConfig,
+) -> Result<QemuConfigWrite, ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
+    let bytes = encode_qemu_config(config)?;
+    let bytes_sha256 = qemu_config_bytes_sha256(&bytes);
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    configure_qemu_file_options(&mut options, true);
+    options.read(true).write(true).create_new(true);
+    configure_qemu_file_options(&mut options, true, QemuFileSharePolicy::DenyWriteAndDelete);
     let mut file = options.open(path).map_err(|error| {
         ProviderError::Command(format!("failed to create QEMU configuration: {error}"))
     })?;
@@ -1224,16 +1351,50 @@ fn write_config_new(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderEr
         ProviderError::Command(format!(
             "failed to persist QEMU configuration directory: {error}"
         ))
-    })
+    })?;
+    Ok(QemuConfigWrite { bytes_sha256, file })
 }
 
-fn replace_config(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderError> {
+fn write_config_new(path: &Path, config: &QemuVmConfig) -> Result<(), ProviderError> {
+    drop(write_config_new_pinned(path, config)?);
+    Ok(())
+}
+
+fn replace_config(
+    path: &Path,
+    mut snapshot: QemuConfigSnapshot,
+    config: &QemuVmConfig,
+) -> Result<(), ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
     let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    write_config_new(&temp, config)?;
+    let mut temp_write = write_config_new_pinned(&temp, config)?;
+    if let Err(error) = validate_pinned_config_snapshot(path, &mut snapshot) {
+        // The generated path may have been replaced after a failed identity check.
+        // Retain it rather than deleting by pathname without exact ownership proof.
+        drop(temp_write);
+        return Err(error);
+    }
+    let expected_sha256 = temp_write.bytes_sha256.clone();
+    if let Err(error) =
+        validate_pinned_qemu_config_bytes(&temp, &mut temp_write.file, &expected_sha256)
+    {
+        // A replacement or content drift makes the generated path untrusted.
+        // Retaining it is safer than a pathname-based cleanup attempt.
+        drop(temp_write);
+        return Err(error);
+    }
+    drop(snapshot);
+    drop(temp_write);
     replace_file_atomic(&temp, path).map_err(|error| {
-        let _ = fs::remove_file(&temp);
         ProviderError::Command(format!("failed to replace QEMU configuration: {error}"))
-    })
+    })?;
+    let written = read_config_snapshot(path, QemuFileSharePolicy::DenyWriteAndDelete)?;
+    if written.bytes_sha256 != expected_sha256 {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU configuration replacement did not bind the intended bytes".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1419,7 +1580,7 @@ fn qemu_argument_path_is_safe(path: &Path) -> bool {
         !value
             .chars()
             .any(|character| matches!(character, ',' | '\n' | '\r' | '\0'))
-    })
+    }) && !crate::state::windows_path_has_stream_or_device_ambiguity(path)
 }
 
 fn control_endpoint_is_safe(endpoint: &ControlEndpoint) -> bool {
@@ -1493,72 +1654,254 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn configure_qemu_file_options(options: &mut OpenOptions, create: bool) {
+#[derive(Clone, Copy)]
+enum QemuFileSharePolicy {
+    #[cfg(windows)]
+    AllowAll,
+    DenyWrite,
+    DenyWriteAndDelete,
+}
+
+fn configure_qemu_file_options(
+    options: &mut OpenOptions,
+    create: bool,
+    share_policy: QemuFileSharePolicy,
+) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let _ = share_policy;
 
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         if create {
             options.mode(0o600);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (options, create);
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        let _ = create;
+        let share_mode = match share_policy {
+            QemuFileSharePolicy::AllowAll => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            QemuFileSharePolicy::DenyWrite => FILE_SHARE_READ | FILE_SHARE_DELETE,
+            QemuFileSharePolicy::DenyWriteAndDelete => FILE_SHARE_READ,
+        };
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(share_mode);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (options, create, share_policy);
     }
 }
 
-#[cfg(unix)]
-fn ensure_private_qemu_directory(path: &Path) -> Result<(), ProviderError> {
-    use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+fn configure_qemu_delete_access(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
 
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    options.access_mode(GENERIC_READ | DELETE);
+}
+
+#[cfg(windows)]
+fn open_private_qemu_delete_file(path: &Path, read_file: &File) -> Result<File, ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_qemu_file_options(&mut options, false, QemuFileSharePolicy::DenyWriteAndDelete);
+    configure_qemu_delete_access(&mut options);
+    let delete_file = options.open(path).map_err(|error| {
+        ProviderError::OwnershipChanged(format!(
+            "QEMU private file could not be upgraded for exact cleanup: {error}"
+        ))
+    })?;
+    if qemu_file_identity(read_file)? != qemu_file_identity(&delete_file)? {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU private file identity changed before exact cleanup".to_owned(),
+        ));
+    }
+    ensure_private_qemu_file(path, &delete_file)?;
+    Ok(delete_file)
+}
+
+fn ensure_private_qemu_directory(path: &Path) -> Result<(), ProviderError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         ProviderError::Authority("QEMU configuration directory identity is unavailable".to_owned())
     })?;
-    if metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-    {
+    if !metadata.is_dir() || qemu_metadata_is_reparse(&metadata) {
         return Err(ProviderError::Authority(
             "QEMU configuration directory is not private and ordinary".to_owned(),
         ));
     }
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(ProviderError::Authority(
+                "QEMU configuration directory is not private and ordinary".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn ensure_private_qemu_directory(_path: &Path) -> Result<(), ProviderError> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn ensure_private_qemu_file(path: &Path, file: &File) -> Result<(), ProviderError> {
-    use std::os::unix::fs::MetadataExt;
-
     let open = file.metadata().map_err(|_| {
         ProviderError::Authority("QEMU configuration file identity is unavailable".to_owned())
     })?;
     let current = fs::symlink_metadata(path).map_err(|_| {
         ProviderError::Authority("QEMU configuration file path is unavailable".to_owned())
     })?;
-    if open.uid() != unsafe { libc::geteuid() }
-        || open.mode() & 0o077 != 0
-        || !open.is_file()
-        || current.file_type().is_symlink()
-        || open.dev() != current.dev()
-        || open.ino() != current.ino()
+    if !open.is_file()
+        || !current.is_file()
+        || qemu_metadata_is_reparse(&open)
+        || qemu_metadata_is_reparse(&current)
     {
         return Err(ProviderError::Authority(
-            "QEMU configuration file is not private, ordinary, and identity-pinned".to_owned(),
+            "QEMU configuration file is not private, ordinary, and safe to use".to_owned(),
         ));
+    }
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if open.uid() != unsafe { libc::geteuid() } || open.mode() & 0o077 != 0 {
+            return Err(ProviderError::Authority(
+                "QEMU configuration file is not private, ordinary, and safe to use".to_owned(),
+            ));
+        }
+        if open.dev() != current.dev() || open.ino() != current.ino() {
+            return Err(ProviderError::OwnershipChanged(
+                "QEMU configuration file identity changed while it was opened".to_owned(),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        configure_qemu_file_options(&mut options, false, QemuFileSharePolicy::AllowAll);
+        let current_file = options.open(path).map_err(|error| {
+            ProviderError::OwnershipChanged(format!(
+                "QEMU configuration file path identity is unavailable: {error}"
+            ))
+        })?;
+        let current_open = current_file.metadata().map_err(|_| {
+            ProviderError::OwnershipChanged(
+                "QEMU configuration file path identity is unavailable".to_owned(),
+            )
+        })?;
+        if qemu_metadata_is_reparse(&current_open)
+            || qemu_file_identity(file)? != qemu_file_identity(&current_file)?
+        {
+            return Err(ProviderError::OwnershipChanged(
+                "QEMU configuration file identity changed while it was opened".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn ensure_private_qemu_file(_path: &Path, _file: &File) -> Result<(), ProviderError> {
+fn ensure_existing_qemu_ancestors_are_ordinary(path: &Path) -> Result<(), ProviderError> {
+    if !qemu_argument_path_is_safe(path) {
+        return Err(ProviderError::Authority(
+            "QEMU path contains an unsafe argument or Windows alias".to_owned(),
+        ));
+    }
+    for (index, ancestor) in path.ancestors().enumerate() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if qemu_metadata_is_reparse(&metadata) || (index > 0 && !metadata.is_dir()) {
+                    return Err(ProviderError::OwnershipChanged(
+                        "QEMU path contains a reparse or non-directory ancestor".to_owned(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && index == 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU path ancestor is unavailable".to_owned(),
+                ));
+            }
+            Err(error) => {
+                return Err(ProviderError::Command(format!(
+                    "failed to inspect QEMU path ancestry: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn qemu_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn qemu_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn qemu_file_identity(file: &File) -> Result<(u32, u64), ProviderError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU configuration file identity is unavailable".to_owned(),
+        ));
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, index))
+}
+
+#[cfg(windows)]
+fn remove_open_qemu_file(file: &File) -> Result<(), ProviderError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let size = u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).map_err(|_| {
+        ProviderError::Command("QEMU exact-file deletion metadata was invalid".to_owned())
+    })?;
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size,
+        )
+    } == 0
+    {
+        return Err(ProviderError::Command(format!(
+            "failed to remove exact QEMU file: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     Ok(())
 }
 
@@ -2934,11 +3277,9 @@ mod tests {
         assert!(!configuration_path.join("vm.json").exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn overlay_creation_uses_staging_and_rejects_dangling_final_symlink() {
-        use std::os::unix::fs::symlink;
-
+    fn overlay_creation_uses_staging_and_preserves_final_path_boundaries() {
         let (_directory, state, installation, runtime, record) =
             crate::providers::test_mutation_fixture_for(
                 "qemu",
@@ -2978,15 +3319,20 @@ mod tests {
                     .ends_with(".tmp"))
         );
 
-        fs::remove_file(&request.overlay_path).unwrap();
-        let external = state.root().join("external.qcow2");
-        fs::write(&external, b"retain").unwrap();
-        symlink(&external, &request.overlay_path).unwrap();
-        assert!(matches!(
-            provider.create_overlay(&authority, &request),
-            Err(ProviderError::Collision(_))
-        ));
-        assert_eq!(fs::read(&external).unwrap(), b"retain");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::remove_file(&request.overlay_path).unwrap();
+            let external = state.root().join("external.qcow2");
+            fs::write(&external, b"retain").unwrap();
+            symlink(&external, &request.overlay_path).unwrap();
+            assert!(matches!(
+                provider.create_overlay(&authority, &request),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+            assert_eq!(fs::read(&external).unwrap(), b"retain");
+        }
     }
 
     #[test]
@@ -3109,6 +3455,163 @@ mod tests {
             validate_qmp_identity(&mut qmp, &config),
             Err(ProviderError::OwnershipChanged(_))
         ));
+    }
+
+    #[test]
+    fn persisted_qemu_configuration_is_bounded_and_schema_strict() {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration_path = directory.path().join("qemu");
+        create_ordinary_directory(&configuration_path).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let mut config = QemuVmConfig {
+            schema_version: QEMU_CONFIG_SCHEMA,
+            id: id.clone(),
+            name: format!("vmcell-{id}"),
+            ownership_marker: "marker".to_owned(),
+            configuration_path: configuration_path.clone(),
+            overlay_path: directory.path().join("cell.qcow2"),
+            parent_path: directory.path().join("base.qcow2"),
+            cpu_count: 1,
+            memory_mib: 1024,
+            accelerator: "tcg".to_owned(),
+            qmp: ControlEndpoint::qmp(&configuration_path, &id),
+            qga: ControlEndpoint::qga(&configuration_path, &id),
+            command_sha256: String::new(),
+            spawn_pending: false,
+            process_id: None,
+            process_start_token: None,
+            process_executable_sha256: None,
+        };
+        config.command_sha256 = launch_digest(&config);
+        let path = configuration_path.join("vm.json");
+        write_config_new(&path, &config).unwrap();
+        assert!(read_config(&path).is_ok());
+
+        #[cfg(unix)]
+        {
+            let snapshot =
+                read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete).unwrap();
+            let mut external = snapshot.config.clone();
+            external.ownership_marker = "external-marker".to_owned();
+            let external_path = configuration_path.join("external.json");
+            write_config_new(&external_path, &external).unwrap();
+            fs::rename(&external_path, &path).unwrap();
+            let mut replacement = snapshot.config.clone();
+            replacement.ownership_marker = "replacement-marker".to_owned();
+            assert!(matches!(
+                replace_config(&path, snapshot, &replacement),
+                Err(ProviderError::OwnershipChanged(message))
+                    if message == "QEMU configuration file identity changed while it was opened"
+            ));
+            assert_eq!(
+                read_config(&path).unwrap().ownership_marker,
+                "external-marker"
+            );
+        }
+
+        #[cfg(not(unix))]
+        {
+            let snapshot =
+                read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete).unwrap();
+            #[cfg(windows)]
+            assert!(OpenOptions::new().write(true).open(&path).is_err());
+            let mut replacement = snapshot.config.clone();
+            replacement.ownership_marker = "replacement-marker".to_owned();
+            replace_config(&path, snapshot, &replacement).unwrap();
+            assert_eq!(
+                read_config(&path).unwrap().ownership_marker,
+                "replacement-marker"
+            );
+        }
+
+        let mut unknown_field = serde_json::to_value(&config).unwrap();
+        unknown_field["unexpected"] = serde_json::json!(true);
+        fs::write(&path, serde_json::to_vec(&unknown_field).unwrap()).unwrap();
+        assert!(matches!(
+            read_config(&path),
+            Err(ProviderError::InvalidResponse(message))
+                if message == "QEMU configuration JSON is invalid"
+        ));
+
+        fs::write(&path, vec![b' '; QEMU_CONFIG_MAX_BYTES + 1]).unwrap();
+        assert!(matches!(
+            read_config(&path),
+            Err(ProviderError::InvalidResponse(message))
+                if message == "QEMU configuration exceeds the maximum size"
+        ));
+
+        let mut oversized_config = config.clone();
+        oversized_config.ownership_marker = "x".repeat(QEMU_CONFIG_MAX_BYTES);
+        let oversized_path = configuration_path.join("oversized.json");
+        assert!(matches!(
+            write_config_new(&oversized_path, &oversized_config),
+            Err(ProviderError::InvalidResponse(message))
+                if message == "QEMU configuration exceeds the maximum size"
+        ));
+        assert!(!oversized_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_qemu_paths_reject_aliases_before_config_or_overlay_access() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        assert!(qemu_argument_path_is_safe(Path::new(
+            r"C:\vmcell\runtime\cell.qcow2"
+        )));
+        for unsafe_path in [
+            r"C:\vmcell\runtime\cell.qcow2:stream",
+            r"C:\vmcell\runtime\NUL.qcow2",
+            r"\\.\NUL",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\cell.qcow2",
+        ] {
+            assert!(!qemu_argument_path_is_safe(Path::new(unsafe_path)));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_directory = directory.path().join("target-qemu");
+        fs::create_dir(&target_directory).unwrap();
+        let aliased_directory = directory.path().join("aliased-qemu");
+        if symlink_dir(&target_directory, &aliased_directory).is_err() {
+            return;
+        }
+        assert!(matches!(
+            create_ordinary_directory(&aliased_directory),
+            Err(ProviderError::OwnershipChanged(_))
+        ));
+
+        let configuration_path = directory.path().join("qemu");
+        create_ordinary_directory(&configuration_path).unwrap();
+        let target_config = directory.path().join("target.json");
+        fs::write(&target_config, b"{}").unwrap();
+        let config_path = configuration_path.join("vm.json");
+        if symlink_file(&target_config, &config_path).is_ok() {
+            assert!(matches!(
+                read_config(&config_path),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+        }
+
+        let target_overlay = directory.path().join("target.qcow2");
+        fs::write(&target_overlay, b"foreign").unwrap();
+        let overlay_path = configuration_path.join("cell.qcow2");
+        if symlink_file(&target_overlay, &overlay_path).is_ok() {
+            assert!(matches!(
+                open_private_qemu_file(&overlay_path),
+                Err(ProviderError::OwnershipChanged(_))
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staged_overlay_cleanup_can_remove_the_pinned_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged_path = directory.path().join("staged.qcow2");
+        fs::write(&staged_path, b"overlay").unwrap();
+        let staged_file = open_private_qemu_file(&staged_path).unwrap();
+        cleanup_exact_qemu_file(&staged_path, staged_file);
+        assert!(!staged_path.exists());
     }
 
     #[test]

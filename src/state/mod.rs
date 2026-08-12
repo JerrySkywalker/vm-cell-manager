@@ -1811,7 +1811,7 @@ fn removable_paths_equal(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_path_has_stream_or_device_ambiguity(path: &Path) -> bool {
+pub(crate) fn windows_path_has_stream_or_device_ambiguity(path: &Path) -> bool {
     let value = path.to_string_lossy().replace('/', "\\");
     if value
         .get(..4)
@@ -1877,7 +1877,7 @@ fn windows_path_has_stream_or_device_ambiguity(path: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-fn windows_path_has_stream_or_device_ambiguity(_path: &Path) -> bool {
+pub(crate) fn windows_path_has_stream_or_device_ambiguity(_path: &Path) -> bool {
     false
 }
 

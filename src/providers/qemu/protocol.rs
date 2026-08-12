@@ -392,7 +392,10 @@ impl<S: ReadWrite> JsonLineProtocol<S> {
 }
 
 fn protocol_io_error(operation: &str, error: std::io::Error) -> ProviderError {
-    if error.kind() == std::io::ErrorKind::TimedOut {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
         ProviderError::Timeout(format!("QEMU protocol {operation} timed out"))
     } else {
         ProviderError::Command(format!("QEMU protocol {operation} failed: {error}"))
@@ -413,9 +416,9 @@ impl<S: ReadWrite> QmpClient<S> {
             deadline: Instant::now() + timeout,
         };
         let greeting = client.protocol.receive(client.deadline)?;
-        if greeting.get("QMP").is_none() {
+        if !greeting.get("QMP").is_some_and(Value::is_object) {
             return Err(ProviderError::InvalidResponse(
-                "QMP greeting was missing".to_owned(),
+                "QMP greeting was invalid".to_owned(),
             ));
         }
         client.execute("qmp_capabilities", None)?;
@@ -543,6 +546,42 @@ mod tests {
         }
     }
 
+    struct TimeoutStream {
+        fail_write: bool,
+    }
+
+    impl Read for TimeoutStream {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "scripted QMP read timeout",
+            ))
+        }
+    }
+
+    impl Write for TimeoutStream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted QMP write timeout",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ReadWrite for TimeoutStream {
+        fn set_operation_deadline(&mut self, _: Instant) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn qmp_negotiation_correlates_ids_and_ignores_events() {
         let input = concat!(
@@ -596,6 +635,33 @@ mod tests {
         assert!(matches!(
             QmpClient::negotiate(truncated, Duration::from_secs(1)),
             Err(ProviderError::InvalidResponse(_))
+        ));
+
+        let malformed_greeting = ScriptedStream {
+            reads: b"{\"QMP\":false}\n".iter().copied().collect(),
+            writes: Vec::new(),
+        };
+        assert!(matches!(
+            QmpClient::negotiate(malformed_greeting, Duration::from_secs(1)),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn protocol_io_would_block_is_a_typed_timeout() {
+        let mut write = JsonLineProtocol::new(TimeoutStream { fail_write: true });
+        assert!(matches!(
+            write.send(
+                &serde_json::json!({"execute": "qmp_capabilities"}),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(ProviderError::Timeout(_))
+        ));
+
+        let mut read = JsonLineProtocol::new(TimeoutStream { fail_write: false });
+        assert!(matches!(
+            read.receive(Instant::now() + Duration::from_secs(1)),
+            Err(ProviderError::Timeout(_))
         ));
     }
 
