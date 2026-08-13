@@ -178,6 +178,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\test-linux-reliability-workflow.ps1
 
+      - name: Reliability closeout contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-reliability-closeout.ps1
+
       - name: Locked static check
         shell: pwsh
         run: |

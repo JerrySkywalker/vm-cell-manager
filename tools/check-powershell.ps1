@@ -46,6 +46,7 @@ $files += @(
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-validation-workflow.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-linux-validation-workflow.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-linux-reliability-workflow.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-reliability-closeout.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\ci-timing.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-ci-timing.ps1'))
 )
