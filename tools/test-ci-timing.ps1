@@ -37,7 +37,7 @@ $requiredWorkflow = [ordered]@{
   'read-only permission' = '(?ms)^permissions:\r?\n  contents: read\r?$'
   'exact checkout' = '(?m)^          ref: \$\{\{ github\.sha \}\}\r?$'
   'credential isolation' = '(?m)^          persist-credentials: false\r?$'
-  'bounded cargo parallelism' = '(?m)^      CARGO_BUILD_JOBS: "2"\r?$'
+  'bounded cargo parallelism' = '(?m)^      CARGO_BUILD_JOBS: "4"\r?$'
   'bounded target binding' = 'cargo_target_dir=\$target'
   'format command' = 'cargo fmt --all -- --check'
   'format native failure preservation' = 'Invoke-VmcellCiNativeCommand -Action \{ cargo fmt --all -- --check \}'
