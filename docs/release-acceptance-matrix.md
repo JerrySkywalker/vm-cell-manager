@@ -81,6 +81,13 @@ template. A future filled acceptance record must still have a separate operator
 authorization and a sanitized Markdown receipt; neither a template nor a
 preflight grants support-promotion authority.
 
+Issue #61 selected one consolidated v0.4.1 corrective-candidate strategy. The
+repository-local [corrective ledger](v041-corrective-acceptance-ledger.md) and
+[dedicated-host R5 runbook](receipts/v041-r5-dedicated-host-runbook.md) define
+its exact correction floor and renewed packet slots. They remain pending and
+non-authorizing until the final candidate ref/SHA and fresh evidence are bound;
+no historical row or receipt transfers to v0.4.1.
+
 The offline [`acceptance-receipt validator`](acceptance-receipt-validator.md)
 adds a strict, sanitized JSON *validation request* for the two v0.3 QEMU
 tuples. It validates supplied binding consistency only: it does not replace the
