@@ -6,6 +6,13 @@ authoritative product-status catalog. Neither document authorizes a host action,
 promotes a support row, or replaces a separately admitted acceptance run.
 This register does not create a `supported` or `experimental` support row.
 
+The frozen v0.1-v0.4 source refs below are historical and immutable. A
+cross-release audit retired their exact candidates from future promotion; see
+[the frozen-candidate correction matrix](frozen-candidate-correction-matrix.md)
+for exact fix provenance, minimum corrected trees, strategy options, and the
+required renewed package/CI/real-platform receipts. Their rows remain here to
+preserve the original tuple contracts, not to imply current promotability.
+
 ## Evidence rules
 
 Every real-platform claim binds all of the following at once:
