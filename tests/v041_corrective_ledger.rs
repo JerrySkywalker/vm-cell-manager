@@ -1,4 +1,6 @@
 const LEDGER: &str = include_str!("../docs/v041-corrective-acceptance-ledger.md");
+const QUALIFICATION: &str = include_str!("../docs/v041-frozen-qualification.md");
+const RELEASE_REHEARSAL: &str = include_str!("../docs/v041-release-rehearsal.json");
 const RUNBOOK: &str = include_str!("../docs/receipts/v041-r5-dedicated-host-runbook.md");
 const CARGO_LOCK: &str = include_str!("../Cargo.lock");
 const README: &str = include_str!("../README.md");
@@ -12,7 +14,9 @@ fn corrective_ledger_binds_selected_strategy_floor_and_historical_retirement() {
     for required in [
         "vmcell.v0.4.1-corrective-acceptance-ledger.v1",
         "OWNER_DECISION=SELECTED_B",
-        "PENDING_EXACT_FINAL_BINDING",
+        "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+        "18c2e81acc4db57e2275175b138d31049df000da",
+        "PROMOTION_ELIGIBLE_PENDING_R5",
         "f10ea52a9dddf62adf115225ae0f9d83b5f298da",
         "0217fa3d42addb95008e0190124d50ed4383d0ba",
         "f539cbc8aa0d4438df21256ebed3590c187824b1",
@@ -52,6 +56,76 @@ fn corrective_ledger_binds_selected_strategy_floor_and_historical_retirement() {
             !LEDGER.contains(prohibited),
             "ledger claimed forbidden authority: {prohibited}"
         );
+    }
+}
+
+#[test]
+fn qualification_and_release_rehearsal_stay_exact_candidate_and_non_authorizing() {
+    for required in [
+        "vmcell.v041-frozen-qualification.v1",
+        "PROMOTION_ELIGIBLE_PENDING_R5",
+        "NOT_COMPLETED",
+        "TECHNICAL_FAILURE",
+        "binary reproducibility",
+        "R5 is `NOT_EXECUTED`",
+        "support remains `untested`",
+        "31730186128",
+        "31744783947",
+        "3802a045148849c2dc7a385e2fee43865336dbd3d12ea64347503713230324b7",
+        "0a258f4f838f38ed632e80a2aec8e2ae6526de6656b21ddde77aeb13efa2999b",
+    ] {
+        assert!(
+            QUALIFICATION.contains(required),
+            "qualification omitted {required}"
+        );
+    }
+
+    for prohibited in [
+        "support_status: supported",
+        "R5 is `PASS`",
+        "publication_performed: true",
+    ] {
+        assert!(
+            !QUALIFICATION.contains(prohibited),
+            "qualification claimed forbidden authority: {prohibited}"
+        );
+    }
+
+    let rehearsal: serde_json::Value =
+        serde_json::from_str(RELEASE_REHEARSAL).expect("release rehearsal must be JSON");
+    assert_eq!(rehearsal["contract"], "vmcell.v041-release-rehearsal.v1");
+    assert_eq!(rehearsal["authorizing"], false);
+    assert_eq!(rehearsal["publication_performed"], false);
+    assert_eq!(
+        rehearsal["candidate_disposition"],
+        "PROMOTION_ELIGIBLE_PENDING_R5"
+    );
+    assert_eq!(
+        rehearsal["candidate"]["sha"],
+        "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"
+    );
+    assert_eq!(
+        rehearsal["candidate"]["tree"],
+        "18c2e81acc4db57e2275175b138d31049df000da"
+    );
+    assert_eq!(rehearsal["r5"]["result"], "NOT_EXECUTED");
+    assert_eq!(rehearsal["tag_plan"]["created"], false);
+    assert_eq!(rehearsal["main_promotion"]["performed"], false);
+    assert_eq!(rehearsal["support_rendering"]["changed"], false);
+    assert_eq!(
+        rehearsal["assets"].as_array().map(Vec::len),
+        Some(2),
+        "release rehearsal must bind both platform assets"
+    );
+    for asset in rehearsal["assets"]
+        .as_array()
+        .expect("release assets must be an array")
+    {
+        assert_eq!(
+            asset["source_commit"],
+            "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"
+        );
+        assert_eq!(asset["source_date_epoch"], 1786641485);
     }
 }
 
@@ -127,5 +201,6 @@ fn repository_package_and_current_docs_share_the_v041_candidate_identity() {
     }
     assert!(README.contains("consolidated corrective"));
     assert!(CHANGELOG.contains("candidate-only"));
-    assert!(LEDGER.contains("repository candidate version\n`0.4.1`"));
+    assert!(LEDGER.contains("release/v0.4.1@0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"));
+    assert!(LEDGER.contains("18c2e81acc4db57e2275175b138d31049df000da"));
 }

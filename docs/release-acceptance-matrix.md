@@ -50,7 +50,11 @@ the release-specific packet supplies the exact candidate, tuple, and sequence.
 | v0.3.0 `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA | Windows CI, fixture-only WHPX preflight, fake QMP/QGA, portable-package contract | Historical [Windows QEMU/WHPX walkthrough](windows-qemu-whpx.md); a corrected tree also requires atomic Job Object/empty-tree proof before new dedicated-host evidence | `RETIRED_CORRECTION_REQUIRED` |
 | v0.3.0 `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA | Exact-SHA hosted Linux compile/test/package lane, shell fixture preflight, fake QMP/QGA, Unix safety contracts | Historical [native Linux walkthrough](linux-kvm-qga.md); a future corrected tree must rebind and repeat its dedicated-host KVM/QGA prerequisites | `RETIRED_CORRECTION_REQUIRED` |
 | v0.4.0 `c741be99ef4632b436f394f1c53b71ed57d0d2d9` | Overlay on an independently accepted v0.1/v0.3 tuple; TOML JobSpec for prepared workload | v0.4 exact-dev Windows/Linux CI, package contracts, JobSpec/plan/result/correlation/compatibility tests | Historical [v0.4 overlay](#v04--job-result-overlay); a future corrected tree must rebind and repeat it against an independently accepted corrected base | `RETIRED_CORRECTION_REQUIRED` |
-| v0.5 planning base `c741be99ef4632b436f394f1c53b71ed57d0d2d9` | macOS/Apple Silicon/aarch64 + QEMU/HVF + Linux/aarch64 + credentialless QGA | Fail-closed repository safety contracts only; no macOS lifecycle evidence | [v0.5 preflight handoff](#v05--apple-silicon-observe-only-preflight); dedicated Apple-Silicon host and fresh observe-only preflight | `BLOCKED_EXTERNAL` |
+| v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct | Exact candidate Windows/Linux/R3/package/compatibility/reliability qualification; R5 dry run only | `V041-R5-HYPERV-PSD-V1`; dedicated authorized host/window, exact VHDX/guest/package/ownership/cleanup bindings | `NOT_EXECUTED` |
+| v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA | Same exact candidate repository evidence; atomic Job/empty-tree contracts; R5 dry run only | `V041-R5-WHPX-QGA-V1`; dedicated authorized host/window, exact QEMU/QCOW2/guest/package/ownership/cleanup bindings | `NOT_EXECUTED` |
+| v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA | Same exact candidate repository evidence; native Linux package and fixture contracts; R5 dry run only | `V041-R5-KVM-QGA-V1`; dedicated native authorized host/window, exact KVM/QEMU/QCOW2/guest/package/cleanup bindings | `NOT_EXECUTED` |
+| v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | JobSpec overlay on one exact accepted v0.4.1 base tuple | Same exact candidate JobSpec/result/artifact compatibility and two-run contract rehearsal | `V041-R5-JOBSPEC-OVERLAY-V1`; same A5 window as an exact base packet with terminal `PASS` | `NOT_EXECUTED` |
+| v0.5 planning base `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | macOS/Apple Silicon/aarch64 + QEMU/HVF + Linux/aarch64 + credentialless QGA | Corrected frozen v0.4.1 repository baseline; no macOS lifecycle evidence | [v0.5 preflight handoff](#v05--apple-silicon-observe-only-preflight); dedicated Apple-Silicon host and fresh observe-only preflight | `BLOCKED_EXTERNAL` |
 
 `Windows QEMU/WHPX` and `native Linux QEMU/KVM` are separate tuple rows. WSL2,
 fixture success, package validation, or a capability probe cannot satisfy either
@@ -82,11 +86,13 @@ authorization and a sanitized Markdown receipt; neither a template nor a
 preflight grants support-promotion authority.
 
 Issue #61 selected one consolidated v0.4.1 corrective-candidate strategy. The
-repository-local [corrective ledger](v041-corrective-acceptance-ledger.md) and
-[dedicated-host R5 runbook](receipts/v041-r5-dedicated-host-runbook.md) define
-its exact correction floor and renewed packet slots. They remain pending and
-non-authorizing until the final candidate ref/SHA and fresh evidence are bound;
-no historical row or receipt transfers to v0.4.1.
+repository-local [corrective ledger](v041-corrective-acceptance-ledger.md),
+[frozen qualification report](v041-frozen-qualification.md), and
+[dedicated-host R5 runbook](receipts/v041-r5-dedicated-host-runbook.md) bind
+the exact correction floor and renewed packet slots. Repository/package
+qualification is complete with disclosed limits; all R5 rows remain
+`NOT_EXECUTED`, non-authorizing, and `untested`. No historical real-platform
+receipt transfers to v0.4.1.
 
 The offline [`acceptance-receipt validator`](acceptance-receipt-validator.md)
 adds a strict, sanitized JSON *validation request* for the two v0.3 QEMU

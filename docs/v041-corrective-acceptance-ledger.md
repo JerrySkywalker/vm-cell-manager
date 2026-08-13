@@ -5,11 +5,14 @@
 Contract: `vmcell.v0.4.1-corrective-acceptance-ledger.v1`.
 
 Issue #61 records `OWNER_DECISION=SELECTED_B`: prepare one consolidated
-corrective candidate from current `dev`, with repository candidate version
-`0.4.1`. This ledger is non-authorizing. Until the final source floor is
-independently accepted and `release/v0.4.1` is created from that exact `dev`
-commit, its candidate SHA, package hashes, binary hashes, and R5 results are
-`PENDING_EXACT_FINAL_BINDING`.
+corrective candidate with repository candidate version `0.4.1`. The frozen
+candidate is
+`release/v0.4.1@0e7fcf37f4310562d318f9d5c709ddf8e8ca1637`, tree
+`18c2e81acc4db57e2275175b138d31049df000da`. Candidate-specific qualification
+is recorded in [the frozen qualification report](v041-frozen-qualification.md)
+and [release rehearsal](v041-release-rehearsal.json). This ledger remains
+non-authorizing; R5 is `NOT_EXECUTED` and support remains `untested`.
+The candidate disposition is `PROMOTION_ELIGIBLE_PENDING_R5`.
 
 The authorization is repository-local candidate preparation and freeze only.
 It does not authorize a tag, GitHub Release, package publication, `main` merge,
@@ -57,13 +60,13 @@ The freeze audit must fill these slots with terminal, exact-source evidence:
 
 | Slot | Required final binding | Current disposition |
 | --- | --- | --- |
-| Candidate identity | `release/v0.4.1` ref and tree both equal final accepted `dev` SHA; clean checkout; Cargo/lock/CLI/docs all report `0.4.1` | `PENDING_EXACT_FINAL_BINDING` |
-| Candidate hosted Windows | exact SHA, workflow SHA, Windows image, Rust 1.85, full tests/doc-tests, static/workflow safety, Windows package contract, read-only proof | `PENDING_EXACT_FINAL_BINDING` |
-| Candidate hosted Linux | exact SHA, workflow SHA, Ubuntu image, Rust 1.85, full gate, Linux package contract, read-only proof | `PENDING_EXACT_FINAL_BINDING` |
-| Candidate R3 | exact SHA and five-case bounded campaign receipt | `PENDING_EXACT_FINAL_BINDING` |
-| Windows package | fresh `vmcell-v0.4.1-windows-x86_64.zip`, adjacent `SHA256SUMS.txt`, source SHA, archive SHA, binary SHA, deterministic layout, install/remove receipt | `PENDING_EXACT_FINAL_BINDING` |
-| Linux package | fresh `vmcell-v0.4.1-linux-x86_64.tar.gz`, adjacent `SHA256SUMS.txt`, source SHA, archive SHA, binary SHA, deterministic layout, install/remove receipt | `PENDING_EXACT_FINAL_BINDING` |
-| Independent audit | final source and release-ref/tree identity, P0=0/P1=0, immutable historical refs, no support/publication claim | `PENDING_EXACT_FINAL_BINDING` |
+| Candidate identity | release ref/SHA/tree, clean export, and Cargo/lock/CLI/docs version binding | `PASS`: exact SHA/tree above; version `0.4.1`; candidate remained immutable |
+| Candidate hosted Windows | exact SHA, workflow SHA, Windows image, Rust 1.85, full tests/doc-tests, static/workflow safety, Windows package contract, read-only proof | `PASS`: run `31725027400` |
+| Candidate hosted Linux | exact SHA, workflow SHA, Ubuntu image, Rust 1.85, full gate, Linux package contract, read-only proof | `PASS`: runs `31730194963` and retained package `31744783947` |
+| Candidate R3 | exact SHA and five-case bounded campaign receipt | `PASS`: run `31725039915`; later counted provider-free confirmation also passed |
+| Windows package | fresh `vmcell-v0.4.1-windows-x86_64.zip`, adjacent `SHA256SUMS.txt`, source SHA, archive SHA, binary SHA, deterministic layout, install/remove receipt | `PASS_WITH_LIMITS`: run `31730186128`; assembly fixed-input deterministic, binary non-reproducible and unsigned |
+| Linux package | fresh `vmcell-v0.4.1-linux-x86_64.tar.gz`, adjacent `SHA256SUMS.txt`, source SHA, archive SHA, binary SHA, deterministic layout, install/remove receipt | `PASS_WITH_LIMITS`: run `31744783947`; assembly reproducible, binary reproducibility not claimed, GLIBC_2.39 floor |
+| Independent audit | final source and release-ref/tree identity, release-critical defect count, immutable historical refs, no support/publication claim | `PASS_WITH_DISCLOSED_LIMITS`: release-critical defects 0; `cargo deny` automation technical failure; no tag, release, main, registry, R5, or support mutation |
 
 R4 remains optional shared-host performance/diagnostic evidence under its
 unchanged 30-minute contract. It is not a slot in repository correctness or R5.
@@ -90,8 +93,9 @@ most `PREFLIGHT_PASS`.
 
 ## Freeze rule
 
-Create `release/v0.4.1` only after the final version-aligned `dev` SHA has a
-fresh P0=0/P1=0 audit and terminal hosted Windows, hosted Linux, applicable R3,
-and package gates. The branch and tree must equal that exact `dev` commit.
-Creating the branch freezes a repository candidate only. It does not create a
-tag, publish anything, merge `main`, run R5, or promote support.
+`release/v0.4.1` is frozen at the exact SHA/tree above and must not absorb the
+later qualification-tooling commits on `dev`. The repository/package gates are
+qualified with the limits in the frozen qualification report. Promotion still
+requires the declared R5 receipts and separate owner authority. The frozen
+branch does not create a tag, publish anything, merge `main`, run R5, or
+promote support.

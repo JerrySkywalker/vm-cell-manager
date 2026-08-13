@@ -557,10 +557,13 @@ A Windows or Linux developer can install the appropriate binary and use substant
 
 ---
 
-# v0.4.0 — Reproducible Jobs
+# v0.4.x — Reproducible Jobs
 
-**Repository-local status:** complete at candidate version `0.4.0` on `dev`.
-The implementation is not a public release and does not establish any real
+**Repository-local status:** the original `release/v0.4.0` candidate is
+historically retired. The current corrected baseline is
+`release/v0.4.1@0e7fcf37f4310562d318f9d5c709ddf8e8ca1637`; its repository/package
+qualification is complete with disclosed limits and its promotion remains
+pending dedicated-host R5. The implementation is not a public release and does not establish any real
 provider, accelerator, or guest-transport acceptance. Those gates remain
 separate from repository CI, package contracts, and this roadmap milestone.
 
@@ -971,7 +974,9 @@ v0.9  1.0 Contract Candidate
 v1.0  Stable Execution Cell Runtime
 ```
 
-Repository-local v0.4 Reproducible Jobs implementation is complete on `dev`.
+Repository-local v0.4 Reproducible Jobs implementation is complete in the
+corrected frozen `release/v0.4.1` baseline. Post-freeze qualification tooling
+continues on `dev` and does not change the candidate tree.
 The next repository-development milestone is **v0.5.0 — Three-Host
 Portability**, subject to separate admission and a dedicated macOS environment.
 Public release advancement remains separately blocked on dedicated

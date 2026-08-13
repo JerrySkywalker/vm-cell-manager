@@ -285,7 +285,7 @@ fn release_acceptance_matrix_retires_frozen_candidates_without_promotion() {
             "RETIRED_CORRECTION_REQUIRED",
         ),
         (
-            "c741be99ef4632b436f394f1c53b71ed57d0d2d9",
+            "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
             "macOS/Apple Silicon/aarch64 + QEMU/HVF + Linux/aarch64 + credentialless QGA",
             "BLOCKED_EXTERNAL",
         ),
@@ -300,6 +300,17 @@ fn release_acceptance_matrix_retires_frozen_candidates_without_promotion() {
     assert!(
         ACCEPTANCE_MATRIX.contains("does not create a `supported` or `experimental` support row")
     );
+    for tuple in [
+        "Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct",
+        "Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA",
+        "Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA",
+        "JobSpec overlay on one exact accepted v0.4.1 base tuple",
+    ] {
+        assert!(
+            row("0e7fcf37f4310562d318f9d5c709ddf8e8ca1637", tuple).contains("NOT_EXECUTED"),
+            "v0.4.1 R5 row must remain not executed: {tuple}"
+        );
+    }
 }
 
 #[test]

@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.v041-release-rehearsal.v1",
+  "authorizing": false,
+  "publication_performed": false,
+  "candidate_disposition": "PROMOTION_ELIGIBLE_PENDING_R5",
+  "candidate": {
+    "repository": "JerrySkywalker/vm-cell-manager",
+    "release_ref": "release/v0.4.1",
+    "sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+    "tree": "18c2e81acc4db57e2275175b138d31049df000da",
+    "version": "0.4.1",
+    "immutable": true
+  },
+  "qualification_tooling": {
+    "merge_sha": "658a74f1441994381a58dedd90ee765a66892fbb",
+    "candidate_tree_member": false,
+    "purpose": "post-freeze qualification only"
+  },
+  "assets": [
+    {
+      "platform": "windows-x86_64",
+      "workflow_run": 31730186128,
+      "archive_name": "vmcell-v0.4.1-windows-x86_64.zip",
+      "archive_sha256": "3802a045148849c2dc7a385e2fee43865336dbd3d12ea64347503713230324b7",
+      "checksum_manifest_sha256": "ad0825847013090138ddfd7ab899a13b3d5588e0b60c893760eb2c8f27804a03",
+      "binary_sha256": "249db6841161d634449142584ad7924b26cbe7b31a41eca9b813dd2eb8acec1b",
+      "source_commit": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+      "source_date_epoch": 1786641485,
+      "target": "x86_64-pc-windows-msvc",
+      "rustc_version": "rustc 1.97.1",
+      "cargo_version": "cargo 1.97.1",
+      "binary_reproducible": false,
+      "code_signature": "not_signed"
+    },
+    {
+      "platform": "linux-x86_64-glibc",
+      "workflow_run": 31744783947,
+      "archive_name": "vmcell-v0.4.1-linux-x86_64.tar.gz",
+      "archive_sha256": "0a258f4f838f38ed632e80a2aec8e2ae6526de6656b21ddde77aeb13efa2999b",
+      "checksum_manifest_sha256": "7ede5d30576da1ae36748f7add18d637a61c6697866c228026af0a134f64d42b",
+      "binary_sha256": "54d8371846edcc83bb2d9e49f8597a44d0abc003e5fedaabbcd1f21c0f80b575",
+      "source_commit": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+      "source_date_epoch": 1786641485,
+      "target": "x86_64-unknown-linux-gnu",
+      "rustc_version": "rustc 1.85.0 (4d91de4e4 2025-02-17)",
+      "cargo_version": "cargo 1.85.0 (d73d2caf9 2024-12-31)",
+      "observed_required_glibc": "GLIBC_2.39",
+      "assembly_reproducible": true,
+      "binary_reproducible": false
+    }
+  ],
+  "staged_release_notes": [
+    "Consolidated v0.4.1 corrective source over the retired v0.1-v0.4 candidates.",
+    "Includes atomic Windows QEMU Job containment, state-root and artifact integrity, reliability A-G, frozen compatibility, and exact JobSpec provenance.",
+    "Retains untested support status until exact authorized R5 receipts exist.",
+    "Discloses non-reproducible platform binaries, unsigned Windows binary, and Linux GLIBC_2.39 floor."
+  ],
+  "asset_plan": {
+    "upload_only_after_owner_authority": true,
+    "required_files": [
+      "vmcell-v0.4.1-windows-x86_64.zip",
+      "vmcell-v0.4.1-linux-x86_64.tar.gz",
+      "SHA256SUMS.txt",
+      "BUILD-PROVENANCE.json"
+    ],
+    "combined_checksum_manifest_required": true,
+    "provenance_must_bind_candidate_and_workflow_runs": true,
+    "registry_publication": "not_authorized"
+  },
+  "tag_plan": {
+    "tag": "v0.4.1",
+    "target_sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+    "immutable": true,
+    "created": false,
+    "moving_existing_tag_forbidden": true
+  },
+  "main_promotion": {
+    "observed_main": "c965d9f113fb3a9dca85161079738cda95411d2b",
+    "source": "release/v0.4.1",
+    "qualification_only_dev_commits_excluded": true,
+    "changed_files": 127,
+    "insertions": 36668,
+    "deletions": 3092,
+    "performed": false
+  },
+  "support_rendering": {
+    "path": "docs/support-matrix.md",
+    "sha256": "8017c6b5fa5b10c4d4041ef02844eb2902a94cc92faff1ea10804ad6afc75481",
+    "changed": false,
+    "promotion_authorized": false
+  },
+  "rollback_and_patch_policy": {
+    "before_publication": "stop promotion and retire the candidate on any release-critical defect",
+    "after_publication": "never move the tag; record the defect and prepare a new version from corrected dev",
+    "package_rollback": "restore only exact retained checksummed artifacts; preserve user state and provider objects",
+    "support_rollback": "support changes require their own evidence-bound owner decision"
+  },
+  "r5": {
+    "result": "NOT_EXECUTED",
+    "required_packets": [
+      "V041-R5-HYPERV-PSD-V1",
+      "V041-R5-WHPX-QGA-V1",
+      "V041-R5-KVM-QGA-V1",
+      "V041-R5-JOBSPEC-OVERLAY-V1"
+    ]
+  },
+  "stop_conditions": [
+    "candidate ref or tree drift",
+    "package, checksum, binary, provenance, host, image, guest, window, ownership, cleanup, or result binding mismatch",
+    "any R5 packet not terminal PASS under fresh A5 authority",
+    "release-critical defect",
+    "missing separate owner authority for main, tag, release, registry, or support mutation"
+  ]
+}
