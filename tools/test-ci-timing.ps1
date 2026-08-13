@@ -18,8 +18,6 @@ $stages = @(
   'windows-preflight-contract',
   'linux-validation-contract',
   'linux-reliability-contract',
-  'v041-r5-rehearsal',
-  'release-supply-chain',
   'clippy',
   'test',
   'windows-package-contract'
@@ -142,7 +140,7 @@ try {
   }
 
   foreach ($line in @($summary -split '\r?\n' | Where-Object { $_ })) {
-    if ($line -notmatch '^vmcell\.windows-timing-summary\.v1 stage=(?:format|powershell-static|windows-preflight-contract|linux-validation-contract|linux-reliability-contract|v041-r5-rehearsal|release-supply-chain|clippy|test|windows-package-contract|checkout-and-setup) state=(?:started|completed|failed|uninstrumented) timestamp_utc=[0-9T:.+\-Z]+ duration_ms=[0-9]{1,7}$') {
+    if ($line -notmatch '^vmcell\.windows-timing-summary\.v1 stage=(?:format|powershell-static|windows-preflight-contract|linux-validation-contract|linux-reliability-contract|clippy|test|windows-package-contract|checkout-and-setup) state=(?:started|completed|failed|uninstrumented) timestamp_utc=[0-9T:.+\-Z]+ duration_ms=[0-9]{1,7}$') {
       throw 'timing summary did not retain its fixed sanitized shape'
     }
   }
