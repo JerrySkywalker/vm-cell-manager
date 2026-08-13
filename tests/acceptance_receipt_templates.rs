@@ -8,6 +8,7 @@ const ACCEPTANCE_MATRIX: &str = include_str!("../docs/release-acceptance-matrix.
 const OWNER_PACKET_TEMPLATE: &str =
     include_str!("../docs/receipts/real-platform-owner-packet-template.md");
 const ACCEPTANCE_VALIDATOR_DOC: &str = include_str!("../docs/acceptance-receipt-validator.md");
+const V041_R5_REHEARSAL: &str = include_str!("../docs/receipts/v041-r5-contract-rehearsal.json");
 
 fn template(name: &str, source: &str) -> Value {
     serde_json::from_str(source)
@@ -362,4 +363,130 @@ fn offline_acceptance_validator_document_retains_the_real_platform_boundary() {
             "acceptance validator documentation omitted required boundary: {required_text}"
         );
     }
+}
+
+#[test]
+fn v041_r5_rehearsal_binds_four_exact_non_authorizing_owner_handoffs() {
+    let rehearsal = template("v0.4.1 R5 rehearsal", V041_R5_REHEARSAL);
+    assert_eq!(required(&rehearsal, "/schema_version"), 1);
+    assert_eq!(
+        required_string(&rehearsal, "/contract"),
+        "vmcell.v041-r5-contract-rehearsal.v1"
+    );
+    assert_eq!(required(&rehearsal, "/authorizing"), false);
+    assert_eq!(
+        required_string(&rehearsal, "/candidate/release_ref"),
+        "release/v0.4.1"
+    );
+    assert_eq!(
+        required_string(&rehearsal, "/candidate/sha"),
+        "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"
+    );
+    assert_eq!(
+        required_string(&rehearsal, "/candidate/tree"),
+        "18c2e81acc4db57e2275175b138d31049df000da"
+    );
+    assert_eq!(required_string(&rehearsal, "/candidate/version"), "0.4.1");
+    assert_eq!(required(&rehearsal, "/candidate/immutable"), true);
+    assert_eq!(required_string(&rehearsal, "/dry_run_result"), "PASS");
+    assert_eq!(required_string(&rehearsal, "/r5_result"), "NOT_EXECUTED");
+    assert_eq!(
+        required_string(&rehearsal, "/support_promotion"),
+        "not_evaluated"
+    );
+
+    let packets = required(&rehearsal, "/packets")
+        .as_array()
+        .expect("v0.4.1 R5 packets must be an array");
+    assert_eq!(packets.len(), 4);
+    let expected = [
+        (
+            "V041-R5-HYPERV-PSD-V1",
+            "windows|x86_64|hyperv|none|windows|x86_64|powershell-direct",
+        ),
+        (
+            "V041-R5-WHPX-QGA-V1",
+            "windows|x86_64|qemu|whpx|linux|x86_64|qga",
+        ),
+        (
+            "V041-R5-KVM-QGA-V1",
+            "linux|x86_64|qemu|kvm|linux|x86_64|qga",
+        ),
+        (
+            "V041-R5-JOBSPEC-OVERLAY-V1",
+            "inherited-from-one-exact-base-packet|inherited-from-one-exact-base-packet|inherited-from-one-exact-base-packet|inherited-from-one-exact-base-packet|inherited-from-one-exact-base-packet|inherited-from-one-exact-base-packet|inherited-from-one-exact-base-packet",
+        ),
+    ];
+    for (index, (packet_id, tuple)) in expected.into_iter().enumerate() {
+        let packet = &packets[index];
+        assert_eq!(required_string(packet, "/packet_id"), packet_id);
+        assert_eq!(required_string(packet, "/packet_status"), "NOT_EXECUTED");
+        assert_eq!(required_string(packet, "/support_status"), "untested");
+        let actual_tuple = [
+            required_string(packet, "/tuple/host_os"),
+            required_string(packet, "/tuple/host_architecture"),
+            required_string(packet, "/tuple/provider"),
+            required_string(packet, "/tuple/accelerator"),
+            required_string(packet, "/tuple/guest_os"),
+            required_string(packet, "/tuple/guest_architecture"),
+            required_string(packet, "/tuple/guest_transport"),
+        ]
+        .join("|");
+        assert_eq!(actual_tuple, tuple, "{packet_id} tuple drifted");
+        assert!(
+            required(packet, "/minimum_dedicated_host_prerequisites")
+                .as_array()
+                .is_some_and(|values| values.len() >= 7),
+            "{packet_id} omitted minimum dedicated-host prerequisites"
+        );
+        for (authority, profile, mode, ceiling) in [
+            (
+                "a4",
+                "PROTECTED_PREFLIGHT_V2",
+                "observe-only-preflight",
+                "PREFLIGHT_PASS",
+            ),
+            (
+                "a5",
+                "PROTECTED_TRANSACTION_V2",
+                "authorized-real-run",
+                "PASS",
+            ),
+        ] {
+            assert_eq!(
+                required_string(packet, &format!("/{authority}/profile")),
+                profile
+            );
+            assert_eq!(required_string(packet, &format!("/{authority}/mode")), mode);
+            assert_eq!(
+                required_string(packet, &format!("/{authority}/result_ceiling")),
+                ceiling
+            );
+            let command = required_string(packet, &format!("/{authority}/one_command"));
+            assert!(command.contains(packet_id));
+            assert!(command.ends_with(&format!("-Authority {}", authority.to_uppercase())));
+        }
+    }
+
+    let truth = required(&rehearsal, "/terminal_truth_table")
+        .as_array()
+        .expect("v0.4.1 R5 truth table must be an array");
+    assert_eq!(truth.len(), 5);
+    assert!(truth.iter().all(|row| {
+        required_string(row, "/support_status") == "untested"
+            && match required_string(row, "/result") {
+                "PASS" => {
+                    required_string(row, "/mode") == "authorized-real-run"
+                        && required_string(row, "/real_platform_acceptance") == "completed"
+                }
+                "PREFLIGHT_PASS" => {
+                    required_string(row, "/mode") == "observe-only-preflight"
+                        && required_string(row, "/real_platform_acceptance") == "pending"
+                }
+                "PARTIAL" | "BLOCKED_EXTERNAL" | "OWNER_DECISION_REQUIRED" => {
+                    required_string(row, "/real_platform_acceptance") == "pending"
+                }
+                _ => false,
+            }
+    }));
 }

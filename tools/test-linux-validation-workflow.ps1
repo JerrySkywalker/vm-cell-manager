@@ -53,6 +53,7 @@ function Assert-LinuxValidationContract {
     'read-only repository permission' = '(?ms)^permissions:\r?\n  contents: read\r?\n\r?\nconcurrency:'
     'lane-isolated exact-source concurrency' = '(?ms)^concurrency:\r?\n  group: vmcell-repository-validation-\$\{\{ inputs\.lane \}\}-\$\{\{ inputs\.source_sha \}\}\r?\n  cancel-in-progress: false\r?$'
     'pinned hosted baseline' = '(?m)^    runs-on: ubuntu-24\.04\r?$'
+    'pinned checkout action' = '(?m)^        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6\r?$'
     'Rust 1.85 toolchain' = '(?m)^      RUSTUP_TOOLCHAIN: 1\.85\.0\r?$'
     'bounded Cargo target' = 'cargo_target="\$RUNNER_TEMP/vmcell-cargo-target"'
     'Cargo target propagation' = 'printf ''CARGO_TARGET_DIR=%s\\n'' "\$cargo_target" >> "\$GITHUB_ENV"'

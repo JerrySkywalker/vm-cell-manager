@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout exact SHA
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -208,6 +208,25 @@ jobs:
           . .\tools\ci-timing.ps1
           Invoke-VmcellCiTimedStage -Stage 'linux-reliability-contract' -Action {
             & .\tools\test-linux-reliability-workflow.ps1
+          }
+
+      - name: v0.4.1 R5 contract rehearsal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'v041-r5-rehearsal' -Action {
+            & .\tools\test-v041-r5-contract-rehearsal.ps1
+          }
+
+      - name: Release supply-chain contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tools\ci-timing.ps1
+          Invoke-VmcellCiTimedStage -Stage 'release-supply-chain' -Action {
+            & .\tools\test-release-supply-chain.ps1
+            & .\tools\test-package-linux-workflow.ps1
           }
 
       - name: Clippy
