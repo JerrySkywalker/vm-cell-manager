@@ -54,7 +54,7 @@ fn run_vmcell_with_stdin(arguments: &[&str], stdin: &[u8]) -> std::process::Outp
 fn version_help_and_shell_completions_are_stable_and_state_free() {
     let version = run_vmcell(&["--version"]);
     assert!(version.status.success());
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.1");
     assert_eq!(
         String::from_utf8(version.stdout).unwrap(),
         format!("vmcell {}\n", env!("CARGO_PKG_VERSION"))

@@ -6,6 +6,14 @@ The project is currently pre-release and follows an architecture-first bootstrap
 
 ## [Unreleased]
 
+- Set the consolidated corrective repository candidate identity to `0.4.1`.
+  It retains the v0.4 Reproducible Jobs contract and adds the full reliability
+  A-G correction floor, frozen v1/v2 read/reject/no-rewrite compatibility,
+  exact JobSpec plan/result provenance checks, and atomic Windows QEMU Job
+  Object containment with durable descendant recovery and exact empty-tree
+  proof. The identity is candidate-only: it creates no tag or publication,
+  transfers no historical receipt, runs no real provider, and promotes no
+  support row.
 - Set the repository-local candidate identity to `0.4.0` and completed the
   reproducible-job surface: strict TOML job
   specifications, read-only job planning, fresh invocation/result identities,
