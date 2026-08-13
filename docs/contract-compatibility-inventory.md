@@ -7,7 +7,7 @@ package, CI, support, or real-platform evidence.
 
 ## Frozen fixture binding
 
-`tests/fixtures/compat/manifest.json` carries contract
+`tests/compat/manifest.json` carries contract
 `vmcell.frozen-compatibility-fixtures.v1` and binds the immutable v0.1-v0.4
 source SHAs, Cargo versions, Rust 1.85.0 contract, durable-state fixture set,
 JobSpec availability, and historical portable-package layout identities. All
@@ -27,6 +27,12 @@ historical archive names, platform families, checksum file, and layout-contract
 source. v0.1-v0.2 have the Windows portable family, while v0.3-v0.4 also have
 the Linux user-portable family. No frozen archive or receipt is reused as
 evidence for a future corrected tree.
+
+The repository templates use short `CELL_ID` and `OPERATION_ID` directory
+aliases and materialize the exact frozen UUID paths at test time. Every
+repository-relative fixture path is capped at 100 characters so the Windows
+preflight clone retains `MAX_PATH` margin without changing the materialized
+compatibility contract.
 
 ## Current contract inventory
 

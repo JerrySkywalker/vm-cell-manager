@@ -8,13 +8,16 @@ use vm_cell_manager::core::job_spec::{JobSpecError, parse_job_spec};
 use vm_cell_manager::state::StateStore;
 
 const LEGACY_CELL_ID: &str = "00000000-0000-0000-0000-000000000201";
+const LEGACY_OPERATION_ID: &str = "00000000-0000-0000-0000-000000000202";
+const V2_CELL_ID: &str = "00000000-0000-0000-0000-000000000301";
+const V2_OPERATION_ID: &str = "00000000-0000-0000-0000-000000000302";
 const LEGACY_SECRET_SENTINEL: &str = "credential-sentinel raw legacy provider detail";
 const INVALID_SPEC_SECRET_SENTINEL: &str = "compatibility-credential-sentinel";
+const MAX_REPOSITORY_RELATIVE_FIXTURE_PATH: usize = 100;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join("fixtures")
         .join("compat")
 }
 
@@ -52,8 +55,18 @@ fn make_private_file(path: &Path) {
     let _ = path;
 }
 
-fn materialize_template(template: &Path, destination: &Path, base_path: &Path) {
-    fn copy_entry(source: &Path, destination: &Path, replacements: &[(&str, String)]) {
+fn materialize_template(
+    template: &Path,
+    destination: &Path,
+    base_path: &Path,
+    path_replacements: &[(&str, &str)],
+) {
+    fn copy_entry(
+        source: &Path,
+        destination: &Path,
+        replacements: &[(&str, String)],
+        path_replacements: &[(&str, &str)],
+    ) {
         let metadata = fs::symlink_metadata(source).unwrap();
         assert!(
             !metadata.file_type().is_symlink(),
@@ -69,8 +82,19 @@ fn materialize_template(template: &Path, destination: &Path, base_path: &Path) {
             entries.sort();
             for entry in entries {
                 let name = entry.file_name().unwrap().to_str().unwrap();
-                let output_name = name.strip_suffix(".in").unwrap_or(name);
-                copy_entry(&entry, &destination.join(output_name), replacements);
+                let mut output_name = name.strip_suffix(".in").unwrap_or(name).to_owned();
+                if output_name == "m.json" {
+                    output_name = "manifest.json".to_owned();
+                }
+                for (token, replacement) in path_replacements {
+                    output_name = output_name.replace(token, replacement);
+                }
+                copy_entry(
+                    &entry,
+                    &destination.join(output_name),
+                    replacements,
+                    path_replacements,
+                );
             }
         } else {
             assert!(
@@ -109,7 +133,7 @@ fn materialize_template(template: &Path, destination: &Path, base_path: &Path) {
             json_path(&runtime.join("fixture.overlay")),
         ),
     ];
-    copy_entry(template, destination, &replacements);
+    copy_entry(template, destination, &replacements, path_replacements);
 }
 
 fn snapshot_tree(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
@@ -348,6 +372,32 @@ fn compatibility_inventory_preserves_evidence_and_authority_boundaries() {
     assert!(!inventory.contains("support is promoted"));
 }
 
+#[test]
+fn compatibility_fixture_paths_preserve_windows_clone_margin() {
+    fn collect(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            paths.push(path.strip_prefix(root).unwrap().to_path_buf());
+            if path.is_dir() {
+                collect(root, &path, paths);
+            }
+        }
+    }
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    collect(repository_root, &fixture_root(), &mut paths);
+    assert!(!paths.is_empty());
+    for path in paths {
+        let length = path.to_string_lossy().len();
+        assert!(
+            length <= MAX_REPOSITORY_RELATIVE_FIXTURE_PATH,
+            "compatibility fixture path exceeded the Windows clone budget: {length} > {MAX_REPOSITORY_RELATIVE_FIXTURE_PATH}: {}",
+            path.display()
+        );
+    }
+}
+
 fn assert_compatible_fixture(
     template_name: &str,
     expected_format: u64,
@@ -357,7 +407,27 @@ fn assert_compatible_fixture(
     let base_path = directory.path().join("immutable-base.img");
     fs::write(&base_path, b"immutable-base-sentinel").unwrap();
     make_private_file(&base_path);
-    materialize_template(&fixture_root().join(template_name), &state_root, &base_path);
+    let path_replacements = match template_name {
+        "v1" => [
+            ("CELL_ID", LEGACY_CELL_ID),
+            ("OPERATION_ID", LEGACY_OPERATION_ID),
+        ],
+        "v2" => [("CELL_ID", V2_CELL_ID), ("OPERATION_ID", V2_OPERATION_ID)],
+        _ => panic!("unknown compatible fixture template {template_name}"),
+    };
+    materialize_template(
+        &fixture_root().join(template_name),
+        &state_root,
+        &base_path,
+        &path_replacements,
+    );
+    let artifact_root = state_root
+        .join("artifacts")
+        .join(path_replacements[0].1)
+        .join(path_replacements[1].1);
+    assert!(artifact_root.join("manifest.json").is_file());
+    assert!(artifact_root.join("files").join("0000.bin").is_file());
+    assert!(!artifact_root.join("m.json").exists());
     let before = snapshot_tree(&state_root);
     let base_before = fs::read(&base_path).unwrap();
     let output = run_state_check(&state_root);
@@ -406,7 +476,7 @@ fn current_dev_rejects_future_state_without_rewrite_or_path_disclosure() {
     let base_path = directory.path().join("immutable-base.img");
     fs::write(&base_path, b"immutable-base-sentinel").unwrap();
     make_private_file(&base_path);
-    materialize_template(&fixture_root().join("future"), &state_root, &base_path);
+    materialize_template(&fixture_root().join("future"), &state_root, &base_path, &[]);
     let before = snapshot_tree(&state_root);
     let base_before = fs::read(&base_path).unwrap();
     let output = run_state_check(&state_root);
