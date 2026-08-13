@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.v041-r5-contract-rehearsal.v1",
+  "authorizing": false,
+  "real_platform_acceptance": "not_executed",
+  "candidate": {
+    "repository": "JerrySkywalker/vm-cell-manager",
+    "release_ref": "release/v0.4.1",
+    "sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+    "tree": "18c2e81acc4db57e2275175b138d31049df000da",
+    "version": "0.4.1",
+    "immutable": true
+  },
+  "package_binding_fields": [
+    "archive_name",
+    "archive_sha256",
+    "checksum_manifest_sha256",
+    "binary_sha256",
+    "source_commit",
+    "source_date_epoch",
+    "target_triple",
+    "rustc_version",
+    "cargo_version"
+  ],
+  "common_binding_fields": [
+    "candidate",
+    "package",
+    "operator_authorization",
+    "host",
+    "execution_window",
+    "writer_exclusivity",
+    "immutable_image",
+    "guest",
+    "exact_owned_namespace",
+    "foreign_prestate",
+    "lifecycle_and_recovery",
+    "cleanup_and_poststate",
+    "terminal_result"
+  ],
+  "terminal_truth_table": [
+    {
+      "result": "PREFLIGHT_PASS",
+      "mode": "observe-only-preflight",
+      "real_platform_acceptance": "pending",
+      "support_status": "untested"
+    },
+    {
+      "result": "PASS",
+      "mode": "authorized-real-run",
+      "real_platform_acceptance": "completed",
+      "support_status": "untested"
+    },
+    {
+      "result": "PARTIAL",
+      "mode": "authorized-real-run",
+      "real_platform_acceptance": "pending",
+      "support_status": "untested"
+    },
+    {
+      "result": "BLOCKED_EXTERNAL",
+      "mode": "observe-only-preflight-or-authorized-real-run",
+      "real_platform_acceptance": "pending",
+      "support_status": "untested"
+    },
+    {
+      "result": "OWNER_DECISION_REQUIRED",
+      "mode": "observe-only-preflight-or-authorized-real-run",
+      "real_platform_acceptance": "pending",
+      "support_status": "untested"
+    }
+  ],
+  "packets": [
+    {
+      "packet_id": "V041-R5-HYPERV-PSD-V1",
+      "packet_status": "NOT_EXECUTED",
+      "support_status": "untested",
+      "correction_floor": ["S", "A"],
+      "tuple": {
+        "host_os": "windows",
+        "host_architecture": "x86_64",
+        "provider": "hyperv",
+        "accelerator": "none",
+        "guest_os": "windows",
+        "guest_architecture": "x86_64",
+        "guest_transport": "powershell-direct"
+      },
+      "minimum_dedicated_host_prerequisites": [
+        "dedicated Windows x86_64 host and bounded isolated window",
+        "Hyper-V capability observed without feature, service, switch, or network mutation",
+        "ordinary immutable parentless VHDX with exact hash, size, and provenance",
+        "prepared Windows guest with PowerShell Direct expectation",
+        "private ACL-exclusive state and runtime roots",
+        "foreign VM and switch inventories plus exclusive provider writer evidence",
+        "exact candidate package, checksum, binary, and clean-checkout binding",
+        "rollback capacity and exact-owned cleanup namespace"
+      ],
+      "required_bindings": [
+        "candidate",
+        "package",
+        "operator_authorization",
+        "host",
+        "execution_window",
+        "writer_exclusivity",
+        "immutable_image",
+        "guest",
+        "exact_owned_namespace",
+        "foreign_prestate",
+        "lifecycle_and_recovery",
+        "cleanup_and_poststate",
+        "terminal_result",
+        "powershell_direct_readiness",
+        "differencing_vhdx_parent",
+        "provider_object_identity"
+      ],
+      "a4": {
+        "authority": "A4",
+        "profile": "PROTECTED_PREFLIGHT_V2",
+        "mode": "observe-only-preflight",
+        "result_ceiling": "PREFLIGHT_PASS",
+        "provider_or_guest_execution": false,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-HYPERV-PSD-V1 -Authority A4"
+      },
+      "a5": {
+        "authority": "A5",
+        "profile": "PROTECTED_TRANSACTION_V2",
+        "mode": "authorized-real-run",
+        "result_ceiling": "PASS",
+        "fresh_owner_goal_required": true,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-HYPERV-PSD-V1 -Authority A5"
+      }
+    },
+    {
+      "packet_id": "V041-R5-WHPX-QGA-V1",
+      "packet_status": "NOT_EXECUTED",
+      "support_status": "untested",
+      "correction_floor": ["Q", "S", "A"],
+      "tuple": {
+        "host_os": "windows",
+        "host_architecture": "x86_64",
+        "provider": "qemu",
+        "accelerator": "whpx",
+        "guest_os": "linux",
+        "guest_architecture": "x86_64",
+        "guest_transport": "qga"
+      },
+      "minimum_dedicated_host_prerequisites": [
+        "dedicated Windows x86_64 host and bounded isolated window",
+        "canonical QEMU system and image tools with exact paths, versions, and hashes",
+        "WHPX advertised by observe-only preflight and proved functional only during A5",
+        "ordinary immutable parentless QCOW2 with exact hash, size, and provenance",
+        "prepared Linux x86_64 guest with credentialless QGA",
+        "private endpoint namespace and ACL-exclusive state and runtime roots",
+        "foreign QEMU, socket, network, and writer prestate",
+        "atomic Windows Job launch and terminal empty-process-tree capability",
+        "exact candidate package, checksum, binary, and clean-checkout binding"
+      ],
+      "required_bindings": [
+        "candidate",
+        "package",
+        "operator_authorization",
+        "host",
+        "execution_window",
+        "writer_exclusivity",
+        "immutable_image",
+        "guest",
+        "exact_owned_namespace",
+        "foreign_prestate",
+        "lifecycle_and_recovery",
+        "cleanup_and_poststate",
+        "terminal_result",
+        "qemu_tool_identity",
+        "whpx_functional_evidence",
+        "qmp_and_qga_identity",
+        "windows_job_schema_2",
+        "terminal_empty_process_tree"
+      ],
+      "a4": {
+        "authority": "A4",
+        "profile": "PROTECTED_PREFLIGHT_V2",
+        "mode": "observe-only-preflight",
+        "result_ceiling": "PREFLIGHT_PASS",
+        "provider_or_guest_execution": false,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-WHPX-QGA-V1 -Authority A4"
+      },
+      "a5": {
+        "authority": "A5",
+        "profile": "PROTECTED_TRANSACTION_V2",
+        "mode": "authorized-real-run",
+        "result_ceiling": "PASS",
+        "fresh_owner_goal_required": true,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-WHPX-QGA-V1 -Authority A5"
+      }
+    },
+    {
+      "packet_id": "V041-R5-KVM-QGA-V1",
+      "packet_status": "NOT_EXECUTED",
+      "support_status": "untested",
+      "correction_floor": ["S", "A"],
+      "tuple": {
+        "host_os": "linux",
+        "host_architecture": "x86_64",
+        "provider": "qemu",
+        "accelerator": "kvm",
+        "guest_os": "linux",
+        "guest_architecture": "x86_64",
+        "guest_transport": "qga"
+      },
+      "minimum_dedicated_host_prerequisites": [
+        "dedicated native non-WSL non-container Linux x86_64 host and bounded isolated window",
+        "canonical QEMU system and image tools with exact paths, versions, and hashes",
+        "exact /dev/kvm character-device identity and read-write open by the effective UID",
+        "ordinary immutable parentless QCOW2 with exact hash, size, and provenance",
+        "prepared Linux x86_64 guest with credentialless QGA",
+        "private mode-0700 state and runtime roots",
+        "foreign QEMU, socket, network, process-group, and writer prestate",
+        "exact candidate package, checksum, binary, and clean-checkout binding",
+        "rollback capacity and exact-owned cleanup namespace"
+      ],
+      "required_bindings": [
+        "candidate",
+        "package",
+        "operator_authorization",
+        "host",
+        "execution_window",
+        "writer_exclusivity",
+        "immutable_image",
+        "guest",
+        "exact_owned_namespace",
+        "foreign_prestate",
+        "lifecycle_and_recovery",
+        "cleanup_and_poststate",
+        "terminal_result",
+        "qemu_tool_identity",
+        "kvm_device_identity",
+        "qmp_and_qga_identity",
+        "process_group_identity"
+      ],
+      "a4": {
+        "authority": "A4",
+        "profile": "PROTECTED_PREFLIGHT_V2",
+        "mode": "observe-only-preflight",
+        "result_ceiling": "PREFLIGHT_PASS",
+        "provider_or_guest_execution": false,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-KVM-QGA-V1 -Authority A4"
+      },
+      "a5": {
+        "authority": "A5",
+        "profile": "PROTECTED_TRANSACTION_V2",
+        "mode": "authorized-real-run",
+        "result_ceiling": "PASS",
+        "fresh_owner_goal_required": true,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-KVM-QGA-V1 -Authority A5"
+      }
+    },
+    {
+      "packet_id": "V041-R5-JOBSPEC-OVERLAY-V1",
+      "packet_status": "NOT_EXECUTED",
+      "support_status": "untested",
+      "correction_floor": ["S", "A", "Q-if-WHPX-base"],
+      "tuple": {
+        "host_os": "inherited-from-one-exact-base-packet",
+        "host_architecture": "inherited-from-one-exact-base-packet",
+        "provider": "inherited-from-one-exact-base-packet",
+        "accelerator": "inherited-from-one-exact-base-packet",
+        "guest_os": "inherited-from-one-exact-base-packet",
+        "guest_architecture": "inherited-from-one-exact-base-packet",
+        "guest_transport": "inherited-from-one-exact-base-packet"
+      },
+      "minimum_dedicated_host_prerequisites": [
+        "one exact v0.4.1 Hyper-V, WHPX, or KVM base packet with terminal PASS",
+        "the same A5-authorized isolated host window as that exact base packet",
+        "non-secret vmcell.job-spec.v1 bytes and exact SHA-256",
+        "one already registered logical image ID from the accepted base tuple",
+        "capacity for two executions with fresh job, cell, operation, and artifact identities",
+        "exact candidate package, checksum, binary, and clean-checkout binding",
+        "bounded result, operation, artifact, no-replay, retention, and cleanup evidence"
+      ],
+      "required_bindings": [
+        "candidate",
+        "package",
+        "operator_authorization",
+        "host",
+        "execution_window",
+        "writer_exclusivity",
+        "immutable_image",
+        "guest",
+        "exact_owned_namespace",
+        "foreign_prestate",
+        "lifecycle_and_recovery",
+        "cleanup_and_poststate",
+        "terminal_result",
+        "exact_base_packet_id_and_sha256",
+        "base_packet_terminal_result_PASS",
+        "same_authorized_window",
+        "job_spec_source_sha256",
+        "non_authorizing_job_plan",
+        "two_fresh_execution_identity_sets",
+        "job_result_and_operation_correlation"
+      ],
+      "a4": {
+        "authority": "A4",
+        "profile": "PROTECTED_PREFLIGHT_V2",
+        "mode": "observe-only-preflight",
+        "result_ceiling": "PREFLIGHT_PASS",
+        "provider_or_guest_execution": false,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-JOBSPEC-OVERLAY-V1 -Authority A4"
+      },
+      "a5": {
+        "authority": "A5",
+        "profile": "PROTECTED_TRANSACTION_V2",
+        "mode": "authorized-real-run",
+        "result_ceiling": "PASS",
+        "fresh_owner_goal_required": true,
+        "one_command": "pwsh -NoProfile -File .\\tools\\test-v041-r5-contract-rehearsal.ps1 -PacketId V041-R5-JOBSPEC-OVERLAY-V1 -Authority A5"
+      }
+    }
+  ],
+  "dry_run_result": "PASS",
+  "r5_result": "NOT_EXECUTED",
+  "support_promotion": "not_evaluated"
+}

@@ -48,6 +48,9 @@ $files += @(
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-linux-reliability-workflow.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-reliability-closeout.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-frozen-candidate-correction-matrix.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-v041-r5-contract-rehearsal.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-release-supply-chain.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-package-linux-workflow.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\ci-timing.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-ci-timing.ps1'))
 )

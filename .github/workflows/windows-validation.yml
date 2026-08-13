@@ -196,6 +196,19 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\test-frozen-candidate-correction-matrix.ps1
 
+      - name: v0.4.1 R5 contract rehearsal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-v041-r5-contract-rehearsal.ps1
+
+      - name: Release supply-chain contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-release-supply-chain.ps1
+          & .\tools\test-package-linux-workflow.ps1
+
       - name: Locked static check
         shell: pwsh
         run: |
