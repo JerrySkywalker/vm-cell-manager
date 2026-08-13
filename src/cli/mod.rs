@@ -1695,52 +1695,67 @@ mod tests {
 
     #[test]
     fn deterministic_error_taxonomy_covers_state_provider_guest_and_engine() {
-        let cases: Vec<(Box<dyn Error>, &str, CliExitCode, bool)> = vec![
+        type ClassificationCase = (
+            Box<dyn Error>,
+            &'static str,
+            CliErrorCategory,
+            CliExitCode,
+            bool,
+        );
+        let cases: Vec<ClassificationCase> = vec![
             (
                 Box::new(StateError::NotFound(PathBuf::from("missing"))),
                 "vmcell.state.not_found",
+                CliErrorCategory::NotFound,
                 CliExitCode::NotFound,
                 false,
             ),
             (
                 Box::new(StateError::MutationBusy),
                 "vmcell.state.contention",
+                CliErrorCategory::Contention,
                 CliExitCode::Contention,
                 true,
             ),
             (
                 Box::new(ProviderError::OwnershipChanged("drift".to_owned())),
                 "vmcell.ownership.changed",
+                CliErrorCategory::Ownership,
                 CliExitCode::Ownership,
                 false,
             ),
             (
                 Box::new(ProviderError::Timeout("deadline".to_owned())),
                 "vmcell.provider.timeout",
+                CliErrorCategory::Timeout,
                 CliExitCode::Timeout,
                 false,
             ),
             (
                 Box::new(ProviderError::OutputLimit("bounded output".to_owned())),
                 "vmcell.provider.output_limit",
+                CliErrorCategory::ResourceLimit,
                 CliExitCode::ResourceLimit,
                 false,
             ),
             (
                 Box::new(GuestIoError::Timeout),
                 "vmcell.guest.timeout",
+                CliErrorCategory::Timeout,
                 CliExitCode::Timeout,
                 false,
             ),
             (
                 Box::new(EngineError::ProviderUnavailable("offline".to_owned())),
                 "vmcell.provider.unavailable",
+                CliErrorCategory::Unavailable,
                 CliExitCode::Unavailable,
                 true,
             ),
             (
                 Box::new(EngineError::ImageIntegrity("hash drift".to_owned())),
                 "vmcell.image.integrity",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
@@ -1750,30 +1765,35 @@ mod tests {
                     blocking_cells: 1,
                 }),
                 "vmcell.image.in_use",
+                CliErrorCategory::Conflict,
                 CliExitCode::Conflict,
                 false,
             ),
             (
                 Box::new(EngineError::InvalidImage("missing image path".to_owned())),
                 "vmcell.invalid_input",
+                CliErrorCategory::InvalidInput,
                 CliExitCode::InvalidInput,
                 false,
             ),
             (
                 Box::new(EngineError::LifecycleConflict("not ready".to_owned())),
                 "vmcell.lifecycle.conflict",
+                CliErrorCategory::Conflict,
                 CliExitCode::Conflict,
                 false,
             ),
             (
                 Box::new(EngineError::Integrity("manifest drift".to_owned())),
                 "vmcell.state.integrity",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
             (
                 Box::new(CliInputError("missing credential flag".to_owned())),
                 "vmcell.invalid_input",
+                CliErrorCategory::InvalidInput,
                 CliExitCode::InvalidInput,
                 false,
             ),
@@ -1783,12 +1803,14 @@ mod tests {
                     source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
                 }),
                 "vmcell.state.integrity",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
             (
                 Box::new(ConfigError::InvalidValue("invalid default")),
                 "vmcell.config.invalid",
+                CliErrorCategory::InvalidInput,
                 CliExitCode::InvalidInput,
                 false,
             ),
@@ -1798,18 +1820,21 @@ mod tests {
                     actual: 2,
                 }),
                 "vmcell.config.unsupported_schema",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
             (
                 Box::new(ConfigError::NotFound),
                 "vmcell.config.not_found",
+                CliErrorCategory::InvalidInput,
                 CliExitCode::InvalidInput,
                 false,
             ),
             (
                 Box::new(JobSpecError::Toml),
                 "vmcell.job_spec.invalid_document",
+                CliErrorCategory::InvalidInput,
                 CliExitCode::InvalidInput,
                 false,
             ),
@@ -1819,14 +1844,16 @@ mod tests {
                     actual: 2,
                 }),
                 "vmcell.job_spec.unsupported_schema",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
         ];
 
-        for (error, code, exit_code, retryable) in cases {
+        for (error, code, category, exit_code, retryable) in cases {
             let actual = classify_cli_error(error.as_ref());
             assert_eq!(actual.code, code);
+            assert_eq!(actual.category, category);
             assert_eq!(actual.exit_code, exit_code);
             assert_eq!(actual.retryable, retryable);
         }
@@ -1838,47 +1865,56 @@ mod tests {
             (
                 ProviderError::Command("redacted".to_owned()),
                 "vmcell.provider.command_failed",
+                CliErrorCategory::Unavailable,
                 CliExitCode::Unavailable,
             ),
             (
                 ProviderError::Timeout("redacted".to_owned()),
                 "vmcell.provider.timeout",
+                CliErrorCategory::Timeout,
                 CliExitCode::Timeout,
             ),
             (
                 ProviderError::OutputLimit("redacted".to_owned()),
                 "vmcell.provider.output_limit",
+                CliErrorCategory::ResourceLimit,
                 CliExitCode::ResourceLimit,
             ),
             (
                 ProviderError::InvalidResponse("redacted".to_owned()),
                 "vmcell.provider.invalid_response",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
             ),
             (
                 ProviderError::NotFound("redacted".to_owned()),
                 "vmcell.provider.not_found",
+                CliErrorCategory::NotFound,
                 CliExitCode::NotFound,
             ),
             (
                 ProviderError::Collision("redacted".to_owned()),
                 "vmcell.provider.conflict",
+                CliErrorCategory::Conflict,
                 CliExitCode::Conflict,
             ),
             (
                 ProviderError::OwnershipChanged("redacted".to_owned()),
                 "vmcell.ownership.changed",
+                CliErrorCategory::Ownership,
                 CliExitCode::Ownership,
             ),
             (
                 ProviderError::Authority("redacted".to_owned()),
                 "vmcell.ownership.changed",
+                CliErrorCategory::Ownership,
                 CliExitCode::Ownership,
             ),
         ];
-        for (error, code, exit_code) in common {
+        for (error, code, category, exit_code) in common {
             let classification = classify_provider_error(&error);
             assert_eq!(classification.code, code);
+            assert_eq!(classification.category, category);
             assert_eq!(classification.exit_code, exit_code);
             assert!(!classification.retryable);
         }
@@ -1889,6 +1925,7 @@ mod tests {
                 operation: "fixture",
             });
             assert_eq!(classification.code, "vmcell.provider.unsupported");
+            assert_eq!(classification.category, CliErrorCategory::Unsupported);
             assert_eq!(classification.exit_code, CliExitCode::Unsupported);
         }
     }
@@ -1899,61 +1936,71 @@ mod tests {
             (
                 RunSelectionError::Ambiguous,
                 "vmcell.run_plan.ambiguous",
+                CliErrorCategory::Conflict,
                 CliExitCode::Conflict,
                 false,
             ),
             (
                 RunSelectionError::IncompatibleImageVariant,
                 "vmcell.run_plan.incompatible_image_variant",
+                CliErrorCategory::Unsupported,
                 CliExitCode::Unsupported,
                 false,
             ),
             (
                 RunSelectionError::ProviderUnavailable,
                 "vmcell.run_plan.provider_unavailable",
+                CliErrorCategory::Unavailable,
                 CliExitCode::Unavailable,
                 true,
             ),
             (
                 RunSelectionError::AcceleratorUnavailable,
                 "vmcell.run_plan.accelerator_unavailable",
+                CliErrorCategory::Unavailable,
                 CliExitCode::Unavailable,
                 true,
             ),
             (
                 RunSelectionError::ArchitectureMismatch,
                 "vmcell.run_plan.architecture_mismatch",
+                CliErrorCategory::Unsupported,
                 CliExitCode::Unsupported,
                 false,
             ),
             (
                 RunSelectionError::UnsupportedGuestTransport,
                 "vmcell.run_plan.guest_transport_unsupported",
+                CliErrorCategory::Unsupported,
                 CliExitCode::Unsupported,
                 false,
             ),
             (
                 RunSelectionError::ContradictoryCapabilityEvidence,
                 "vmcell.run_plan.capability_conflict",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
             (
                 RunSelectionError::TcgRequiresExplicitOptIn,
                 "vmcell.run_plan.tcg_requires_explicit_opt_in",
+                CliErrorCategory::InvalidInput,
                 CliExitCode::InvalidInput,
                 false,
             ),
             (
                 RunSelectionError::PlanDrift,
                 "vmcell.run_plan.drift",
+                CliErrorCategory::Integrity,
                 CliExitCode::Integrity,
                 false,
             ),
         ];
-        for (error, code, exit_code, retryable) in cases {
+        for (error, code, category, exit_code, retryable) in cases {
             let classification = classify_cli_error(&error);
             assert_eq!(classification.code, code);
+            assert_eq!(classification.category, category);
             assert_eq!(classification.exit_code, exit_code);
             assert_eq!(classification.retryable, retryable);
         }

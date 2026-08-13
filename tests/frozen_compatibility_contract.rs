@@ -1,10 +1,21 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use chrono::{Duration, TimeZone, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use vm_cell_manager::core::automation::AUTOMATION_SCHEMA_VERSION;
+use vm_cell_manager::core::capability::ProviderCapabilities;
 use vm_cell_manager::core::cell::CellId;
-use vm_cell_manager::core::job_spec::{JobSpecError, parse_job_spec};
+use vm_cell_manager::core::image::{Architecture, GuestOs, ImageId, ImageRecord, ImageVariant};
+use vm_cell_manager::core::job::JobRunContext;
+use vm_cell_manager::core::job_plan::resolve_job_plan;
+use vm_cell_manager::core::job_spec::{JobSpecError, load_job_spec, parse_job_spec};
+use vm_cell_manager::core::run_selection::HostPlatform;
+use vm_cell_manager::core::support::{Accelerator, HostOs, SupportStatus};
+use vm_cell_manager::providers::{ProviderProbe, ProviderProbeStatus};
 use vm_cell_manager::state::StateStore;
 
 const LEGACY_CELL_ID: &str = "00000000-0000-0000-0000-000000000201";
@@ -304,6 +315,24 @@ fn frozen_manifest_binds_exact_sources_state_specs_and_package_layouts() {
     ];
     let candidates = manifest["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), expected.len());
+    let state_fixtures = manifest["state_fixtures"].as_array().unwrap();
+    let mut state_fixture_ids = HashSet::new();
+    for fixture in state_fixtures {
+        let id = fixture["id"].as_str().unwrap();
+        assert!(
+            state_fixture_ids.insert(id),
+            "duplicate state fixture id {id}"
+        );
+        let template_root = fixture["template_root"].as_str().unwrap();
+        assert!(
+            fixture_root().join(template_root).is_dir(),
+            "state fixture {id} has no materialized template root"
+        );
+        if let Some(counts) = fixture.get("counts") {
+            assert_eq!(counts.as_object().unwrap().len(), 5);
+            assert!(counts.as_object().unwrap().values().all(Value::is_u64));
+        }
+    }
     for (candidate, expected) in candidates.iter().zip(expected) {
         assert_eq!(candidate["release"], expected.0);
         assert_eq!(candidate["ref"], expected.1);
@@ -312,7 +341,19 @@ fn frozen_manifest_binds_exact_sources_state_specs_and_package_layouts() {
         assert_eq!(candidate["rust_version"], "1.85.0");
         assert_eq!(candidate["disposition"], "retired_correction_required");
         assert_eq!(candidate["state_fixture_ids"], expected.4);
+        for fixture_id in candidate["state_fixture_ids"].as_array().unwrap() {
+            assert!(
+                state_fixture_ids.contains(fixture_id.as_str().unwrap()),
+                "candidate references an unknown state fixture"
+            );
+        }
         assert_eq!(candidate["job_spec_fixture"], expected.5);
+        if let Some(job_spec_fixture) = candidate["job_spec_fixture"].as_str() {
+            assert!(
+                fixture_root().join(job_spec_fixture).is_file(),
+                "candidate references a missing JobSpec fixture"
+            );
+        }
         let packages = candidate["packages"]
             .as_array()
             .unwrap()
@@ -328,7 +369,35 @@ fn frozen_manifest_binds_exact_sources_state_specs_and_package_layouts() {
         assert_eq!(Value::Array(packages), expected.6);
         for package in candidate["packages"].as_array().unwrap() {
             assert_eq!(package["checksum"], "SHA256SUMS.txt");
+            let platform = package["platform"].as_str().unwrap();
+            let archive = package["archive"].as_str().unwrap();
+            let contract_source = package["contract_source"].as_str().unwrap();
+            let expected_contract_source = match platform {
+                "windows-x86_64" => {
+                    assert!(archive.ends_with("-windows-x86_64.zip"));
+                    "tools/test-windows-package.ps1"
+                }
+                "linux-x86_64" => {
+                    assert!(archive.ends_with("-linux-x86_64.tar.gz"));
+                    "tools/test-linux-package.py"
+                }
+                other => panic!("unknown package platform {other}"),
+            };
+            assert_eq!(contract_source, expected_contract_source);
+            assert!(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(contract_source)
+                    .is_file(),
+                "package contract source is missing"
+            );
         }
+    }
+
+    for path in manifest["golden_contracts"].as_object().unwrap().values() {
+        assert!(
+            fixture_root().join(path.as_str().unwrap()).is_file(),
+            "manifest references a missing golden contract"
+        );
     }
 
     assert_eq!(
@@ -438,6 +507,18 @@ fn assert_compatible_fixture(
     );
     assert!(output.stderr.is_empty());
     let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let manifest = manifest();
+    let declared_fixture = manifest["state_fixtures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fixture| fixture["template_root"] == template_name)
+        .expect("materialized compatible fixture must be declared");
+    assert_eq!(
+        declared_fixture["durable_state_format_version"],
+        expected_format
+    );
+    assert_eq!(actual["counts"], declared_fixture["counts"]);
     let golden = read_json(
         fixture_root()
             .join("golden")
@@ -564,4 +645,96 @@ fn current_dev_reads_v04_spec_and_fails_closed_on_future_or_secret_like_input() 
     assert_eq!(fs::read(invalid_path).unwrap(), invalid_before);
     assert_eq!(fs::read(private_future).unwrap(), future_before);
     assert_eq!(fs::read(private_invalid).unwrap(), invalid_before);
+}
+
+#[test]
+fn frozen_v04_job_spec_binds_exact_plan_and_result_provenance_without_authority() {
+    let source_path = fixture_root().join("spec").join("v04-valid.toml");
+    let source_bytes = fs::read(&source_path).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let private_specs = directory.path().join("specs");
+    fs::create_dir(&private_specs).unwrap();
+    make_private_directory(&private_specs);
+    let private_spec = private_specs.join("v04-valid.toml");
+    fs::write(&private_spec, &source_bytes).unwrap();
+    make_private_file(&private_spec);
+
+    let loaded = load_job_spec(&private_spec).unwrap();
+    let expected_sha256 = format!("{:x}", Sha256::digest(&source_bytes));
+    assert_eq!(loaded.source_sha256(), expected_sha256);
+    assert_eq!(fs::read(&private_spec).unwrap(), source_bytes);
+
+    let image = ImageRecord {
+        schema_version: 1,
+        id: ImageId::parse("frozen-linux-image").unwrap(),
+        guest_os: GuestOs::Linux,
+        guest_arch: Architecture::X86_64,
+        variants: vec![ImageVariant {
+            provider: "qemu".to_owned(),
+            disk_format: "qcow2".to_owned(),
+            path: "immutable-fixture.qcow2".into(),
+            sha256: "a".repeat(64),
+            file_size: 1024,
+        }],
+        registered_at: Utc.with_ymd_and_hms(2026, 8, 14, 0, 0, 0).unwrap(),
+    };
+    let probes = [ProviderProbe {
+        name: "qemu",
+        status: ProviderProbeStatus::Ready,
+        available: true,
+        detail: "synthetic compatibility probe".to_owned(),
+        capabilities: ProviderCapabilities {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            full_system_vm: true,
+            cow_overlay: true,
+            hardware_acceleration: true,
+            accelerators: vec!["kvm".to_owned()],
+            guest_os: vec!["linux".to_owned()],
+            guest_arch: vec!["x86_64".to_owned()],
+            guest_transports: vec!["qga".to_owned()],
+            networkless_guest_exec: true,
+        },
+    }];
+    let plan = resolve_job_plan(
+        &loaded,
+        HostPlatform {
+            os: HostOs::Linux,
+            architecture: Architecture::X86_64,
+        },
+        &image,
+        &probes,
+    )
+    .unwrap();
+    assert_eq!(plan.contract, "vmcell.job-plan.v1");
+    assert_eq!(plan.job_spec_sha256, expected_sha256);
+    assert!(!plan.authorizing);
+    assert!(!plan.execution.authorizing);
+    assert_eq!(plan.execution.accelerator, Accelerator::Kvm);
+    assert_eq!(plan.execution.support_status, SupportStatus::Untested);
+
+    let started = Utc.with_ymd_and_hms(2026, 8, 14, 0, 0, 0).unwrap();
+    let context = JobRunContext::new(plan.job_spec_sha256.clone(), started).unwrap();
+    let result = context.result_metadata(started + Duration::milliseconds(17));
+    assert_eq!(result.contract, "vmcell.job-result.v1");
+    assert_eq!(result.job_spec_sha256, expected_sha256);
+    assert_eq!(result.elapsed_milliseconds, 17);
+
+    for rendered in [
+        serde_json::to_string(&plan).unwrap(),
+        serde_json::to_string(&result).unwrap(),
+    ] {
+        for forbidden in [
+            "/usr/bin/printf",
+            "inputs/request.json",
+            "results/output.json",
+            private_spec.to_string_lossy().as_ref(),
+            "synthetic compatibility probe",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "provenance contract leaked input data"
+            );
+        }
+    }
+    assert_eq!(fs::read(source_path).unwrap(), source_bytes);
 }
