@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "id": "00000000-0000-0000-0000-000000000302",
+  "cell_id": "00000000-0000-0000-0000-000000000301",
+  "kind": "artifact_collect",
+  "phase": "artifact_committed",
+  "created_at": "2026-08-11T00:00:02Z",
+  "updated_at": "2026-08-11T00:00:03Z",
+  "completed_at": null,
+  "failure": null,
+  "exit_code": null,
+  "stdout_bytes": null,
+  "stderr_bytes": null,
+  "artifact_id": "00000000-0000-0000-0000-000000000302",
+  "artifact_pruned_at": null,
+  "job_id": "00000000-0000-0000-0000-000000000303"
+}

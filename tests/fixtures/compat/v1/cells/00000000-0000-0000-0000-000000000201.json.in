@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "00000000-0000-0000-0000-000000000201",
+  "provider": "hyperv",
+  "spec": {
+    "image": "frozen-image",
+    "provider": "hyperv",
+    "cpu_count": 2,
+    "memory_mib": 4096,
+    "ttl_seconds": null,
+    "accelerator": null,
+    "allow_tcg": false
+  },
+  "image": {
+    "image_id": "frozen-image",
+    "guest_os": "windows",
+    "provider": "hyperv",
+    "disk_format": "vhdx",
+    "path": {{BASE_PATH_JSON}},
+    "sha256": "fixture-image-hash-not-opened",
+    "file_size": 24
+  },
+  "ownership": {
+    "schema_version": 1,
+    "install_id": "00000000-0000-0000-0000-000000000200",
+    "operation_id": "00000000-0000-0000-0000-000000000203",
+    "provider_object_name": "vmcell-00000000-0000-0000-0000-000000000201",
+    "provider_marker": "vmcell:v1:00000000-0000-0000-0000-000000000200:00000000-0000-0000-0000-000000000201:00000000-0000-0000-0000-000000000203",
+    "configuration_path": {{CONFIG_PATH_JSON}},
+    "overlay_path": {{OVERLAY_PATH_JSON}}
+  },
+  "provider_object": null,
+  "state": "stopped",
+  "phase": "ready",
+  "created_at": "2026-08-10T00:00:00Z",
+  "updated_at": "2026-08-10T00:00:01Z",
+  "expires_at": null,
+  "last_error": "credential-sentinel raw legacy provider detail"
+}
