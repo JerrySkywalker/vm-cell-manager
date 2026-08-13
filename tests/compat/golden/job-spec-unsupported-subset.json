@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "error": {
+    "code": "vmcell.job_spec.unsupported_schema",
+    "category": "integrity",
+    "retryable": false,
+    "exit_code": 9
+  }
+}

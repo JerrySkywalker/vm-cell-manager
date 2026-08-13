@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "frozen-image",
+  "guest_os": "windows",
+  "guest_arch": "x86_64",
+  "variants": [
+    {
+      "provider": "hyperv",
+      "disk_format": "vhdx",
+      "path": {{BASE_PATH_JSON}},
+      "sha256": "fixture-image-hash-not-opened",
+      "file_size": 24
+    }
+  ],
+  "registered_at": "2026-08-10T00:00:00Z"
+}

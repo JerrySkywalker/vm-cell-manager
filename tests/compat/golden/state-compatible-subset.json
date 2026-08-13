@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.state-compatibility.v1",
+  "status": "compatible",
+  "counts": {
+    "installations": 1,
+    "images": 1,
+    "cells": 1,
+    "guest_operations": 1,
+    "artifacts": 1
+  }
+}

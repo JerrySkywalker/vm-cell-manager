@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.frozen-compatibility-fixtures.v1",
+  "base_dev_sha": "27dcc1c56db91f8c8ce34bcb8d7e3ed667962158",
+  "authority": "version_neutral_reader_and_contract_prework_only",
+  "owner_decision_issue": 61,
+  "owner_decision": "pending",
+  "candidates": [
+    {
+      "release": "v0.1.0",
+      "ref": "release/v0.1.0",
+      "source_sha": "32f4adad3881c5248c6c8c5d47982368b7b55799",
+      "cargo_version": "0.1.0",
+      "rust_version": "1.85.0",
+      "disposition": "retired_correction_required",
+      "state_fixture_ids": ["legacy-v1"],
+      "job_spec_fixture": null,
+      "packages": [
+        {
+          "platform": "windows-x86_64",
+          "archive": "vmcell-v0.1.0-windows-x86_64.zip",
+          "layout_revision": "windows-v1-core",
+          "checksum": "SHA256SUMS.txt",
+          "contract_source": "tools/test-windows-package.ps1"
+        }
+      ]
+    },
+    {
+      "release": "v0.2.0",
+      "ref": "release/v0.2.0",
+      "source_sha": "ed2ed31ae2f0182fc1626321b81e86d09db378c2",
+      "cargo_version": "0.2.0",
+      "rust_version": "1.85.0",
+      "disposition": "retired_correction_required",
+      "state_fixture_ids": ["legacy-v1"],
+      "job_spec_fixture": null,
+      "packages": [
+        {
+          "platform": "windows-x86_64",
+          "archive": "vmcell-v0.2.0-windows-x86_64.zip",
+          "layout_revision": "windows-v2-metadata-completion",
+          "checksum": "SHA256SUMS.txt",
+          "contract_source": "tools/test-windows-package.ps1"
+        }
+      ]
+    },
+    {
+      "release": "v0.3.0",
+      "ref": "release/v0.3.0",
+      "source_sha": "d0af04b2e84cf2226628173d2ed0d295aed01f2b",
+      "cargo_version": "0.3.0",
+      "rust_version": "1.85.0",
+      "disposition": "retired_correction_required",
+      "state_fixture_ids": ["legacy-v1"],
+      "job_spec_fixture": null,
+      "packages": [
+        {
+          "platform": "windows-x86_64",
+          "archive": "vmcell-v0.3.0-windows-x86_64.zip",
+          "layout_revision": "windows-v2-metadata-completion",
+          "checksum": "SHA256SUMS.txt",
+          "contract_source": "tools/test-windows-package.ps1"
+        },
+        {
+          "platform": "linux-x86_64",
+          "archive": "vmcell-v0.3.0-linux-x86_64.tar.gz",
+          "layout_revision": "linux-v1-user-portable",
+          "checksum": "SHA256SUMS.txt",
+          "contract_source": "tools/test-linux-package.py"
+        }
+      ]
+    },
+    {
+      "release": "v0.4.0",
+      "ref": "release/v0.4.0",
+      "source_sha": "c741be99ef4632b436f394f1c53b71ed57d0d2d9",
+      "cargo_version": "0.4.0",
+      "rust_version": "1.85.0",
+      "disposition": "retired_correction_required",
+      "state_fixture_ids": ["legacy-v1", "job-correlated-v2"],
+      "job_spec_fixture": "spec/v04-valid.toml",
+      "packages": [
+        {
+          "platform": "windows-x86_64",
+          "archive": "vmcell-v0.4.0-windows-x86_64.zip",
+          "layout_revision": "windows-v2-metadata-completion",
+          "checksum": "SHA256SUMS.txt",
+          "contract_source": "tools/test-windows-package.ps1"
+        },
+        {
+          "platform": "linux-x86_64",
+          "archive": "vmcell-v0.4.0-linux-x86_64.tar.gz",
+          "layout_revision": "linux-v1-user-portable",
+          "checksum": "SHA256SUMS.txt",
+          "contract_source": "tools/test-linux-package.py"
+        }
+      ]
+    }
+  ],
+  "state_fixtures": [
+    {
+      "id": "legacy-v1",
+      "template_root": "v1",
+      "frozen_sources": ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0-direct"],
+      "durable_state_format_version": 1,
+      "counts": {
+        "installations": 1,
+        "images": 1,
+        "cells": 1,
+        "guest_operations": 1,
+        "artifacts": 1
+      }
+    },
+    {
+      "id": "job-correlated-v2",
+      "template_root": "v2",
+      "frozen_sources": ["v0.4.0-job"],
+      "durable_state_format_version": 2,
+      "counts": {
+        "installations": 1,
+        "images": 1,
+        "cells": 1,
+        "guest_operations": 1,
+        "artifacts": 1
+      }
+    },
+    {
+      "id": "future-image-v2",
+      "template_root": "future",
+      "frozen_sources": [],
+      "expected_rejection": "vmcell.state.upgrade_required",
+      "actual_schema_version": 2,
+      "supported_schema_version": 1
+    }
+  ],
+  "golden_contracts": {
+    "state_compatible_subset": "golden/state-compatible-subset.json",
+    "state_upgrade_required_subset": "golden/state-upgrade-required-subset.json",
+    "job_spec_unsupported_subset": "golden/job-spec-unsupported-subset.json",
+    "job_spec_invalid_subset": "golden/job-spec-invalid-subset.json"
+  },
+  "forbidden_authority": [
+    "version_bump",
+    "release_ref_or_tag",
+    "package_publication",
+    "support_promotion",
+    "provider_or_guest_execution",
+    "real_platform_acceptance",
+    "owner_decision_selection"
+  ],
+  "limitations": [
+    "package fixtures bind metadata and layouts, not historical archive bytes",
+    "reader rehearsals do not renew frozen package, CI, or real-platform receipts",
+    "no downgrade, migration, or rewrite authority is claimed"
+  ]
+}

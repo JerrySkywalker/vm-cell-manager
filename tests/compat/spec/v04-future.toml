@@ -1,0 +1,27 @@
+schema_version = 2
+image = "frozen-linux-image"
+cpu_count = 2
+memory_mib = 2048
+ttl_seconds = 60
+provider = "qemu"
+accelerator = "kvm"
+
+[command]
+program = "/usr/bin/printf"
+args = ["fixture"]
+
+[cleanup]
+keep = false
+keep_on_failure = true
+
+[[copy_in]]
+source = "inputs/request.json"
+destination = "inputs/request.json"
+overwrite = "deny"
+timeout_seconds = 30
+max_bytes = 4096
+
+[artifacts]
+sources = ["results/output.json"]
+timeout_seconds = 30
+max_bytes_per_file = 4096
