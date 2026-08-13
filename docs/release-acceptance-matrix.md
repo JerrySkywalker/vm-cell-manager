@@ -6,6 +6,13 @@ authoritative product-status catalog. Neither document authorizes a host action,
 promotes a support row, or replaces a separately admitted acceptance run.
 This register does not create a `supported` or `experimental` support row.
 
+The frozen v0.1-v0.4 source refs below are historical and immutable. A
+cross-release audit retired their exact candidates from future promotion; see
+[the frozen-candidate correction matrix](frozen-candidate-correction-matrix.md)
+for exact fix provenance, minimum corrected trees, strategy options, and the
+required renewed package/CI/real-platform receipts. Their rows remain here to
+preserve the original tuple contracts, not to imply current promotability.
+
 ## Evidence rules
 
 Every real-platform claim binds all of the following at once:
@@ -38,11 +45,11 @@ the release-specific packet supplies the exact candidate, tuple, and sequence.
 
 | Release / candidate | Exact target tuple | Reusable repository evidence | Required packet and missing external prerequisites | Status |
 | --- | --- | --- | --- | --- |
-| v0.1.0 `32f4adad3881c5248c6c8c5d47982368b7b55799` | Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct | M1 ownership, provider, image/state, and static PowerShell contracts | [v0.1 packet](#v01--dedicated-hyper-v-and-powershell-direct); dedicated Hyper-V host, immutable VHDX, admitted guest credential process, exclusive Hyper-V/state-root window, and lifecycle/cleanup receipt | `PENDING_REAL_PLATFORM_GATE` |
-| v0.2.0 `ed2ed31ae2f0182fc1626321b81e86d09db378c2` | Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct | v0.1 foundation plus repeated-session, image lifecycle, compatibility, package, and recovery contracts | [v0.2 packet](#v02--repeated-session-image-and-state); repeat the full v0.1 path on this candidate, then prove fresh cells, retained session, image lifecycle, upgrade preflight, interruption/recovery, and cleanup | `PENDING_REAL_PLATFORM_GATE` |
-| v0.3.0 `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA | Windows CI, fixture-only WHPX preflight, fake QMP/QGA, portable-package contract | [Windows QEMU/WHPX walkthrough](windows-qemu-whpx.md) and its receipt template; dedicated Windows QEMU/WHPX host, canonical QEMU tools, immutable Linux QCOW2/QGA, private state root, foreign-writer exclusion, lifecycle/QGA/cleanup receipt | `PENDING_REAL_PLATFORM_GATE` |
-| v0.3.0 `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA | Exact-SHA hosted Linux compile/test/package lane, shell fixture preflight, fake QMP/QGA, Unix safety contracts | [native Linux walkthrough](linux-kvm-qga.md) and its receipt template; dedicated native Linux host, usable unmodified `/dev/kvm`, canonical QEMU tools, immutable Linux QCOW2/QGA, private 0700 root, foreign-writer exclusion, lifecycle/QGA/cleanup receipt | `PENDING_REAL_PLATFORM_GATE` |
-| v0.4.0 `c741be99ef4632b436f394f1c53b71ed57d0d2d9` | Overlay on an independently accepted v0.1/v0.3 tuple; TOML JobSpec for prepared workload | v0.4 exact-dev Windows/Linux CI, package contracts, JobSpec/plan/result/correlation/compatibility tests | [v0.4 overlay](#v04--job-result-overlay); an exact accepted base tuple in the same window, non-secret job spec, plan/result/operation/artifact proof, fresh cells, no-replay, and cleanup | `PENDING_REAL_PLATFORM_GATE` |
+| v0.1.0 `32f4adad3881c5248c6c8c5d47982368b7b55799` | Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct | M1 ownership, provider, image/state, and static PowerShell contracts | Historical [v0.1 packet](#v01--dedicated-hyper-v-and-powershell-direct); a future corrected tree must rebind and repeat its dedicated-host prerequisites | `RETIRED_CORRECTION_REQUIRED` |
+| v0.2.0 `ed2ed31ae2f0182fc1626321b81e86d09db378c2` | Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct | v0.1 foundation plus repeated-session, image lifecycle, compatibility, package, and recovery contracts | Historical [v0.2 packet](#v02--repeated-session-image-and-state); a future corrected tree must rebind and repeat its full lifecycle/recovery prerequisites | `RETIRED_CORRECTION_REQUIRED` |
+| v0.3.0 `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA | Windows CI, fixture-only WHPX preflight, fake QMP/QGA, portable-package contract | Historical [Windows QEMU/WHPX walkthrough](windows-qemu-whpx.md); a corrected tree also requires atomic Job Object/empty-tree proof before new dedicated-host evidence | `RETIRED_CORRECTION_REQUIRED` |
+| v0.3.0 `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA | Exact-SHA hosted Linux compile/test/package lane, shell fixture preflight, fake QMP/QGA, Unix safety contracts | Historical [native Linux walkthrough](linux-kvm-qga.md); a future corrected tree must rebind and repeat its dedicated-host KVM/QGA prerequisites | `RETIRED_CORRECTION_REQUIRED` |
+| v0.4.0 `c741be99ef4632b436f394f1c53b71ed57d0d2d9` | Overlay on an independently accepted v0.1/v0.3 tuple; TOML JobSpec for prepared workload | v0.4 exact-dev Windows/Linux CI, package contracts, JobSpec/plan/result/correlation/compatibility tests | Historical [v0.4 overlay](#v04--job-result-overlay); a future corrected tree must rebind and repeat it against an independently accepted corrected base | `RETIRED_CORRECTION_REQUIRED` |
 | v0.5 planning base `c741be99ef4632b436f394f1c53b71ed57d0d2d9` | macOS/Apple Silicon/aarch64 + QEMU/HVF + Linux/aarch64 + credentialless QGA | Fail-closed repository safety contracts only; no macOS lifecycle evidence | [v0.5 preflight handoff](#v05--apple-silicon-observe-only-preflight); dedicated Apple-Silicon host and fresh observe-only preflight | `BLOCKED_EXTERNAL` |
 
 `Windows QEMU/WHPX` and `native Linux QEMU/KVM` are separate tuple rows. WSL2,
