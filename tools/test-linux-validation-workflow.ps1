@@ -51,6 +51,7 @@ function Assert-LinuxValidationContract {
     'isolated Linux lane' = '(?m)^    if: inputs\.lane == ''linux''\r?$'
     'single trigger declaration' = '(?m)^on:\r?$'
     'read-only repository permission' = '(?ms)^permissions:\r?\n  contents: read\r?\n\r?\nconcurrency:'
+    'lane-isolated exact-source concurrency' = '(?ms)^concurrency:\r?\n  group: vmcell-repository-validation-\$\{\{ inputs\.lane \}\}-\$\{\{ inputs\.source_sha \}\}\r?\n  cancel-in-progress: false\r?$'
     'pinned hosted baseline' = '(?m)^    runs-on: ubuntu-24\.04\r?$'
     'Rust 1.85 toolchain' = '(?m)^      RUSTUP_TOOLCHAIN: 1\.85\.0\r?$'
     'bounded Cargo target' = 'cargo_target="\$RUNNER_TEMP/vmcell-cargo-target"'
@@ -302,6 +303,9 @@ Assert-RejectedMutation -Name 'inline pull request trigger' `
   -Workflow ($workflow -replace '  workflow_dispatch:', "  workflow_dispatch:`n  pull_request: {}") -Gate $gate -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'write permission' `
   -Workflow ($workflow -replace 'contents: read', 'contents: write') -Gate $gate -ExecutionSurface $packageSurface
+Assert-RejectedMutation -Name 'cross-lane concurrency collision' `
+  -Workflow ($workflow -replace 'vmcell-repository-validation-\$\{\{ inputs\.lane \}\}-', 'vmcell-repository-validation-') `
+  -Gate $gate -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'privileged gate command' `
   -Workflow $workflow -Gate "$gate`nsudo true" -ExecutionSurface $packageSurface
 Assert-RejectedMutation -Name 'host package mutation' `

@@ -57,6 +57,7 @@ function Assert-WindowsValidationContract {
     'Windows fixture preflight gate' = '& \.\\tools\\test-windows-whpx-preflight\.ps1'
     'Linux workflow contract gate' = '& \.\\tools\\test-linux-validation-workflow\.ps1'
     'R3 workflow contract gate' = '& \.\\tools\\test-linux-reliability-workflow\.ps1'
+    'reliability closeout contract gate' = '& \.\\tools\\test-reliability-closeout\.ps1'
     'locked offline static check' = 'cargo check --locked --offline --workspace --all-targets --all-features'
     'locked offline Clippy' = 'cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings'
     'locked offline full tests' = 'cargo test --locked --offline --workspace --all-targets --all-features'

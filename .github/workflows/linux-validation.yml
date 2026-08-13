@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vmcell-linux-validation-${{ inputs.source_sha }}
+  group: vmcell-repository-validation-${{ inputs.lane }}-${{ inputs.source_sha }}
   cancel-in-progress: false
 
 jobs:

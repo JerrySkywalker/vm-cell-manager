@@ -88,6 +88,10 @@ development evidence but is never recorded as real Linux host acceptance.
 The `Repository Validation` workflow provides the canonical manual exact-source
 dispatcher and repository Linux lane. Its required lane selector runs exactly
 one of Linux correctness, Windows correctness, or Linux R3 per dispatch. The
+dispatcher concurrency key includes both that lane and the exact source SHA, so
+a pending Windows or R3 request cannot replace a pending Linux request for the
+same commit. A second pending request for the same lane and SHA remains
+deduplicated without canceling an in-progress run. The
 Windows and R3 choices invoke same-commit reusable workflows because GitHub only
 registers a new `workflow_dispatch` file after it exists on the default branch.
 It is manual `workflow_dispatch` only, accepts one exact lowercase 40-hex
@@ -149,6 +153,10 @@ summary receipt explicitly denies R4 runner-health, real-platform acceptance,
 and support-promotion meaning. A hosted pass may establish repository
 correctness; it cannot establish Hyper-V, WHPX, provider, guest, or shared-host
 health.
+
+The version-neutral A-G reliability train, its deterministic campaign protocol,
+residual race limits, compatibility matrix, and long-term runner topology are
+closed out in [the reliability closeout](reliability-closeout.md).
 
 ## Provider safety rule
 
