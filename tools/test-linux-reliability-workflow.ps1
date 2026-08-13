@@ -4,8 +4,9 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $workflowPath = Join-Path $repositoryRoot '.github\workflows\linux-reliability.yml'
 $campaignPath = Join-Path $repositoryRoot 'tools\reliability-campaign.json'
 $campaignScriptPath = Join-Path $repositoryRoot 'tools\check-reliability-campaign.sh'
+$campaignTestPath = Join-Path $repositoryRoot 'tools\test-reliability-campaign.sh'
 
-foreach ($path in @($workflowPath, $campaignPath, $campaignScriptPath)) {
+foreach ($path in @($workflowPath, $campaignPath, $campaignScriptPath, $campaignTestPath)) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     throw "Linux reliability validation surface is missing: $path"
   }
@@ -13,6 +14,8 @@ foreach ($path in @($workflowPath, $campaignPath, $campaignScriptPath)) {
 
 $workflow = [IO.File]::ReadAllText($workflowPath)
 $campaignScript = [IO.File]::ReadAllText($campaignScriptPath)
+$campaignTest = [IO.File]::ReadAllText($campaignTestPath)
+$campaignSurface = "$campaignScript`n$campaignTest"
 $campaign = [IO.File]::ReadAllText($campaignPath) | ConvertFrom-Json
 
 function Assert-LinuxReliabilityContract {
@@ -45,6 +48,7 @@ function Assert-LinuxReliabilityContract {
     'Ubuntu 24.04 proof' = 'test "\$VERSION_ID" = ''24\.04'''
     'exact compiler identity' = 'test "\$\(rustc --version\)" = "\$EXPECTED_RUSTC"'
     'locked dependency fetch' = 'cargo fetch --locked'
+    'bounded-capture fixture' = 'sh tools/test-reliability-campaign\.sh'
     'fixed campaign entry point' = 'sh tools/check-reliability-campaign\.sh'
     'hard campaign deadline' = 'timeout --kill-after=1s 600s sh tools/check-reliability-campaign\.sh'
     'fixed campaign manifest' = '--manifest tools/reliability-campaign\.json'
@@ -82,7 +86,10 @@ function Assert-LinuxReliabilityContract {
     'strict source SHA length' = '\[ "\$\{#source_sha\}" -eq 40 \]'
     'bounded per-case deadline' = 'case_limit=120'
     'bounded campaign deadline' = 'campaign_limit=600'
-    'bounded captured test output' = 'ulimit -f 2048'
+    'bounded captured test output' = 'capture_limit=1048576'
+    'draining bounded capture' = 'while True:'
+    'overflow rejection' = 'if total > limit:'
+    'private capture pipe' = 'mkfifo -m 600 "\$fifo"'
     'bounded test-process deadline' = 'timeout --kill-after=1s "\$case_limit"s cargo test'
     'executed ignored-test proof' = 'grep -F ''running 1 test'' "\$output" >/dev/null'
     'executed ignored-test result proof' = 'grep -F ''test result: ok\. 1 passed; 0 failed; 0 ignored;'' "\$output" >/dev/null'
@@ -170,7 +177,7 @@ function Assert-RejectedReliabilityMutation {
   throw "Linux reliability negative regression was accepted: $Name"
 }
 
-Assert-LinuxReliabilityContract -Workflow $workflow -CampaignScript $campaignScript
+Assert-LinuxReliabilityContract -Workflow $workflow -CampaignScript $campaignSurface
 
 $expectedCampaignProperties = @(
   'schema_version',
@@ -211,34 +218,34 @@ if (($actualCases -join '|') -ne ($expectedCases -join '|')) {
 }
 
 Assert-RejectedReliabilityMutation -Name 'automatic push trigger' `
-  -Workflow ($workflow -replace '  workflow_dispatch:', '  push: {}') -CampaignScript $campaignScript
+  -Workflow ($workflow -replace '  workflow_dispatch:', '  push: {}') -CampaignScript $campaignSurface
 Assert-RejectedReliabilityMutation -Name 'public pull request trigger' `
-  -Workflow ($workflow -replace '  workflow_dispatch:', "  workflow_dispatch:`n  pull_request: {}") -CampaignScript $campaignScript
+  -Workflow ($workflow -replace '  workflow_dispatch:', "  workflow_dispatch:`n  pull_request: {}") -CampaignScript $campaignSurface
 Assert-RejectedReliabilityMutation -Name 'write permission' `
-  -Workflow ($workflow -replace 'contents: read', 'contents: write') -CampaignScript $campaignScript
+  -Workflow ($workflow -replace 'contents: read', 'contents: write') -CampaignScript $campaignSurface
 Assert-RejectedReliabilityMutation -Name 'secret expression' `
-  -Workflow "$workflow`n      TOKEN: `${{ secrets.UNSAFE }}" -CampaignScript $campaignScript
+  -Workflow "$workflow`n      TOKEN: `${{ secrets.UNSAFE }}" -CampaignScript $campaignSurface
 Assert-RejectedReliabilityMutation -Name 'canonical gate reuse' `
-  -Workflow $workflow -CampaignScript "$campaignScript`ntools/check-linux.sh"
+  -Workflow $workflow -CampaignScript "$campaignSurface`ntools/check-linux.sh"
 Assert-RejectedReliabilityMutation -Name 'privileged command' `
-  -Workflow $workflow -CampaignScript "$campaignScript`nsudo true"
+  -Workflow $workflow -CampaignScript "$campaignSurface`nsudo true"
 Assert-RejectedReliabilityMutation -Name 'host package mutation' `
-  -Workflow $workflow -CampaignScript "$campaignScript`napt-get install qemu"
+  -Workflow $workflow -CampaignScript "$campaignSurface`napt-get install qemu"
 Assert-RejectedReliabilityMutation -Name 'KVM permission repair' `
-  -Workflow $workflow -CampaignScript "$campaignScript`nchmod 0666 /dev/kvm"
+  -Workflow $workflow -CampaignScript "$campaignSurface`nchmod 0666 /dev/kvm"
 Assert-RejectedReliabilityMutation -Name 'QEMU lifecycle' `
-  -Workflow $workflow -CampaignScript "$campaignScript`nqemu-system-x86_64 --version"
+  -Workflow $workflow -CampaignScript "$campaignSurface`nqemu-system-x86_64 --version"
 Assert-RejectedReliabilityMutation -Name 'vmcell lifecycle' `
-  -Workflow $workflow -CampaignScript "$campaignScript`nvmcell run --image test -- true"
+  -Workflow $workflow -CampaignScript "$campaignSurface`nvmcell run --image test -- true"
 Assert-RejectedReliabilityMutation -Name 'network command' `
-  -Workflow $workflow -CampaignScript "$campaignScript`ncurl https://example.invalid"
+  -Workflow $workflow -CampaignScript "$campaignSurface`ncurl https://example.invalid"
 Assert-RejectedReliabilityMutation -Name 'extra reliability case' `
-  -Workflow $workflow -CampaignScript "$campaignScript`nrun_case 6 extra extra"
+  -Workflow $workflow -CampaignScript "$campaignSurface`nrun_case 6 extra extra"
 Assert-RejectedReliabilityMutation -Name 'extra direct cargo test' `
-  -Workflow $workflow -CampaignScript "$campaignScript`ntimeout 1s cargo test --test extra -- --ignored --exact"
+  -Workflow $workflow -CampaignScript "$campaignSurface`ntimeout 1s cargo test --test extra -- --ignored --exact"
 Assert-RejectedReliabilityMutation -Name 'runner expression context' `
-  -Workflow "$workflow`n      CARGO_HOME: `${{ runner.temp }}/unsafe" -CampaignScript $campaignScript
+  -Workflow "$workflow`n      CARGO_HOME: `${{ runner.temp }}/unsafe" -CampaignScript $campaignSurface
 Assert-RejectedReliabilityMutation -Name 'removed hard campaign deadline' `
-  -Workflow ($workflow -replace 'timeout --kill-after=1s 600s sh ', 'sh ') -CampaignScript $campaignScript
+  -Workflow ($workflow -replace 'timeout --kill-after=1s 600s sh ', 'sh ') -CampaignScript $campaignSurface
 
 Write-Host 'Linux reliability workflow safety contract passed'

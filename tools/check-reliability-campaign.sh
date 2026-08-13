@@ -60,7 +60,32 @@ esac
 
 campaign_dir=$(mktemp -d "$runner_temp/vmcell-reliability-campaign.XXXXXX")
 campaign_rows="$campaign_dir/cases.tsv"
-trap 'rm -f -- "$campaign_rows"; rmdir -- "$campaign_dir" 2>/dev/null || true' EXIT HUP INT TERM
+capture_script="$campaign_dir/bounded_capture.py"
+trap 'rm -f -- "$campaign_dir"/*; rmdir -- "$campaign_dir" 2>/dev/null || true' EXIT HUP INT TERM
+
+cat >"$capture_script" <<'PY'
+import sys
+
+path, raw_limit = sys.argv[1:]
+limit = int(raw_limit)
+total = 0
+overflow = False
+
+with open(path, "wb") as output:
+    while True:
+        chunk = sys.stdin.buffer.read(65536)
+        if not chunk:
+            break
+        remaining = max(limit - total, 0)
+        if remaining:
+            output.write(chunk[:remaining])
+        total += len(chunk)
+        if total > limit:
+            overflow = True
+
+if overflow:
+    raise SystemExit(3)
+PY
 
 manifest_sha256=$(python3 - "$manifest" "$campaign_rows" <<'PY'
 import hashlib
@@ -134,17 +159,43 @@ PY
 started_at=$(date +%s)
 case_limit=120
 campaign_limit=600
+capture_limit=1048576
+
+run_bounded_capture() {
+  output=$1
+  shift
+  fifo="$campaign_dir/capture.pipe"
+  rm -f -- "$fifo"
+  mkfifo -m 600 "$fifo"
+
+  python3 "$capture_script" "$output" "$capture_limit" <"$fifo" &
+  reader_pid=$!
+  if "$@" >"$fifo" 2>&1; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if wait "$reader_pid"; then
+    reader_status=0
+  else
+    reader_status=$?
+  fi
+  rm -f -- "$fifo"
+
+  if [ "$command_status" -ne 0 ] || [ "$reader_status" -ne 0 ]; then
+    return 1
+  fi
+  return 0
+}
 
 run_case() {
   case_index=$1
   target=$2
   test_name=$3
-  output=$(mktemp "$runner_temp/vmcell-reliability-case.XXXXXX")
+  output=$(mktemp "$campaign_dir/case.XXXXXX")
 
-  if ! (
-    ulimit -f 2048
-    exec timeout --kill-after=1s "$case_limit"s cargo test --locked --offline --test "$target" "$test_name" -- --list --ignored --exact
-  ) >"$output" 2>&1 ||
+  if ! run_bounded_capture "$output" \
+      timeout --kill-after=1s "$case_limit"s cargo test --locked --offline --test "$target" "$test_name" -- --list --ignored --exact ||
     [ "$(grep -Fxc "$test_name: test" "$output")" -ne 1 ]; then
     rm -f -- "$output"
     printf 'reliability_case=%s status=failed\n' "$case_index" >&2
@@ -152,11 +203,9 @@ run_case() {
   fi
   rm -f -- "$output"
 
-  output=$(mktemp "$runner_temp/vmcell-reliability-case.XXXXXX")
-  if (
-    ulimit -f 2048
-    exec timeout --kill-after=1s "$case_limit"s cargo test --locked --offline --test "$target" "$test_name" -- --ignored --exact
-  ) >"$output" 2>&1 &&
+  output=$(mktemp "$campaign_dir/case.XXXXXX")
+  if run_bounded_capture "$output" \
+      timeout --kill-after=1s "$case_limit"s cargo test --locked --offline --test "$target" "$test_name" -- --ignored --exact &&
     grep -F 'running 1 test' "$output" >/dev/null &&
     grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$output" >/dev/null; then
     rm -f -- "$output"
@@ -173,6 +222,7 @@ while IFS="$(printf '\t')" read -r case_index target test_name; do
   run_case "$case_index" "$target" "$test_name"
 done < "$campaign_rows"
 rm -f -- "$campaign_rows"
+rm -f -- "$capture_script"
 rmdir -- "$campaign_dir"
 trap - EXIT HUP INT TERM
 

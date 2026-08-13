@@ -105,6 +105,12 @@ jobs:
           set -euo pipefail
           cargo fetch --locked
 
+      - name: Reliability campaign bounded-capture fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh tools/test-reliability-campaign.sh
+
       - name: Run fixed reliability campaign
         shell: bash
         env:
