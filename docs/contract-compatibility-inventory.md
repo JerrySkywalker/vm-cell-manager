@@ -18,7 +18,9 @@ surface emitted throughout v0.1-v0.4: installation, image, cell, guest
 operation, and operation-bound artifact records. The `job-correlated-v2` tree
 adds the v0.4 JobSpec correlation fields. The committed v0.4 TOML fixture is a
 strict schema-v1 input; the future-schema and secret-like fixtures are negative
-reader cases. Paths are materialized only inside a test-owned temporary root.
+reader cases. Paths are materialized only inside a test-owned temporary root;
+on Unix the materialized directories/files are explicitly private (`0700` /
+`0600`) before the production reader opens them.
 
 Package fixtures are metadata snapshots, not archived binaries. They bind the
 historical archive names, platform families, checksum file, and layout-contract

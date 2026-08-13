@@ -30,6 +30,28 @@ fn json_path(path: &Path) -> String {
     serde_json::to_string(path.to_str().expect("fixture path must be UTF-8")).unwrap()
 }
 
+fn make_private_directory(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn make_private_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn materialize_template(template: &Path, destination: &Path, base_path: &Path) {
     fn copy_entry(source: &Path, destination: &Path, replacements: &[(&str, String)]) {
         let metadata = fs::symlink_metadata(source).unwrap();
@@ -39,6 +61,7 @@ fn materialize_template(template: &Path, destination: &Path, base_path: &Path) {
         );
         if metadata.is_dir() {
             fs::create_dir_all(destination).unwrap();
+            make_private_directory(destination);
             let mut entries = fs::read_dir(source)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -70,6 +93,7 @@ fn materialize_template(template: &Path, destination: &Path, base_path: &Path) {
             } else {
                 fs::copy(source, destination).unwrap();
             }
+            make_private_file(destination);
         }
     }
 
@@ -332,6 +356,7 @@ fn assert_compatible_fixture(
     let state_root = directory.path().join("state");
     let base_path = directory.path().join("immutable-base.img");
     fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+    make_private_file(&base_path);
     materialize_template(&fixture_root().join(template_name), &state_root, &base_path);
     let before = snapshot_tree(&state_root);
     let base_before = fs::read(&base_path).unwrap();
@@ -380,6 +405,7 @@ fn current_dev_rejects_future_state_without_rewrite_or_path_disclosure() {
     let state_root = directory.path().join("future-state");
     let base_path = directory.path().join("immutable-base.img");
     fs::write(&base_path, b"immutable-base-sentinel").unwrap();
+    make_private_file(&base_path);
     materialize_template(&fixture_root().join("future"), &state_root, &base_path);
     let before = snapshot_tree(&state_root);
     let base_before = fs::read(&base_path).unwrap();
@@ -423,7 +449,17 @@ fn current_dev_reads_v04_spec_and_fails_closed_on_future_or_secret_like_input() 
 
     let directory = tempfile::tempdir().unwrap();
     let state_root = directory.path().join("must-not-exist");
-    let future = run_job_plan(&state_root, &future_path);
+    let private_specs = directory.path().join("specs");
+    fs::create_dir(&private_specs).unwrap();
+    make_private_directory(&private_specs);
+    let private_future = private_specs.join("future.toml");
+    let private_invalid = private_specs.join("invalid.toml");
+    fs::write(&private_future, &future_before).unwrap();
+    fs::write(&private_invalid, &invalid_before).unwrap();
+    make_private_file(&private_future);
+    make_private_file(&private_invalid);
+
+    let future = run_job_plan(&state_root, &private_future);
     assert_eq!(future.status.code(), Some(9));
     assert!(future.stdout.is_empty());
     assert_json_subset(
@@ -438,7 +474,7 @@ fn current_dev_reads_v04_spec_and_fails_closed_on_future_or_secret_like_input() 
     assert!(!state_root.exists());
     assert_no_path_or_secret(&future, directory.path(), &[INVALID_SPEC_SECRET_SENTINEL]);
 
-    let invalid = run_job_plan(&state_root, &invalid_path);
+    let invalid = run_job_plan(&state_root, &private_invalid);
     assert_eq!(invalid.status.code(), Some(2));
     assert!(invalid.stdout.is_empty());
     assert_json_subset(
@@ -456,4 +492,6 @@ fn current_dev_reads_v04_spec_and_fails_closed_on_future_or_secret_like_input() 
     assert_eq!(fs::read(valid_path).unwrap(), valid_before);
     assert_eq!(fs::read(future_path).unwrap(), future_before);
     assert_eq!(fs::read(invalid_path).unwrap(), invalid_before);
+    assert_eq!(fs::read(private_future).unwrap(), future_before);
+    assert_eq!(fs::read(private_invalid).unwrap(), invalid_before);
 }
