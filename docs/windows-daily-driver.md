@@ -1,7 +1,7 @@
 # Windows Daily Driver
 
 This canonical Windows workflow was established for v0.2 and remains the
-Windows/Hyper-V daily-driver contract in the repository-local `0.4.0`
+Windows/Hyper-V daily-driver contract in the repository-local `0.4.1`
 candidate. It joins portable installation, state compatibility, image, run,
 retained-cell, diagnostic, shell, recovery, cleanup, and upgrade into one
 sequence.
@@ -22,7 +22,7 @@ Set the accepted version and downloaded files, verify the checksum, and keep
 the archive's versioned top-level directory:
 
 ```powershell
-$version = '0.4.0'
+$version = '0.4.1'
 $download = Join-Path $HOME 'Downloads\vmcell'
 $archive = Join-Path $download "vmcell-v$version-windows-x86_64.zip"
 $checksums = Join-Path $download 'SHA256SUMS.txt'

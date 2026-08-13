@@ -1,5 +1,11 @@
 const LEDGER: &str = include_str!("../docs/v041-corrective-acceptance-ledger.md");
 const RUNBOOK: &str = include_str!("../docs/receipts/v041-r5-dedicated-host-runbook.md");
+const CARGO_LOCK: &str = include_str!("../Cargo.lock");
+const README: &str = include_str!("../README.md");
+const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+const WINDOWS_INSTALL: &str = include_str!("../docs/windows-install-upgrade-remove.md");
+const LINUX_INSTALL: &str = include_str!("../docs/linux-install-upgrade-remove.md");
+const WINDOWS_DAILY_DRIVER: &str = include_str!("../docs/windows-daily-driver.md");
 
 #[test]
 fn corrective_ledger_binds_selected_strategy_floor_and_historical_retirement() {
@@ -94,4 +100,32 @@ fn r5_runbook_is_tuple_specific_fail_closed_and_non_authorizing() {
             "R5 runbook claimed authority or disclosure field: {prohibited}"
         );
     }
+}
+
+#[test]
+fn repository_package_and_current_docs_share_the_v041_candidate_identity() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.1");
+    assert!(CARGO_LOCK.contains("name = \"vm-cell-manager\"\nversion = \"0.4.1\""));
+    for (name, document) in [
+        ("README", README),
+        ("changelog", CHANGELOG),
+        ("Windows install", WINDOWS_INSTALL),
+        ("Linux install", LINUX_INSTALL),
+        ("Windows daily driver", WINDOWS_DAILY_DRIVER),
+    ] {
+        assert!(document.contains("0.4.1"), "{name} omitted candidate 0.4.1");
+    }
+    for (name, current_document) in [
+        ("Windows install", WINDOWS_INSTALL),
+        ("Linux install", LINUX_INSTALL),
+        ("Windows daily driver", WINDOWS_DAILY_DRIVER),
+    ] {
+        assert!(
+            !current_document.contains("0.4.0"),
+            "{name} retained the retired current-install example"
+        );
+    }
+    assert!(README.contains("consolidated corrective"));
+    assert!(CHANGELOG.contains("candidate-only"));
+    assert!(LEDGER.contains("repository candidate version\n`0.4.1`"));
 }

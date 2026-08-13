@@ -2,11 +2,12 @@
 
 `vmcell` is a Rust-first, daemonless local execution-cell runtime for disposable **full-system virtual machines** across native hypervisor backends.
 
-> **Status:** pre-alpha. The repository-local `0.4.0` Reproducible Jobs
-> candidate is complete on `dev` over the v0.1-v0.3 and M1-M5 foundations. It
-> is not a public release. Real Hyper-V, PowerShell Direct, QEMU, WHPX, KVM,
-> QGA, and HVF acceptance remains separately gated and is not established by
-> core CI.
+> **Status:** pre-alpha. The repository-local `0.4.1` consolidated corrective
+> candidate combines the v0.4 Reproducible Jobs surface with the reliability
+> A-G closeout, frozen-state compatibility contracts, and atomic Windows QEMU
+> Job containment. It is not a public release. Real Hyper-V, PowerShell Direct,
+> QEMU, WHPX, KVM, QGA, and HVF acceptance remains separately gated and is not
+> established by repository CI.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 

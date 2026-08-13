@@ -10,16 +10,16 @@ is created by these instructions.
    trusted candidate workflow.
 2. Verify the ZIP SHA-256 against the exact checksum line before extraction.
 3. Extract into a user-owned versioned parent such as
-   `%LOCALAPPDATA%\Programs\vmcell\0.4.0`. The ZIP retains its deterministic
-   top-level `vmcell-v0.4.0-windows-x86_64` directory.
+   `%LOCALAPPDATA%\Programs\vmcell\0.4.1`. The ZIP retains its deterministic
+   top-level `vmcell-v0.4.1-windows-x86_64` directory.
 4. Set `$installDir` to that nested directory, then run the exact binary's
    version, help, and doctor checks.
 5. Add `$installDir` to the user PATH only after those checks.
 
 ```powershell
-$extractDir = Join-Path $env:LOCALAPPDATA 'Programs\vmcell\0.4.0'
-Expand-Archive -LiteralPath .\vmcell-v0.4.0-windows-x86_64.zip -DestinationPath $extractDir
-$installDir = Join-Path $extractDir 'vmcell-v0.4.0-windows-x86_64'
+$extractDir = Join-Path $env:LOCALAPPDATA 'Programs\vmcell\0.4.1'
+Expand-Archive -LiteralPath .\vmcell-v0.4.1-windows-x86_64.zip -DestinationPath $extractDir
+$installDir = Join-Path $extractDir 'vmcell-v0.4.1-windows-x86_64'
 $vmcell = Join-Path $installDir 'vmcell.exe'
 & $vmcell --version
 & $vmcell --help

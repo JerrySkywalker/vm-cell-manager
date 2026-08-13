@@ -24,12 +24,12 @@ the retained manifest before publication. Stop on any mismatch.
 
 ```sh
 set -eu
-archive=vmcell-v0.4.0-linux-x86_64.tar.gz
+archive=vmcell-v0.4.1-linux-x86_64.tar.gz
 staging=$(mktemp -d)
 (umask 022; tar -xzf "$archive" -C "$staging")
-layout="$staging/vmcell-v0.4.0-linux-x86_64"
+layout="$staging/vmcell-v0.4.1-linux-x86_64"
 install_parent="$HOME/.local/lib/vmcell"
-install_root="$install_parent/vmcell-v0.4.0-linux-x86_64"
+install_root="$install_parent/vmcell-v0.4.1-linux-x86_64"
 
 (cd "$layout" && sha256sum --check --strict PACKAGE-CONTENTS.sha256)
 python3 "$layout/vmcell-portable-layout.py" install --parent "$install_parent"

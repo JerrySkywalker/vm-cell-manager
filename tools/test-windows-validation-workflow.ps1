@@ -77,7 +77,7 @@ function Assert-WindowsValidationContract {
     'same-commit R3 dispatcher bridge' = '(?ms)^  linux-reliability:\r?\n    name: [^\r\n]+\r?\n    if: inputs\.lane == ''reliability''\r?\n    uses: \./\.github/workflows/linux-reliability\.yml\r?\n    with:\r?\n      source_sha: \$\{\{ inputs\.source_sha \}\}\r?$'
     'immutable self-hosted R4 timeout' = '(?ms)^  windows-core:\r?\n.*?^    timeout-minutes: 30\r?$'
     'declared package MSRV' = '(?m)^rust-version = "1\.85\.0"\r?$'
-    'declared package version' = '(?m)^version = "0\.4\.0"\r?$'
+    'declared package version' = '(?m)^version = "0\.4\.1"\r?$'
   }
   $contract = "$Workflow`n$Dispatcher`n$SelfHosted`n$Cargo"
   foreach ($entry in $required.GetEnumerator()) {
