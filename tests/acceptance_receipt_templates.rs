@@ -163,6 +163,14 @@ fn windows_whpx_acceptance_template_is_complete_and_non_authorizing() {
         "/ownership/exact_owned_namespace",
         "/ownership/process_identity",
         "/ownership/process_tree_containment",
+        "/ownership/windows_job/job_identity_sha256",
+        "/ownership/windows_job/receipt_persisted_before_resume",
+        "/ownership/windows_job/leader_pid",
+        "/ownership/windows_job/leader_start_token_sha256",
+        "/ownership/windows_job/pre_cleanup_active_processes",
+        "/ownership/windows_job/terminal_active_processes",
+        "/ownership/windows_job/terminal_process_id_count",
+        "/ownership/windows_job/empty_tree_evidence",
         "/ownership/overlay_identity",
         "/ownership/qmp_identity",
         "/cleanup/rollback_evidence",
@@ -170,6 +178,11 @@ fn windows_whpx_acceptance_template_is_complete_and_non_authorizing() {
     ] {
         required_placeholder(&value, field);
     }
+    assert_eq!(required(&value, "/ownership/windows_job/config_schema"), 2);
+    assert_eq!(
+        required_string(&value, "/ownership/windows_job/atomic_create_method"),
+        "PROC_THREAD_ATTRIBUTE_JOB_LIST_CREATE_SUSPENDED"
+    );
     assert_eq!(required(&value, "/whpx/advertised_preflight"), true);
 }
 

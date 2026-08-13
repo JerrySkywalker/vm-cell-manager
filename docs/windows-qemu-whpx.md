@@ -146,14 +146,38 @@ requires the exact base/overlay identity. PID, process name, pipe name, socket,
 or QEMU name alone never authorizes stop, kill, adoption, or deletion. Any
 drift is retained for manual review.
 
-Windows PID reuse is checked against the receipt's process-creation token. The
-current repository does **not** yet have an atomically created, durable Windows
-Job Object receipt for QEMU descendants: `CREATE_NEW_PROCESS_GROUP` is not that
-proof. Consequently, if the QEMU leader exits, Windows recovery and cleanup
-fail closed and retain the cell whenever descendant absence cannot be proven.
-An authorized real-platform acceptance run must include a separately reviewed
-atomic Job Object containment and empty-tree receipt; repository tests and a
-WHPX capability probe do not substitute for it.
+Windows PID reuse is checked against the receipt's process-creation token.
+Current source persists a random, collision-rejected named Job Object before
+launch. It pins the resolved executable against write/delete replacement while
+hashing and creating the process. `CreateProcessW` uses `PROC_THREAD_ATTRIBUTE_JOB_LIST` and
+`CREATE_SUSPENDED`, so the new process is inside a kill-on-close launch guard
+and its durable Job before any user-mode instruction can execute. The exact
+PID, creation token, executable hash, launch digest, and Job identity are then
+persisted before `ResumeThread`; the digest is recomputed from the same argument
+vector that renders the UTF-16 `CreateProcessW` buffer. A query-only Job handle is inherited by QEMU
+to keep the named receipt open across the daemonless launcher boundary; it
+does not grant cleanup authority to the guest.
+
+Existing runner/launcher Jobs remain governed by Windows nested-Job semantics.
+An incompatible host policy fails process creation; there is no alternate
+parent broker, environment-triggered internal mode, or post-spawn assignment.
+
+Stop and removal hold/reopen the exact named Job and require both zero active
+processes and an empty `JobObjectBasicProcessIdList`. Stop first requests
+graceful QMP `quit`; a bounded failure or residual descendant permits
+`TerminateJobObject` only on the already validated exact Job, never enumerated
+PIDs. A live descendant keeps
+the receipt nonempty even after the leader exits. A missing Job is accepted as
+empty only with exact leader absence, under the exclusive same-user writer
+boundary. Legacy schema-1 Windows receipts are readable but never infer Job
+ownership; cleanup remains fail closed. These repository fixtures establish
+the containment mechanism, not WHPX or real-platform acceptance. A new R5 run
+must still exercise the corrected exact candidate on a dedicated host.
+
+Crash recovery does not replay QMP. If the exact leader is absent and the
+persisted Job is queryable and nonempty, inspect exposes cleanup-required
+running state and stop/destroy may terminate only that Job. Inaccessible,
+missing-with-live-leader, or malformed observations remain blocked.
 
 ## Diagnostics and operator response
 
