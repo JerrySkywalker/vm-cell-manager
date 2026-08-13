@@ -5,6 +5,8 @@ $script:VmcellCiTimingStages = @(
   'windows-preflight-contract',
   'linux-validation-contract',
   'linux-reliability-contract',
+  'v041-r5-rehearsal',
+  'release-supply-chain',
   'clippy',
   'test',
   'windows-package-contract'
@@ -31,6 +33,8 @@ function Write-VmcellCiTimingRecord {
       'windows-preflight-contract',
       'linux-validation-contract',
       'linux-reliability-contract',
+      'v041-r5-rehearsal',
+      'release-supply-chain',
       'clippy',
       'test',
       'windows-package-contract'
@@ -90,6 +94,8 @@ function Invoke-VmcellCiTimedStage {
       'windows-preflight-contract',
       'linux-validation-contract',
       'linux-reliability-contract',
+      'v041-r5-rehearsal',
+      'release-supply-chain',
       'clippy',
       'test',
       'windows-package-contract'
