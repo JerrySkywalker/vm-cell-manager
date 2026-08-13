@@ -17,8 +17,10 @@ qualified current `dev`, with a new version/ref only after a separate release
 decision. This minimizes divergent manual ports, preserves the cumulative
 compatibility fixes, and gives one truthful source/package/receipt identity. If
 the first public candidate is intentionally v0.5 instead, the same correction
-floor remains mandatory. Separate historical backports are technically possible
-for only the narrow artifact-phase rule and are not recommended.
+floor remains mandatory. Q, S, and A can each be semantically reimplemented on
+an old line, but none is a clean evidence-preserving cherry-pick; Q and S are
+high-risk cross-surface ports, while only A is a narrow bounded port. Separate
+historical corrective candidates are not recommended.
 
 ## Frozen candidate and tuple inventory
 
@@ -47,7 +49,7 @@ tests/contracts from current `dev`.
 
 | Option | Engineering cost and risk | Compatibility and version truth | Evidence renewal | Decision |
 | --- | --- | --- | --- | --- |
-| A — separate historical backports | four manual source lines with different provider/schema surfaces; S and Q are conflict-prone and invite behavioral drift | keeps old feature labels but creates new binaries that are no longer the frozen versions; requires distinct corrective versions | package, Windows/Linux CI, audit, and every applicable R5 tuple per backport | not recommended |
+| A — separate historical backports | four manually corrected candidate trees with different provider/schema surfaces; S and Q are conflict-prone and invite behavioral drift | keeps old feature labels but creates new binaries that are no longer the frozen versions; requires distinct corrective versions | package, Windows/Linux CI, audit, and every applicable R5 tuple per corrected tree | not recommended |
 | B — one consolidated corrective candidate from current `dev` | one maintained tree containing the cumulative reliability train and compatibility checks | clearest truthful identity; preserves current v1/v2 read/reject/no-rewrite behavior | one candidate package/CI/audit set, then only explicitly claimed R5 tuples | **recommended** |
 | C — defer the first public corrective candidate until v0.5 | lowest immediate release cost but delays a promotable candidate and couples correction availability to the externally blocked v0.5 lifecycle | truthful if v0.1-v0.4 remain explicitly retired and v0.5 includes the full floor | v0.5 package/CI/audit/R5 packet after its separate admission | acceptable fallback, not current recommendation |
 

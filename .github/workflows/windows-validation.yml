@@ -184,6 +184,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\test-reliability-closeout.ps1
 
+      - name: Frozen candidate correction matrix contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-frozen-candidate-correction-matrix.ps1
+
       - name: Locked static check
         shell: pwsh
         run: |

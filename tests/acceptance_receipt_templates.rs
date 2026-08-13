@@ -235,7 +235,7 @@ fn linux_kvm_acceptance_template_is_complete_and_non_authorizing() {
 }
 
 #[test]
-fn release_acceptance_matrix_binds_every_current_release_without_promotion() {
+fn release_acceptance_matrix_retires_frozen_candidates_without_promotion() {
     let row = |candidate: &str, tuple: &str| {
         ACCEPTANCE_MATRIX
             .lines()
@@ -248,27 +248,27 @@ fn release_acceptance_matrix_binds_every_current_release_without_promotion() {
         (
             "32f4adad3881c5248c6c8c5d47982368b7b55799",
             "Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct",
-            "PENDING_REAL_PLATFORM_GATE",
+            "RETIRED_CORRECTION_REQUIRED",
         ),
         (
             "ed2ed31ae2f0182fc1626321b81e86d09db378c2",
             "Windows/x86_64 + Hyper-V + Windows/x86_64 + PowerShell Direct",
-            "PENDING_REAL_PLATFORM_GATE",
+            "RETIRED_CORRECTION_REQUIRED",
         ),
         (
             "d0af04b2e84cf2226628173d2ed0d295aed01f2b",
             "Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA",
-            "PENDING_REAL_PLATFORM_GATE",
+            "RETIRED_CORRECTION_REQUIRED",
         ),
         (
             "d0af04b2e84cf2226628173d2ed0d295aed01f2b",
             "Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA",
-            "PENDING_REAL_PLATFORM_GATE",
+            "RETIRED_CORRECTION_REQUIRED",
         ),
         (
             "c741be99ef4632b436f394f1c53b71ed57d0d2d9",
             "Overlay on an independently accepted v0.1/v0.3 tuple",
-            "PENDING_REAL_PLATFORM_GATE",
+            "RETIRED_CORRECTION_REQUIRED",
         ),
         (
             "c741be99ef4632b436f394f1c53b71ed57d0d2d9",
