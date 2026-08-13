@@ -1,35 +1,32 @@
-name: Repository Validation
+name: Linux Reliability
 
 on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Exact trusted repository commit to validate
+        description: Exact trusted repository commit to run the bounded reliability campaign
         required: true
         type: string
-      lane:
-        description: One isolated repository-validation lane
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact trusted repository commit to run the bounded reliability campaign
         required: true
-        default: linux
-        type: choice
-        options:
-          - linux
-          - windows
-          - reliability
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: vmcell-linux-validation-${{ inputs.source_sha }}
+  group: vmcell-linux-reliability-${{ inputs.source_sha }}
   cancel-in-progress: false
 
 jobs:
-  linux-core:
-    name: Linux Core / GitHub-hosted
-    if: inputs.lane == 'linux'
+  linux-reliability:
+    name: Linux Reliability / GitHub-hosted
+    if: github.repository == 'JerrySkywalker/vm-cell-manager' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     env:
       RUSTUP_TOOLCHAIN: 1.85.0
@@ -49,27 +46,34 @@ jobs:
           fi
 
       - name: Checkout exact supplied SHA
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Bind bounded Cargo target outside the checkout
+      - name: Bind ephemeral reliability build state
         shell: bash
         run: |
           set -euo pipefail
-          cargo_target="$RUNNER_TEMP/vmcell-cargo-target"
-          mkdir -p "$cargo_target"
-          test "$(realpath "$cargo_target")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
-          printf 'CARGO_TARGET_DIR=%s\n' "$cargo_target" >> "$GITHUB_ENV"
+          cargo_home="$RUNNER_TEMP/vmcell-reliability-cargo"
+          rustup_home="$RUNNER_TEMP/vmcell-reliability-rustup"
+          cargo_target="$RUNNER_TEMP/vmcell-reliability-target"
+          for path in "$cargo_home" "$rustup_home" "$cargo_target"; do
+            mkdir -p "$path"
+            test "$(realpath "$path")" = "$(realpath "$RUNNER_TEMP")/$(basename "$path")"
+          done
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nCARGO_TARGET_DIR=%s\n' \
+            "$cargo_home" "$rustup_home" "$cargo_target" >> "$GITHUB_ENV"
 
-      - name: Prove native hosted baseline and exact source
+      - name: Prove hosted baseline and exact source
         shell: bash
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          test "${GITHUB_EVENT_NAME:-}" = 'workflow_dispatch'
+          test "${GITHUB_REPOSITORY:-}" = 'JerrySkywalker/vm-cell-manager'
           actual_sha="$(git rev-parse HEAD)"
           test "$actual_sha" = "$SOURCE_SHA"
           test "${RUNNER_ENVIRONMENT:-}" = 'github-hosted'
@@ -80,28 +84,20 @@ jobs:
           . /etc/os-release
           test "$ID" = 'ubuntu'
           test "$VERSION_ID" = '24.04'
-          test "$CARGO_TARGET_DIR" = "$RUNNER_TEMP/vmcell-cargo-target"
-          test "$(realpath "$CARGO_TARGET_DIR")" = "$(realpath "$RUNNER_TEMP")/vmcell-cargo-target"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           printf 'source_sha=%s\nrunner_environment=%s\nos=%s\narchitecture=%s\nbaseline=%s-%s\n' \
             "$actual_sha" "$RUNNER_ENVIRONMENT" "$RUNNER_OS" "$RUNNER_ARCH" "$ID" "$VERSION_ID"
-          ldd_version="$(ldd --version 2>&1)"
-          printf '%s\n' "${ldd_version%%$'\n'*}"
 
       - name: Install exact repository toolchain in the ephemeral job
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.85.0 \
-            --profile minimal \
-            --component rustfmt,clippy
+          rustup toolchain install 1.85.0 --profile minimal
           test "$(rustc --version)" = "$EXPECTED_RUSTC"
           case "$(cargo --version)" in
             "$EXPECTED_CARGO_PREFIX"*) ;;
             *) echo 'cargo version mismatch' >&2; exit 1 ;;
           esac
-          rustfmt --version
-          cargo clippy --version
 
       - name: Fetch locked Rust dependencies
         shell: bash
@@ -109,21 +105,24 @@ jobs:
           set -euo pipefail
           cargo fetch --locked
 
-      - name: Linux shell static safety
+      - name: Reliability campaign bounded-capture fixture
         shell: bash
         run: |
           set -euo pipefail
-          find tools -maxdepth 1 -type f -name '*.sh' -print0 |
-            sort -z |
-            xargs -0 -r -n1 sh -n
+          sh tools/test-reliability-campaign.sh
 
-      - name: Locked repository gate
+      - name: Run fixed reliability campaign
         shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          sh ./tools/check-linux.sh
+          timeout --kill-after=1s 600s sh tools/check-reliability-campaign.sh \
+            --manifest tools/reliability-campaign.json \
+            --source-sha "$SOURCE_SHA" \
+            --receipt "$RUNNER_TEMP/vmcell-reliability-receipt.json"
 
-      - name: Prove validation was repository-read-only
+      - name: Prove reliability campaign was repository-read-only
         if: always()
         shell: bash
         run: |
@@ -131,17 +130,3 @@ jobs:
           git diff --exit-code
           test ! -e "$GITHUB_WORKSPACE/target"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
-
-  windows-correctness:
-    name: Windows Correctness / exact-source bridge
-    if: inputs.lane == 'windows'
-    uses: ./.github/workflows/windows-validation.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}
-
-  linux-reliability:
-    name: Linux Reliability / exact-source bridge
-    if: inputs.lane == 'reliability'
-    uses: ./.github/workflows/linux-reliability.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}

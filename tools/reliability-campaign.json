@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.reliability-campaign.v1",
+  "campaign_id": "r3-fixed-reliability-v1",
+  "rust_toolchain": "1.85.0",
+  "case_limit": 5,
+  "case_timeout_seconds": 120,
+  "campaign_timeout_seconds": 600,
+  "cases": [
+    {
+      "target": "reliability_harness",
+      "test": "seeded_lifecycle_cases_are_reproducible_and_disjoint_from_normal_ci",
+      "seed": "6a09e667f3bcc909"
+    },
+    {
+      "target": "reliability_harness",
+      "test": "bounded_minimizer_returns_a_real_rejected_transition_as_serialized_input",
+      "seed": "6a09e667f3bcc909"
+    },
+    {
+      "target": "reliability_model_matrix",
+      "test": "run_selection_matrix_has_stable_outcomes_and_never_implicitly_selects_tcg",
+      "seed": "fixed-v1"
+    },
+    {
+      "target": "reliability_model_matrix",
+      "test": "job_spec_plan_and_result_metadata_bind_provenance_without_authority_or_secrets",
+      "seed": "fixed-v1"
+    },
+    {
+      "target": "reliability_model_matrix",
+      "test": "durable_correlation_schema_fence_is_property_exact",
+      "seed": "fixed-v1"
+    }
+  ]
+}

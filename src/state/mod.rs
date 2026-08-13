@@ -4557,19 +4557,23 @@ mod tests {
     }
 
     #[test]
-    fn mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement() {
+    fn mutation_guard_isolates_fresh_processes_across_abrupt_exit_and_directory_replacement() {
         if let Some(mode) = std::env::var_os("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD") {
             let root = PathBuf::from(std::env::var_os("VMCELL_TEST_STATE_ROOT").unwrap());
             let store = StateStore::new(root);
             match mode.to_string_lossy().as_ref() {
-                "abort_with_lock" => {
+                "exit_with_lock" => {
                     let _guard = store.acquire_mutation_lock().unwrap();
                     let marker = PathBuf::from(
                         std::env::var_os("VMCELL_TEST_MUTATION_GUARD_ABORT_MARKER")
                             .expect("abort child must receive an acquisition marker path"),
                     );
                     fs::write(marker, b"lock_acquired").unwrap();
-                    std::process::abort();
+                    // This intentionally bypasses Rust destructors while avoiding
+                    // Windows abort-reporting latency. Separate atomic-manifest
+                    // fixtures exercise `abort()` itself; this probe owns only
+                    // OS lock release after a process disappears abruptly.
+                    std::process::exit(86);
                 }
                 "available" => {
                     drop(store.acquire_mutation_lock().unwrap());
@@ -4610,12 +4614,12 @@ mod tests {
         let abort_marker = directory.path().join("mutation-lock-acquired");
 
         let mut abort_command = subprocess_for(
-            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abrupt_exit_and_directory_replacement",
         );
         abort_command
             .env(
                 "VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD",
-                "abort_with_lock",
+                "exit_with_lock",
             )
             .env("VMCELL_TEST_STATE_ROOT", store.root())
             .env("VMCELL_TEST_MUTATION_GUARD_ABORT_MARKER", &abort_marker);
@@ -4628,7 +4632,7 @@ mod tests {
         assert_eq!(fs::read(&abort_marker).unwrap(), b"lock_acquired");
 
         let mut reopen_command = subprocess_for(
-            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abrupt_exit_and_directory_replacement",
         );
         reopen_command
             .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "available")
@@ -4643,7 +4647,7 @@ mod tests {
 
         let guard = store.acquire_mutation_lock().unwrap();
         let mut contention_command = subprocess_for(
-            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abrupt_exit_and_directory_replacement",
         );
         contention_command
             .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "contended")
@@ -4657,7 +4661,7 @@ mod tests {
         assert_child_marker(&contended.stdout, "mutation_busy");
 
         let mut replacement_command = subprocess_for(
-            "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+            "state::tests::mutation_guard_isolates_fresh_processes_across_abrupt_exit_and_directory_replacement",
         );
         replacement_command
             .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "replace_cells")
@@ -4693,7 +4697,7 @@ mod tests {
                 drop(guard);
 
                 let mut release_command = subprocess_for(
-                    "state::tests::mutation_guard_isolates_fresh_processes_across_abort_and_directory_replacement",
+                    "state::tests::mutation_guard_isolates_fresh_processes_across_abrupt_exit_and_directory_replacement",
                 );
                 release_command
                     .env("VMCELL_TEST_PORTABLE_MUTATION_GUARD_CHILD", "replace_cells")
