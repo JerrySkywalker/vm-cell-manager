@@ -1,4 +1,4 @@
-name: Linux Validation
+name: Repository Validation
 
 on:
   workflow_dispatch:
@@ -7,6 +7,15 @@ on:
         description: Exact trusted repository commit to validate
         required: true
         type: string
+      lane:
+        description: One isolated repository-validation lane
+        required: true
+        default: linux
+        type: choice
+        options:
+          - linux
+          - windows
+          - reliability
 
 permissions:
   contents: read
@@ -18,6 +27,7 @@ concurrency:
 jobs:
   linux-core:
     name: Linux Core / GitHub-hosted
+    if: inputs.lane == 'linux'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -121,3 +131,17 @@ jobs:
           git diff --exit-code
           test ! -e "$GITHUB_WORKSPACE/target"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  windows-correctness:
+    name: Windows Correctness / exact-source bridge
+    if: inputs.lane == 'windows'
+    uses: ./.github/workflows/windows-validation.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+
+  linux-reliability:
+    name: Linux Reliability / exact-source bridge
+    if: inputs.lane == 'reliability'
+    uses: ./.github/workflows/linux-reliability.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}

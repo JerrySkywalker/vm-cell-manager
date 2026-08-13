@@ -7,6 +7,12 @@ on:
         description: Exact trusted repository commit to run the bounded reliability campaign
         required: true
         type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact trusted repository commit to run the bounded reliability campaign
+        required: true
+        type: string
 
 permissions:
   contents: read

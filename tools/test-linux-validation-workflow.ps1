@@ -47,7 +47,8 @@ function Assert-LinuxValidationContract {
 
   $contract = "$Workflow`n$Gate`n$ExecutionSurface"
   $requiredPatterns = [ordered]@{
-    'dispatch-only trigger' = '(?ms)^on:\r?\n  workflow_dispatch:\r?\n    inputs:\r?\n      source_sha:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        type: string\r?\n\r?\npermissions:'
+    'dispatch-only trigger' = '(?ms)^on:\r?\n  workflow_dispatch:\r?\n    inputs:\r?\n      source_sha:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        type: string\r?\n      lane:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        default: linux\r?\n        type: choice\r?\n        options:\r?\n          - linux\r?\n          - windows\r?\n          - reliability\r?\n\r?\npermissions:'
+    'isolated Linux lane' = '(?m)^    if: inputs\.lane == ''linux''\r?$'
     'single trigger declaration' = '(?m)^on:\r?$'
     'read-only repository permission' = '(?ms)^permissions:\r?\n  contents: read\r?\n\r?\nconcurrency:'
     'pinned hosted baseline' = '(?m)^    runs-on: ubuntu-24\.04\r?$'

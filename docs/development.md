@@ -21,7 +21,12 @@ cargo test --locked --workspace --all-targets --all-features
 cargo test --locked --workspace --all-features --doc
 ```
 
-Core CI validates Rust code on the dedicated self-hosted Windows `core` runner. It remains non-privileged with respect to VM lifecycle. Real provider acceptance must use a different, explicitly isolated runner/host that exposes Hyper-V, KVM, HVF, or WHPX.
+Core CI observes Rust code on the dedicated self-hosted Windows `core` runner,
+while the manual GitHub-hosted Windows lane supplies disposable repository
+correctness evidence. Both remain non-privileged with respect to VM lifecycle.
+Real provider acceptance must use a different, explicitly isolated runner/host
+that exposes Hyper-V, KVM, HVF, or WHPX. See
+`docs/adr/0016-disposable-correctness-and-windows-performance-evidence.md`.
 
 ## Branch and integration policy
 
@@ -80,7 +85,11 @@ repository-local portability suite. It does not install Rust, QEMU, KVM
 components, packages, or change `/dev/kvm` permissions. WSL2 output is useful
 development evidence but is never recorded as real Linux host acceptance.
 
-The `Linux Validation` workflow provides the canonical repository Linux lane.
+The `Repository Validation` workflow provides the canonical manual exact-source
+dispatcher and repository Linux lane. Its required lane selector runs exactly
+one of Linux correctness, Windows correctness, or Linux R3 per dispatch. The
+Windows and R3 choices invoke same-commit reusable workflows because GitHub only
+registers a new `workflow_dispatch` file after it exists on the default branch.
 It is manual `workflow_dispatch` only, accepts one exact lowercase 40-hex
 repository commit, and checks out and proves that SHA on the declared
 GitHub-hosted `ubuntu-24.04` x86_64 baseline. The ephemeral job installs exactly
@@ -125,6 +134,21 @@ timing remains best-effort diagnostic evidence, never a gate result. It never
 records commands, paths, runner identity, process data, environment values, logs,
 or error text. Those markers cannot classify a product failure, authorize
 recovery, replace an exact-head gate, or promote support.
+
+`Windows Validation` is the disposable repository-correctness counterpart. The
+manual dispatcher passes one exact lowercase 40-hex repository commit to a
+same-commit reusable workflow on GitHub's stable standard `windows-2025` x64
+image. The job uses `contents: read`, a pinned checkout with credential
+persistence disabled, no secrets, OIDC, cache, artifact upload, environment, or
+automatic trigger. It installs exactly Rust 1.85.0 into ephemeral runner state,
+keeps Cargo output outside the checkout, and proves the source/package/MSRV
+binding before locked check, Clippy, full tests, doc-tests, and the portable
+Windows package contract. Its separately bounded 45-minute cold-VM timeout does
+not alter the self-hosted R4 30-minute performance contract. The sanitized
+summary receipt explicitly denies R4 runner-health, real-platform acceptance,
+and support-promotion meaning. A hosted pass may establish repository
+correctness; it cannot establish Hyper-V, WHPX, provider, guest, or shared-host
+health.
 
 ## Provider safety rule
 

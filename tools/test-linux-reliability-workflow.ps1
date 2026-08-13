@@ -22,7 +22,7 @@ function Assert-LinuxReliabilityContract {
   )
 
   $requiredWorkflow = [ordered]@{
-    'dispatch-only trigger' = '(?ms)^on:\r?\n  workflow_dispatch:\r?\n    inputs:\r?\n      source_sha:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        type: string\r?\n\r?\npermissions:'
+    'manual and same-commit reusable triggers' = '(?ms)^on:\r?\n  workflow_dispatch:\r?\n    inputs:\r?\n      source_sha:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        type: string\r?\n  workflow_call:\r?\n    inputs:\r?\n      source_sha:\r?\n        description: [^\r\n]+\r?\n        required: true\r?\n        type: string\r?\n\r?\npermissions:'
     'read-only repository permission' = '(?ms)^permissions:\r?\n  contents: read\r?\n\r?\nconcurrency:'
     'pinned hosted baseline' = '(?m)^    runs-on: ubuntu-24\.04\r?$'
     'canonical repository manual-job admission' = '(?m)^    if: github\.repository == ''JerrySkywalker/vm-cell-manager'' && github\.event_name == ''workflow_dispatch''\r?$'
