@@ -1,10 +1,15 @@
 pub mod protocol;
 
+#[cfg(target_os = "windows")]
+mod windows_job;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(target_os = "windows"))]
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +26,8 @@ use crate::providers::{
     ProviderProbeStatus, ProviderVm, ProviderVmIdentity, QemuDefinition, VmLookup,
 };
 
-const QEMU_CONFIG_SCHEMA: u32 = 1;
+const QEMU_CONFIG_SCHEMA: u32 = 2;
+const QEMU_LEGACY_CONFIG_SCHEMA: u32 = 1;
 const QEMU_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -86,11 +92,14 @@ pub struct QemuCommandOutput {
     pub stderr: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct QemuSpawnReceipt {
     pub process_id: u32,
     pub process_start_token: u64,
     pub executable_sha256: String,
+    pub command_sha256: String,
+    #[cfg(target_os = "windows")]
+    prepared: Option<windows_job::PreparedQemuProcess>,
 }
 
 pub trait QemuCommandExecutor: Send + Sync {
@@ -106,7 +115,11 @@ pub trait QemuCommandExecutor: Send + Sync {
         &self,
         program: &OsStr,
         args: &[OsString],
+        job_name: Option<&str>,
+        command_sha256: &str,
     ) -> Result<QemuSpawnReceipt, ProviderError>;
+
+    fn activate_vm(&self, receipt: &mut QemuSpawnReceipt) -> Result<(), ProviderError>;
 
     fn process_matches(
         &self,
@@ -115,11 +128,20 @@ pub trait QemuCommandExecutor: Send + Sync {
         program: &OsStr,
         command_sha256: &str,
         executable_sha256: &str,
+        job_name: Option<&str>,
     ) -> bool;
 
     fn process_absence_proven(&self, process_id: u32, start_token: u64) -> bool;
 
-    fn process_group_absence_proven(&self, process_group_id: u32) -> bool;
+    fn process_tree_absence_proven(
+        &self,
+        process: Option<(u32, u64)>,
+        job_name: Option<&str>,
+    ) -> bool;
+
+    fn process_tree_owned_nonempty(&self, job_name: Option<&str>) -> bool;
+
+    fn terminate_process_tree(&self, job_name: Option<&str>) -> Result<(), ProviderError>;
 
     fn connect_qmp(
         &self,
@@ -153,47 +175,104 @@ impl QemuCommandExecutor for SystemQemuExecutor {
         &self,
         program: &OsStr,
         args: &[OsString],
+        job_name: Option<&str>,
+        command_sha256: &str,
     ) -> Result<QemuSpawnReceipt, ProviderError> {
-        let executable_sha256 = ordinary_file_sha256(Path::new(program))?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        configure_detached_process(&mut command);
-        let mut child = command
-            .spawn()
-            .map_err(|error| ProviderError::Command(format!("failed to start QEMU: {error}")))?;
-        let process_id = child.id();
-        let Some(process_start_token) = process_start_token(process_id).filter(|token| *token != 0)
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ProviderError::Command(
-                "QEMU process start identity was unavailable".to_owned(),
-            ));
-        };
-        if !process_matches(
-            process_id,
-            process_start_token,
-            program,
-            &argument_digest(args),
-            &executable_sha256,
-        ) {
-            let _ = child.kill();
-            let _ = child.wait();
+        if argument_digest(args) != command_sha256 {
             return Err(ProviderError::OwnershipChanged(
-                "spawned QEMU process identity did not match its executable and start instance"
-                    .to_owned(),
+                "QEMU launch arguments did not match the durable launch digest".to_owned(),
             ));
         }
-        start_process_reaper(child)?;
-        Ok(QemuSpawnReceipt {
-            process_id,
-            process_start_token,
-            executable_sha256,
-        })
+        #[cfg(target_os = "windows")]
+        {
+            let (pinned_executable, executable_sha256) =
+                pinned_ordinary_file_sha256(Path::new(program))?;
+            let job_name = job_name.ok_or_else(|| {
+                ProviderError::OwnershipChanged(
+                    "Windows QEMU launch requires a durable Job Object identity".to_owned(),
+                )
+            })?;
+            let prepared = windows_job::prepare_qemu_process(
+                program,
+                args,
+                job_name,
+                &executable_sha256,
+                &pinned_executable,
+                command_sha256,
+            )?;
+            Ok(QemuSpawnReceipt {
+                process_id: prepared.process_id(),
+                process_start_token: prepared.process_start_token(),
+                executable_sha256,
+                command_sha256: prepared.command_sha256().to_owned(),
+                prepared: Some(prepared),
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = job_name;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let executable_sha256 = ordinary_file_sha256(Path::new(program))?;
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_detached_process(&mut command);
+            let mut child = command.spawn().map_err(|error| {
+                ProviderError::Command(format!("failed to start QEMU: {error}"))
+            })?;
+            let process_id = child.id();
+            let Some(process_start_token) =
+                process_start_token(process_id).filter(|token| *token != 0)
+            else {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProviderError::Command(
+                    "QEMU process start identity was unavailable".to_owned(),
+                ));
+            };
+            if !process_matches(
+                process_id,
+                process_start_token,
+                program,
+                &argument_digest(args),
+                &executable_sha256,
+                None,
+            ) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProviderError::OwnershipChanged(
+                    "spawned QEMU process identity did not match its executable and start instance"
+                        .to_owned(),
+                ));
+            }
+            start_process_reaper(child)?;
+            Ok(QemuSpawnReceipt {
+                process_id,
+                process_start_token,
+                executable_sha256,
+                command_sha256: command_sha256.to_owned(),
+            })
+        }
+    }
+
+    fn activate_vm(&self, receipt: &mut QemuSpawnReceipt) -> Result<(), ProviderError> {
+        #[cfg(target_os = "windows")]
+        {
+            let prepared = receipt.prepared.take().ok_or_else(|| {
+                ProviderError::OwnershipChanged(
+                    "Windows QEMU launch activation receipt was unavailable".to_owned(),
+                )
+            })?;
+            prepared.activate()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = receipt;
+            Ok(())
+        }
     }
 
     fn process_matches(
@@ -203,6 +282,7 @@ impl QemuCommandExecutor for SystemQemuExecutor {
         program: &OsStr,
         command_sha256: &str,
         executable_sha256: &str,
+        job_name: Option<&str>,
     ) -> bool {
         process_matches(
             process_id,
@@ -210,6 +290,7 @@ impl QemuCommandExecutor for SystemQemuExecutor {
             program,
             command_sha256,
             executable_sha256,
+            job_name,
         )
     }
 
@@ -217,8 +298,44 @@ impl QemuCommandExecutor for SystemQemuExecutor {
         process_absence_proven(process_id, start_token)
     }
 
-    fn process_group_absence_proven(&self, process_group_id: u32) -> bool {
-        process_group_absence_proven(process_group_id)
+    fn process_tree_absence_proven(
+        &self,
+        process: Option<(u32, u64)>,
+        job_name: Option<&str>,
+    ) -> bool {
+        process_tree_absence_proven(process, job_name)
+    }
+
+    fn process_tree_owned_nonempty(&self, job_name: Option<&str>) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            job_name.is_some_and(windows_job::job_is_exact_nonempty)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = job_name;
+            false
+        }
+    }
+
+    fn terminate_process_tree(&self, job_name: Option<&str>) -> Result<(), ProviderError> {
+        #[cfg(target_os = "windows")]
+        {
+            let job_name = job_name.ok_or_else(|| {
+                ProviderError::OwnershipChanged(
+                    "Windows QEMU termination requires an exact Job Object receipt".to_owned(),
+                )
+            })?;
+            windows_job::terminate_exact_job(job_name)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = job_name;
+            Err(ProviderError::OwnershipChanged(
+                "QEMU process-tree termination is unavailable without an exact Job receipt"
+                    .to_owned(),
+            ))
+        }
     }
 
     fn connect_qmp(
@@ -379,8 +496,16 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
 
     fn inspect_config(&self, config: &QemuVmConfig) -> Result<ProviderVm, ProviderError> {
         if config.spawn_pending {
+            if self
+                .executor
+                .process_tree_absence_proven(None, config.process_job_name.as_deref())
+            {
+                ensure_control_endpoints_absent(config)?;
+                return Ok(config.snapshot(ProviderPowerState::Off));
+            }
             return Err(ProviderError::OwnershipChanged(
-                "QEMU launch may have started before its process receipt was persisted".to_owned(),
+                "QEMU launch may have started and its exact contained tree is not proven empty"
+                    .to_owned(),
             ));
         }
 
@@ -400,19 +525,30 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             &self.system_binary,
             &config.command_sha256,
             executable_sha256,
+            config.process_job_name.as_deref(),
         ) {
             if !self.executor.process_absence_proven(pid, token) {
                 return Err(ProviderError::OwnershipChanged(
                     "recorded QEMU process absence cannot be proven".to_owned(),
                 ));
             }
-            if !self.executor.process_group_absence_proven(pid) {
-                return Err(ProviderError::OwnershipChanged(
-                    "recorded QEMU process group is not empty".to_owned(),
-                ));
+            if self
+                .executor
+                .process_tree_absence_proven(Some((pid, token)), config.process_job_name.as_deref())
+            {
+                ensure_control_endpoints_absent(config)?;
+                return Ok(config.snapshot(ProviderPowerState::Off));
             }
-            ensure_control_endpoints_absent(config)?;
-            return Ok(config.snapshot(ProviderPowerState::Off));
+            if self
+                .executor
+                .process_tree_owned_nonempty(config.process_job_name.as_deref())
+            {
+                return Ok(config.snapshot(ProviderPowerState::Running));
+            }
+            return Err(ProviderError::OwnershipChanged(
+                "recorded QEMU process tree is not provably empty or exact-owned nonempty"
+                    .to_owned(),
+            ));
         }
 
         let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
@@ -473,6 +609,7 @@ impl<E: QemuCommandExecutor> QemuProvider<E> {
             &self.system_binary,
             &config.command_sha256,
             executable_sha256,
+            config.process_job_name.as_deref(),
         ) {
             return Err(ProviderError::OwnershipChanged(
                 "QEMU process identity drifted from its durable receipt".to_owned(),
@@ -805,6 +942,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             process_id: None,
             process_start_token: None,
             process_executable_sha256: None,
+            process_job_name: None,
         };
         config.command_sha256 = launch_digest(&config);
         config.validate(&config_path)?;
@@ -880,10 +1018,41 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         }
         if expected.power_state == ProviderPowerState::Off {
             ensure_control_endpoints_absent(&config)?;
+            if config.spawn_pending {
+                if !self
+                    .executor
+                    .process_tree_absence_proven(None, config.process_job_name.as_deref())
+                {
+                    return Err(ProviderError::OwnershipChanged(
+                        "prior QEMU launch intent is not proven empty".to_owned(),
+                    ));
+                }
+            } else if let Some((pid, token)) = config.process_id.zip(config.process_start_token) {
+                if !self.executor.process_absence_proven(pid, token)
+                    || !self.executor.process_tree_absence_proven(
+                        Some((pid, token)),
+                        config.process_job_name.as_deref(),
+                    )
+                {
+                    return Err(ProviderError::OwnershipChanged(
+                        "prior QEMU launch receipt is not proven empty".to_owned(),
+                    ));
+                }
+            }
+            config.schema_version = QEMU_CONFIG_SCHEMA;
+            config.process_id = None;
+            config.process_start_token = None;
+            config.process_executable_sha256 = None;
+            config.process_job_name = new_qemu_job_name();
             config.spawn_pending = true;
             replace_config(&path, snapshot, &config)?;
             let args = launch_args(&config);
-            let receipt = self.executor.spawn_vm(&self.system_binary, &args)?;
+            let mut receipt = self.executor.spawn_vm(
+                &self.system_binary,
+                &args,
+                config.process_job_name.as_deref(),
+                &config.command_sha256,
+            )?;
             let snapshot = read_config_snapshot(&path, QemuFileSharePolicy::DenyWriteAndDelete)?;
             if snapshot.bytes_sha256 != qemu_config_bytes_sha256(&encode_qemu_config(&config)?) {
                 return Err(ProviderError::OwnershipChanged(
@@ -892,9 +1061,16 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
             }
             config.process_id = Some(receipt.process_id);
             config.process_start_token = Some(receipt.process_start_token);
-            config.process_executable_sha256 = Some(receipt.executable_sha256);
+            if receipt.command_sha256 != config.command_sha256 {
+                return Err(ProviderError::OwnershipChanged(
+                    "QEMU suspended launch receipt drifted from the durable launch digest"
+                        .to_owned(),
+                ));
+            }
+            config.process_executable_sha256 = Some(receipt.executable_sha256.clone());
             config.spawn_pending = false;
             replace_config(&path, snapshot, &config)?;
+            self.executor.activate_vm(&mut receipt)?;
         } else if expected.power_state != ProviderPowerState::Paused {
             return Err(ProviderError::OwnershipChanged(
                 "QEMU start expected an off or prelaunch VM".to_owned(),
@@ -926,14 +1102,42 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let mut config = snapshot.config.clone();
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
-        let (process_id, process_start_token) = self.validate_live_process_receipt(&config)?;
-        let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
-        let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
-        let mut qmp = QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
-        validate_qmp_identity(&mut qmp, &config)?;
-        qmp.execute("quit", None)?;
-        let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
-        while std::time::Instant::now() < deadline {
+        let (process_id, process_start_token) = config
+            .process_id
+            .zip(config.process_start_token)
+            .ok_or_else(|| {
+            ProviderError::OwnershipChanged(
+                "QEMU stop requires a complete process receipt".to_owned(),
+            )
+        })?;
+        let recovering_exact_tree = match self.validate_live_process_receipt(&config) {
+            Ok(_) => false,
+            Err(_)
+                if self
+                    .executor
+                    .process_absence_proven(process_id, process_start_token)
+                    && self
+                        .executor
+                        .process_tree_owned_nonempty(config.process_job_name.as_deref()) =>
+            {
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        if !recovering_exact_tree {
+            let qmp_deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+            let stream = self.executor.connect_qmp(&config.qmp, CONTROL_TIMEOUT)?;
+            let mut qmp = QmpClient::negotiate(stream, remaining_provider_duration(qmp_deadline)?)?;
+            validate_qmp_identity(&mut qmp, &config)?;
+            qmp.execute("quit", None)?;
+        }
+        let mut deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+        let mut forced_exact_job_cleanup = recovering_exact_tree;
+        if recovering_exact_tree {
+            self.executor
+                .terminate_process_tree(config.process_job_name.as_deref())?;
+        }
+        loop {
             let endpoint_absent = self
                 .executor
                 .connect_qmp(&config.qmp, Duration::from_millis(25))
@@ -943,24 +1147,45 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                     .executor
                     .process_absence_proven(process_id, process_start_token)
             {
-                if !self.executor.process_group_absence_proven(process_id) {
+                if self.executor.process_tree_absence_proven(
+                    Some((process_id, process_start_token)),
+                    config.process_job_name.as_deref(),
+                ) {
+                    ensure_control_endpoints_absent(&config)?;
+                    config.process_id = None;
+                    config.process_start_token = None;
+                    config.process_executable_sha256 = None;
+                    config.process_job_name = None;
+                    config.spawn_pending = false;
+                    replace_config(&path, snapshot, &config)?;
+                    return Ok(());
+                }
+                if config.process_job_name.is_none() || forced_exact_job_cleanup {
                     return Err(ProviderError::OwnershipChanged(
-                        "QEMU leader exited while its owned process group remained live".to_owned(),
+                        "QEMU leader exited while its exact owned process tree remained live"
+                            .to_owned(),
                     ));
                 }
-                ensure_control_endpoints_absent(&config)?;
-                config.process_id = None;
-                config.process_start_token = None;
-                config.process_executable_sha256 = None;
-                config.spawn_pending = false;
-                replace_config(&path, snapshot, &config)?;
-                return Ok(());
+                self.executor
+                    .terminate_process_tree(config.process_job_name.as_deref())?;
+                forced_exact_job_cleanup = true;
+                deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                if config.process_job_name.is_some() && !forced_exact_job_cleanup {
+                    self.executor
+                        .terminate_process_tree(config.process_job_name.as_deref())?;
+                    forced_exact_job_cleanup = true;
+                    deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+                    continue;
+                }
+                return Err(ProviderError::Timeout(
+                    "QEMU did not terminate within the bounded stop window".to_owned(),
+                ));
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        Err(ProviderError::Timeout(
-            "QEMU did not terminate within the bounded stop window".to_owned(),
-        ))
     }
 
     fn remove_vm(
@@ -979,9 +1204,13 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
         let config = snapshot.config.clone();
         authorize_config(authority, &config, true)?;
         validate_config_snapshot(&config, expected, true)?;
-        if config.spawn_pending {
+        if config.spawn_pending
+            && !self
+                .executor
+                .process_tree_absence_proven(None, config.process_job_name.as_deref())
+        {
             return Err(ProviderError::OwnershipChanged(
-                "QEMU launch intent has no durable process receipt".to_owned(),
+                "QEMU launch intent has no durable empty-tree proof".to_owned(),
             ));
         }
         if self
@@ -1000,6 +1229,7 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                 &self.system_binary,
                 &config.command_sha256,
                 config.process_executable_sha256.as_deref().unwrap_or(""),
+                config.process_job_name.as_deref(),
             ) {
                 return Err(ProviderError::OwnershipChanged(
                     "QEMU process is still live".to_owned(),
@@ -1010,9 +1240,12 @@ impl<E: QemuCommandExecutor> LocalVmProvider for QemuProvider<E> {
                     "QEMU process absence cannot be proven".to_owned(),
                 ));
             }
-            if !self.executor.process_group_absence_proven(pid) {
+            if !self
+                .executor
+                .process_tree_absence_proven(Some((pid, token)), config.process_job_name.as_deref())
+            {
                 return Err(ProviderError::OwnershipChanged(
-                    "QEMU process group is still live".to_owned(),
+                    "QEMU process tree is still live or unprovable".to_owned(),
                 ));
             }
         }
@@ -1049,6 +1282,8 @@ struct QemuVmConfig {
     process_start_token: Option<u64>,
     #[serde(default)]
     process_executable_sha256: Option<String>,
+    #[serde(default)]
+    process_job_name: Option<String>,
 }
 
 struct QemuConfigSnapshot {
@@ -1064,8 +1299,10 @@ struct QemuConfigWrite {
 
 impl QemuVmConfig {
     fn validate(&self, path: &Path) -> Result<(), ProviderError> {
-        if self.schema_version != QEMU_CONFIG_SCHEMA
-            || Uuid::parse_str(&self.id).is_err()
+        if !matches!(
+            self.schema_version,
+            QEMU_LEGACY_CONFIG_SCHEMA | QEMU_CONFIG_SCHEMA
+        ) || Uuid::parse_str(&self.id).is_err()
             || self.name != format!("vmcell-{}", self.id)
             || !Self::config_path_matches(path, &self.configuration_path)
             || self.overlay_path.parent() != self.configuration_path.parent()
@@ -1082,6 +1319,8 @@ impl QemuVmConfig {
             || self.command_sha256 != launch_digest(self)
             || self.process_id.is_some() != self.process_start_token.is_some()
             || self.process_id.is_some() != self.process_executable_sha256.is_some()
+            || (self.schema_version == QEMU_LEGACY_CONFIG_SCHEMA && self.process_job_name.is_some())
+            || !qemu_job_receipt_is_valid(self)
             || self.process_start_token == Some(0)
             || self
                 .process_executable_sha256
@@ -1114,6 +1353,37 @@ impl QemuVmConfig {
             memory_mib: self.memory_mib,
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn new_qemu_job_name() -> Option<String> {
+    Some(format!(r"Local\vmcell-qemu-{}", Uuid::new_v4()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn new_qemu_job_name() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn qemu_job_receipt_is_valid(config: &QemuVmConfig) -> bool {
+    if config.schema_version == QEMU_LEGACY_CONFIG_SCHEMA {
+        return config.process_job_name.is_none();
+    }
+    let needs_job = config.spawn_pending || config.process_id.is_some();
+    if config.process_job_name.is_some() != needs_job {
+        return false;
+    }
+    config.process_job_name.as_deref().is_none_or(|name| {
+        name.strip_prefix(r"Local\vmcell-qemu-")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_some()
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn qemu_job_receipt_is_valid(config: &QemuVmConfig) -> bool {
+    config.process_job_name.is_none()
 }
 
 #[derive(Deserialize)]
@@ -1975,6 +2245,39 @@ fn ordinary_file_sha256(path: &Path) -> Result<String, ProviderError> {
     opened_file_sha256(&mut file)
 }
 
+#[cfg(target_os = "windows")]
+fn pinned_ordinary_file_sha256(path: &Path) -> Result<(File, String), ProviderError> {
+    ensure_existing_qemu_ancestors_are_ordinary(path)?;
+    let requested_metadata = fs::symlink_metadata(path).map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable identity was unavailable".to_owned())
+    })?;
+    if !metadata_is_ordinary_file(&requested_metadata) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU executable is not an ordinary file".to_owned(),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable path could not be resolved".to_owned())
+    })?;
+    ensure_existing_qemu_ancestors_are_ordinary(&canonical)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_qemu_file_options(&mut options, false, QemuFileSharePolicy::DenyWriteAndDelete);
+    let mut file = options.open(&canonical).map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable could not be pinned".to_owned())
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        ProviderError::OwnershipChanged("QEMU executable identity was unavailable".to_owned())
+    })?;
+    if !metadata_is_ordinary_file(&metadata) {
+        return Err(ProviderError::OwnershipChanged(
+            "QEMU executable is not an ordinary file".to_owned(),
+        ));
+    }
+    let sha256 = opened_file_sha256(&mut file)?;
+    Ok((file, sha256))
+}
+
 fn opened_file_sha256(file: &mut File) -> Result<String, ProviderError> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -2229,6 +2532,7 @@ fn configure_detached_process(command: &mut Command) {
     command.process_group(0);
 }
 
+#[cfg(not(target_os = "windows"))]
 fn start_process_reaper(child: std::process::Child) -> Result<(), ProviderError> {
     let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
     let waiter = std::sync::Arc::clone(&shared);
@@ -2252,12 +2556,6 @@ fn start_process_reaper(child: std::process::Child) -> Result<(), ProviderError>
             ))
         }
     }
-}
-
-#[cfg(target_os = "windows")]
-fn configure_detached_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(0x0000_0200 | 0x0800_0000);
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -2285,7 +2583,7 @@ fn process_group_id(process_id: u32) -> Option<u32> {
         .ok()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", test))]
 fn process_start_token(process_id: u32) -> Option<u64> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
@@ -2328,10 +2626,12 @@ fn process_matches(
     program: &OsStr,
     command_sha256: &str,
     executable_sha256: &str,
+    job_name: Option<&str>,
 ) -> bool {
     use std::os::unix::ffi::OsStringExt;
 
-    if process_start_token(process_id) != Some(start_token)
+    if job_name.is_some()
+        || process_start_token(process_id) != Some(start_token)
         || process_group_id(process_id) != Some(process_id)
     {
         return false;
@@ -2390,15 +2690,6 @@ fn process_absence_proven(process_id: u32, start_token: u64) -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn process_group_absence_proven(_process_group_id: u32) -> bool {
-    // CREATE_NEW_PROCESS_GROUP is a console-control boundary, not a durable
-    // descendant-containment receipt. Until QEMU launches atomically inside a
-    // persisted Windows Job Object, cleanup must retain an exited leader rather
-    // than asserting that no descendant can still hold its runtime resources.
-    false
-}
-
 #[cfg(target_os = "linux")]
 fn process_group_absence_proven(process_group_id: u32) -> bool {
     if process_group_id == 0 {
@@ -2445,8 +2736,9 @@ fn process_matches(
     process_id: u32,
     start_token: u64,
     program: &OsStr,
-    command_sha256: &str,
+    _command_sha256: &str,
     executable_sha256: &str,
+    job_name: Option<&str>,
 ) -> bool {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
@@ -2455,7 +2747,9 @@ fn process_matches(
         WaitForSingleObject,
     };
 
-    let _ = command_sha256;
+    let Some(job_name) = job_name else {
+        return false;
+    };
     unsafe {
         let handle = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000,
@@ -2470,8 +2764,9 @@ fn process_matches(
         let image_ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) != 0;
         let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
         let token_matches = process_start_token_from_handle(handle) == Some(start_token);
+        let job_matches = windows_job::process_is_in_job(handle, job_name);
         CloseHandle(handle);
-        if !image_ok || !alive || !token_matches {
+        if !image_ok || !alive || !token_matches || !job_matches {
             return false;
         }
         buffer.truncate(length as usize);
@@ -2572,6 +2867,7 @@ fn process_matches(
     _program: &OsStr,
     _command_sha256: &str,
     _executable_sha256: &str,
+    _job_name: Option<&str>,
 ) -> bool {
     false
 }
@@ -2581,8 +2877,27 @@ fn process_absence_proven(_process_id: u32, _start_token: u64) -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
+fn process_tree_absence_proven(process: Option<(u32, u64)>, job_name: Option<&str>) -> bool {
+    let Some(job_name) = job_name else {
+        return false;
+    };
+    if process.is_some_and(|(pid, token)| !process_absence_proven(pid, token)) {
+        return false;
+    }
+    windows_job::job_is_empty_or_missing(job_name)
+}
+
+#[cfg(target_os = "linux")]
+fn process_tree_absence_proven(process: Option<(u32, u64)>, job_name: Option<&str>) -> bool {
+    let Some((process_id, _)) = process else {
+        return false;
+    };
+    job_name.is_none() && process_group_absence_proven(process_id)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn process_group_absence_proven(_process_group_id: u32) -> bool {
+fn process_tree_absence_proven(_process: Option<(u32, u64)>, _job_name: Option<&str>) -> bool {
     false
 }
 
@@ -2643,6 +2958,8 @@ mod tests {
         process_matches: AtomicBool,
         process_absence_proven: AtomicBool,
         process_group_absence_proven: AtomicBool,
+        process_tree_owned_nonempty: AtomicBool,
+        terminate_process_tree_succeeds: AtomicBool,
     }
 
     type QemuConfigDrift = (&'static str, fn(&mut QemuVmConfig));
@@ -2658,6 +2975,8 @@ mod tests {
                 process_matches: AtomicBool::new(true),
                 process_absence_proven: AtomicBool::new(true),
                 process_group_absence_proven: AtomicBool::new(true),
+                process_tree_owned_nonempty: AtomicBool::new(false),
+                terminate_process_tree_succeeds: AtomicBool::new(false),
             }
         }
     }
@@ -2668,10 +2987,12 @@ mod tests {
         program: &OsStr,
         command_sha256: &str,
         executable_sha256: &str,
+        job_name: Option<&str>,
     ) -> String {
         format!(
-            "process_receipt pid={process_id} start_token={start_token} program={} command_sha256={command_sha256} executable_sha256={executable_sha256}",
-            program.to_string_lossy()
+            "process_receipt pid={process_id} start_token={start_token} program={} command_sha256={command_sha256} executable_sha256={executable_sha256} job_name={}",
+            program.to_string_lossy(),
+            job_name.unwrap_or("none")
         )
     }
 
@@ -2729,12 +3050,25 @@ mod tests {
             &self,
             _program: &OsStr,
             _args: &[OsString],
+            job_name: Option<&str>,
+            command_sha256: &str,
         ) -> Result<QemuSpawnReceipt, ProviderError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("spawn_vm job_name={}", job_name.unwrap_or("none")));
             Ok(QemuSpawnReceipt {
                 process_id: 4242,
                 process_start_token: 7,
                 executable_sha256: "a".repeat(64),
+                command_sha256: command_sha256.to_owned(),
+                #[cfg(target_os = "windows")]
+                prepared: None,
             })
+        }
+        fn activate_vm(&self, _receipt: &mut QemuSpawnReceipt) -> Result<(), ProviderError> {
+            self.calls.lock().unwrap().push("activate_vm".to_owned());
+            Ok(())
         }
         fn process_matches(
             &self,
@@ -2743,6 +3077,7 @@ mod tests {
             program: &OsStr,
             command_sha256: &str,
             executable_sha256: &str,
+            job_name: Option<&str>,
         ) -> bool {
             let mut calls = self.calls.lock().unwrap();
             calls.push("process_matches".to_owned());
@@ -2752,6 +3087,7 @@ mod tests {
                 program,
                 command_sha256,
                 executable_sha256,
+                job_name,
             ));
             self.process_matches.load(Ordering::SeqCst)
         }
@@ -2762,12 +3098,37 @@ mod tests {
                 .push("process_absence_proven".to_owned());
             self.process_absence_proven.load(Ordering::SeqCst)
         }
-        fn process_group_absence_proven(&self, _process_group_id: u32) -> bool {
+        fn process_tree_absence_proven(
+            &self,
+            _process: Option<(u32, u64)>,
+            _job_name: Option<&str>,
+        ) -> bool {
             self.calls
                 .lock()
                 .unwrap()
-                .push("process_group_absence_proven".to_owned());
+                .push("process_tree_absence_proven".to_owned());
             self.process_group_absence_proven.load(Ordering::SeqCst)
+        }
+        fn process_tree_owned_nonempty(&self, _job_name: Option<&str>) -> bool {
+            self.process_tree_owned_nonempty.load(Ordering::SeqCst)
+        }
+        fn terminate_process_tree(&self, _job_name: Option<&str>) -> Result<(), ProviderError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("terminate_process_tree".to_owned());
+            if !self.terminate_process_tree_succeeds.load(Ordering::SeqCst) {
+                return Err(ProviderError::OwnershipChanged(
+                    "scripted exact Job termination refusal".to_owned(),
+                ));
+            }
+            self.process_matches.store(false, Ordering::SeqCst);
+            self.process_absence_proven.store(true, Ordering::SeqCst);
+            self.process_group_absence_proven
+                .store(true, Ordering::SeqCst);
+            self.process_tree_owned_nonempty
+                .store(false, Ordering::SeqCst);
+            Ok(())
         }
         fn connect_qmp(
             &self,
@@ -3126,6 +3487,7 @@ mod tests {
             process_id: None,
             process_start_token: None,
             process_executable_sha256: None,
+            process_job_name: None,
         };
         config.command_sha256 = launch_digest(&config);
         assert!(control_endpoint_is_safe(&config.qmp));
@@ -3200,6 +3562,7 @@ mod tests {
             process_id: None,
             process_start_token: None,
             process_executable_sha256: None,
+            process_job_name: None,
         };
         let args = launch_args(&config);
         let rendered = args
@@ -3285,6 +3648,21 @@ mod tests {
         .unwrap();
         assert_eq!(persisted.process_id, Some(4242));
         assert_eq!(persisted.process_executable_sha256, Some("a".repeat(64)));
+        #[cfg(target_os = "windows")]
+        assert!(persisted.process_job_name.is_some());
+        #[cfg(not(target_os = "windows"))]
+        assert!(persisted.process_job_name.is_none());
+        let start_calls = provider.executor.calls.lock().unwrap();
+        let spawn_index = start_calls
+            .iter()
+            .position(|call| call.starts_with("spawn_vm job_name="))
+            .unwrap();
+        let activate_index = start_calls
+            .iter()
+            .position(|call| call == "activate_vm")
+            .unwrap();
+        assert!(spawn_index < activate_index);
+        drop(start_calls);
         provider
             .executor
             .process_matches
@@ -3293,6 +3671,21 @@ mod tests {
             .executor
             .process_group_absence_proven
             .store(false, Ordering::SeqCst);
+        #[cfg(target_os = "windows")]
+        provider
+            .executor
+            .process_tree_owned_nonempty
+            .store(true, Ordering::SeqCst);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            provider
+                .inspect_vm(&VmLookup::Id(configured.id.clone()))
+                .unwrap()
+                .unwrap()
+                .power_state,
+            ProviderPowerState::Running
+        );
+        #[cfg(not(target_os = "windows"))]
         assert!(matches!(
             provider.inspect_vm(&VmLookup::Id(configured.id.clone())),
             Err(ProviderError::OwnershipChanged(_))
@@ -3308,6 +3701,10 @@ mod tests {
             .executor
             .process_group_absence_proven
             .store(true, Ordering::SeqCst);
+        provider
+            .executor
+            .process_tree_owned_nonempty
+            .store(false, Ordering::SeqCst);
         provider
             .executor
             .qmp_sessions
@@ -3404,17 +3801,49 @@ mod tests {
             .process_id,
             Some(4242)
         );
-        provider
-            .executor
-            .process_group_absence_proven
-            .store(true, Ordering::SeqCst);
-        provider
-            .executor
-            .qmp_sessions
-            .lock()
-            .unwrap()
-            .push_back(qmp_stop_session(&running));
+        #[cfg(target_os = "windows")]
+        {
+            provider
+                .executor
+                .terminate_process_tree_succeeds
+                .store(true, Ordering::SeqCst);
+            provider
+                .executor
+                .process_matches
+                .store(false, Ordering::SeqCst);
+            provider
+                .executor
+                .process_tree_owned_nonempty
+                .store(true, Ordering::SeqCst);
+            assert!(provider.executor.qmp_sessions.lock().unwrap().is_empty());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            provider
+                .executor
+                .process_group_absence_proven
+                .store(true, Ordering::SeqCst);
+            provider
+                .executor
+                .qmp_sessions
+                .lock()
+                .unwrap()
+                .push_back(qmp_stop_session(&running));
+        }
         provider.stop_vm(&authority, &running).unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            assert!(provider.executor.qmp_sessions.lock().unwrap().is_empty());
+            assert!(
+                provider
+                    .executor
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|call| call == "terminate_process_tree")
+            );
+        }
         assert!(
             provider
                 .executor
@@ -3587,6 +4016,7 @@ mod tests {
                 OsStr::new("qemu-system-test"),
                 &drifted.command_sha256,
                 drifted.process_executable_sha256.as_deref().unwrap(),
+                drifted.process_job_name.as_deref(),
             );
             let calls = provider.executor.calls.lock().unwrap();
             let traces = calls
@@ -3872,6 +4302,7 @@ mod tests {
             process_id: Some(42),
             process_start_token: Some(7),
             process_executable_sha256: Some("a".repeat(64)),
+            process_job_name: new_qemu_job_name(),
         };
         let valid = qmp_start_session(&config.snapshot(ProviderPowerState::Paused));
         let drifted = String::from_utf8(valid)
@@ -3916,6 +4347,7 @@ mod tests {
             process_id: None,
             process_start_token: None,
             process_executable_sha256: None,
+            process_job_name: None,
         };
         config.command_sha256 = launch_digest(&config);
         let path = configuration_path.join("vm.json");
@@ -4072,6 +4504,7 @@ mod tests {
             process_id: None,
             process_start_token: None,
             process_executable_sha256: None,
+            process_job_name: None,
         };
         config.command_sha256 = launch_digest(&config);
         let path = configuration_path.join("vm.json");
@@ -4089,10 +4522,12 @@ mod tests {
         config.process_executable_sha256 = Some("not-a-hash".to_owned());
         assert!(config.validate(&path).is_err());
         config.process_executable_sha256 = Some("b".repeat(64));
+        config.process_job_name = new_qemu_job_name();
         assert!(config.validate(&path).is_ok());
         config.process_id = None;
         config.process_start_token = None;
         config.process_executable_sha256 = None;
+        config.process_job_name = None;
         config.qmp = ControlEndpoint::WindowsPipe("foreign".to_owned());
         assert!(config.validate(&path).is_err());
         config.qmp = ControlEndpoint::qmp(&configuration_path, &id);
@@ -4101,6 +4536,8 @@ mod tests {
 
         config.command_sha256 = launch_digest(&config);
         config.spawn_pending = true;
+        config.process_job_name = new_qemu_job_name();
+        assert!(config.validate(&path).is_ok());
         let provider = QemuProvider::new(
             FakeExecutor {
                 accelerators: vec!["tcg".to_owned()],
@@ -4109,6 +4546,7 @@ mod tests {
                 backing: Some(config.parent_path.clone()),
                 qmp_sessions: Mutex::new(VecDeque::new()),
                 process_matches: AtomicBool::new(true),
+                process_group_absence_proven: AtomicBool::new(false),
                 ..FakeExecutor::default()
             },
             directory.path().to_path_buf(),
@@ -4146,8 +4584,14 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_process_group_receipt_is_fail_closed_without_job_containment() {
-        assert!(!process_group_absence_proven(std::process::id()));
+    fn windows_legacy_receipt_is_fail_closed_without_job_containment() {
+        assert!(!process_tree_absence_proven(
+            Some((
+                std::process::id(),
+                process_start_token(std::process::id()).unwrap()
+            )),
+            None,
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -4176,12 +4620,13 @@ mod tests {
         let process_id = std::process::id();
         let start_token = process_start_token(process_id).unwrap();
         let executable_sha256 = ordinary_file_sha256(&current).unwrap();
-        assert!(process_matches(
+        assert!(!process_matches(
             process_id,
             start_token,
             current.as_os_str(),
             "not-observable-on-windows",
             &executable_sha256,
+            None,
         ));
         assert!(!process_matches(
             process_id,
@@ -4189,6 +4634,7 @@ mod tests {
             current.as_os_str(),
             "not-observable-on-windows",
             &"0".repeat(64),
+            None,
         ));
         assert!(!process_matches(
             process_id,
@@ -4196,6 +4642,7 @@ mod tests {
             current.as_os_str(),
             "not-observable-on-windows",
             &executable_sha256,
+            None,
         ));
     }
 }

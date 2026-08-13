@@ -86,8 +86,10 @@ unknown guest effects stay nonterminal, retained, and nonreplayed. It never
 authorizes adoption, cleanup by name, automatic repair, or evidence promotion.
 On Windows, a QEMU leader exit, PID/start-token/executable match, or
 `CREATE_NEW_PROCESS_GROUP` membership does not prove descendant absence. Frozen
-v0.3/v0.4 WHPX candidates cannot receive R5 acceptance without an atomic
-Windows Job Object binding and empty-tree proof in a corrected source tree.
+v0.3/v0.4 WHPX candidates still lack the atomic Windows Job Object binding and empty-tree proof.
+Current corrected source supplies that repository mechanism,
+but it becomes R5 evidence only after a newly authorized exact-candidate run on
+a dedicated Windows host; no old receipt transfers.
 
 Real acceptance therefore requires an exclusive, ACL- or mode-enforced writer
 window and a private ordinary state/runtime root. A shared user identity or an

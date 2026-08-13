@@ -28,7 +28,7 @@ historical corrective candidates are not recommended.
 | --- | --- | --- | --- |
 | v0.1.0 | `32f4adad3881c5248c6c8c5d47982368b7b55799` | Windows/x86_64 Hyper-V + Windows guest + PowerShell Direct | retire exact candidate; correction rows S and A apply |
 | v0.2.0 | `ed2ed31ae2f0182fc1626321b81e86d09db378c2` | v0.1 tuple plus repeated session/image/state behavior | retire exact candidate; correction rows S and A apply |
-| v0.3.0 | `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Windows/x86_64 QEMU/WHPX + Linux guest + QGA | retire exact candidate; Q, S, and A apply; Job Object work remains missing |
+| v0.3.0 | `d0af04b2e84cf2226628173d2ed0d295aed01f2b` | Windows/x86_64 QEMU/WHPX + Linux guest + QGA | retire exact candidate; Q, S, and A apply; use current corrected Job Object work and obtain new exact-candidate R5 evidence |
 | v0.3.0 | same source | Linux/x86_64 QEMU/KVM + Linux guest + QGA | retire exact candidate; S and A apply; Windows-only Q row does not apply |
 | v0.4.0 | `c741be99ef4632b436f394f1c53b71ed57d0d2d9` | JobSpec/result overlay on an accepted v0.1/v0.3 tuple | retire exact candidate; S and A apply, plus Q when the base is Windows QEMU/WHPX |
 
@@ -36,7 +36,7 @@ historical corrective candidates are not recommended.
 
 | ID | Exact defect in frozen source | Exact correction SHA and dependency | Affected frozen candidates | Backport feasibility | Minimum corrected source tree |
 | --- | --- | --- | --- | --- | --- |
-| Q | Windows `process_group_absence_proven` returned `true`; leader absence plus `CREATE_NEW_PROCESS_GROUP` was treated as descendant-tree absence without atomic containment | direct clamp `f10ea52a9dddf62adf115225ae0f9d83b5f298da`; functional QEMU receipt ancestry `834e06e4ae9c68ac0dc9a00c2c7674b00f192bd4`, `ab6bcfe306ba89a308043d9843a0472c15399058`, `225aea6886c8042d71ccd6dd67121828b53997e9`, `2dd20814efa9cd5d43693f9cc774c8c7475508d8` | v0.3 Windows QEMU/WHPX and v0.4 overlays using that base | no clean cherry-pick; high-risk manual port because receipt/recovery APIs evolved | frozen v0.3/v0.4 tree plus all named QEMU receipt ancestry and `f10ea52`; this only fails closed and still needs new atomic Windows Job Object plus empty-descendant-tree implementation before R5 |
+| Q | Windows `process_group_absence_proven` returned `true`; leader absence plus `CREATE_NEW_PROCESS_GROUP` was treated as descendant-tree absence without atomic containment | direct clamp `f10ea52a9dddf62adf115225ae0f9d83b5f298da`; functional QEMU receipt ancestry `834e06e4ae9c68ac0dc9a00c2c7674b00f192bd4`, `ab6bcfe306ba89a308043d9843a0472c15399058`, `225aea6886c8042d71ccd6dd67121828b53997e9`, `2dd20814efa9cd5d43693f9cc774c8c7475508d8`; current corrective train adds the atomic Windows Job Object plus empty-tree mechanism | v0.3 Windows QEMU/WHPX and v0.4 overlays using that base | no clean cherry-pick; high-risk manual port because receipt/recovery APIs evolved | current `dev` ancestry plus schema-2 Job identity, suspended Job-list launch, persisted-before-resume receipt, descendant fixture, and exact empty-tree proof; new candidate CI/package/R5 evidence remains mandatory |
 | S | mutation guards validated a filesystem handle but were not bound and revalidated pre/post against the exact state root across durable/destructive call sites | behavior `06934a5b8ce93b80f5fb2b1fc7353a070751e784`; Windows test/cfg follow-up `97e5054f4c7a7d231c2c97c9c6615574f7b83299` | v0.1-v0.4; Hyper-V, QEMU/WHPX, QEMU/KVM, and JobSpec paths | technically possible only as a high-risk manual port; frozen APIs lack the state-root binding and converted call sites | exact frozen tree plus `MutationGuard::validate_for_state_root`, every engine/state pre/post call-site conversion, nested runtime/artifact/image/cell validation, and the cross-process replacement/lock regression suite from both named commits |
 | A | `ArtifactCommitted` validated artifact fields but did not restrict the operation kind; `Exec` and `CopyIn` records could pass that phase | `e50e1759cb3a1c003230d1de45a5a64c6f6283ce` | v0.1-v0.4 and every artifact-capable tuple/overlay | small semantically portable manual port; do not mutate frozen refs and do not transfer old evidence | exact frozen tree plus the `CopyOut`/`ArtifactCollect` phase guard and valid/invalid/external-tamper regression tests; retain v0.4 JobSpec correlation behavior |
 
@@ -76,8 +76,8 @@ version, clean checkout, binary SHA-256, package manifest/hash, and tuple:
 5. New R5 receipts for each tuple actually proposed: dedicated host, image and
    guest identity, base/overlay dependency, exclusive writer window, lifecycle,
    no-replay, artifact, cleanup, and terminal-state proof. Windows QEMU/WHPX
-   additionally requires the not-yet-implemented atomic Job Object and empty
-   descendant-tree proof.
+   additionally requires the current atomic Job Object and empty descendant-tree
+   implementation plus new exact-candidate R5 proof.
 
 No old receipt, CI run, package, PR merge, or release-ref name is backportable
 as evidence. It remains historical context only.

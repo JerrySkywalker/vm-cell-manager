@@ -160,6 +160,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\test-windows-whpx-preflight.ps1
 
+      - name: Windows QEMU Job containment contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-windows-job-containment.ps1
+
       - name: Windows validation workflow contract
         shell: pwsh
         run: |

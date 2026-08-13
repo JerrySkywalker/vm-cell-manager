@@ -55,6 +55,7 @@ function Assert-WindowsValidationContract {
     'PowerShell safety gate' = '& \.\\tools\\check-powershell\.ps1'
     'Windows workflow contract gate' = '& \.\\tools\\test-windows-validation-workflow\.ps1'
     'Windows fixture preflight gate' = '& \.\\tools\\test-windows-whpx-preflight\.ps1'
+    'Windows Job containment gate' = '& \.\\tools\\test-windows-job-containment\.ps1'
     'Linux workflow contract gate' = '& \.\\tools\\test-linux-validation-workflow\.ps1'
     'R3 workflow contract gate' = '& \.\\tools\\test-linux-reliability-workflow\.ps1'
     'reliability closeout contract gate' = '& \.\\tools\\test-reliability-closeout\.ps1'
