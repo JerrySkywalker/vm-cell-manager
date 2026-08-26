@@ -1,0 +1,86 @@
+# Windows Hyper-V R5 read-only preflight
+
+`tools/windows-hyperv-r5-preflight.ps1` is an admission evidence collector for
+the v0.4.1 Windows Hyper-V / Windows guest / PowerShell Direct R5 packet. It is
+not an authorization mechanism, does not claim functional acceptance, and does
+not change the support matrix.
+
+Every result has `authority: "none"`, `acceptance: false`, and
+`real_platform_acceptance: "not_started"`. `PREFLIGHT_ELIGIBLE` only means that
+the supplied or observed preconditions were complete and suitable for a
+separate owner decision. It never grants permission to create, attach, start,
+stop, modify, or remove anything.
+
+## Modes
+
+Fixture mode is the CI and regression-test mode. It reads only the supplied
+fixture JSON and emits one deterministic JSON document on standard output. It
+does not inspect the host, Hyper-V, services, VMs, disks, images, network,
+runners, registry, GitHub, or Git state.
+
+```powershell
+pwsh -NoProfile -File .\tools\windows-hyperv-r5-preflight.ps1 `
+  -FixturePath .\tests\fixtures\hyperv-r5-preflight\eligible.json
+```
+
+Live mode is observational only. It reads the candidate bindings, supplied
+provenance, Windows/Hyper-V availability, foreign inventory, process activity,
+storage facts, and VHDX metadata. It does not make a host or provider change.
+Run it only in a separately authorized owner window and keep its raw output
+outside the repository.
+
+```powershell
+pwsh -NoProfile -File .\tools\windows-hyperv-r5-preflight.ps1 `
+  -CandidateSha REQUIRED_EXACT_40_HEX_SHA `
+  -CandidatePackagePath REQUIRED_PACKAGE_PATH `
+  -CandidateBinaryPath REQUIRED_BINARY_PATH `
+  -VhdxPath REQUIRED_VHDX_PATH `
+  -ProvenancePath REQUIRED_PROVENANCE_PATH `
+  -StateRoot REQUIRED_ORDINARY_C_NTFS_STATE_ROOT
+```
+
+No fixture, CI result, or live preflight result is R5 real-platform acceptance.
+That status remains `NOT_STARTED` until a distinct, explicitly authorized
+real-platform goal completes.
+
+## Evidence and fail-closed behavior
+
+The result contains a fixed observation register covering elevation and local
+administrators membership; Windows build and architecture; Hyper-V feature,
+module, cmdlets, VMMS, and read access; VM and switch inventories; competing
+virtualization writers and runner/Codex activity; C: and V: storage boundaries;
+immutable VHDX state; provenance and candidate/package/binary/VHDX hashes;
+receipt freshness; and exclusive-window eligibility.
+
+`unavailable` is always emitted as an `evidence_gap.*` blocker. It is never
+treated as pass. A failed precondition becomes `precondition_failed.*`; the
+owner action names the evidence or external remediation needed. The result
+stores only codes, statuses, and SHA-256 evidence digests—never raw host paths,
+VM names, command lines, credentials, or process identities.
+
+The live V: check rejects ReFS and `File Backed Virtual` storage as unsuitable
+for the R5 boundary. The tool also rejects a missing, dynamic, writable,
+attached, differencing, or parented VHDX. It leaves all such evidence untouched.
+
+## Provenance template
+
+Start with
+[`hyperv-r5-image-provenance-template.json`](receipts/hyperv-r5-image-provenance-template.json).
+The template deliberately contains placeholders, not evidence. A completed
+owner packet must bind the exact candidate SHA, package and binary hashes,
+Windows edition/build, source, VHDX digest, generation and security properties,
+parent/attachment state, creation time, immutability declaration, receipt, and
+exclusive-window evidence before live observation can evaluate it.
+
+## Safety checks and CI
+
+`tools/test-windows-hyperv-r5-preflight.ps1` runs 31 deterministic checks. It
+includes the eligible fixture; evidence gaps and failed predicates for every
+R5 boundary; malformed input, deterministic rendering, path/secret-like input
+redaction, and a guarded fixture-isolation process. Its AST deny list rejects
+feature, membership, service, VM, switch, VHD, disk/partition, ACL, network,
+process, runner, and service mutation command families in the production tool.
+
+Windows CI invokes only that fixture/static/template contract. It does not run
+the live mode, invoke Hyper-V, request elevation, create a VM, manipulate a
+service or host feature, or produce real-platform acceptance evidence.
