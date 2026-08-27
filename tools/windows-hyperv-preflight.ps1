@@ -73,20 +73,33 @@ function Get-Sha256File {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
 }
 
-function Get-OrdinaryProvenanceFile {
-  param([Parameter(Mandatory)][string]$Path)
+function Get-OrdinaryPathItem {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][bool]$RequireDirectory,
+    [Parameter(Mandatory)][string]$Description
+  )
 
   $fullPath = [IO.Path]::GetFullPath($Path)
   $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
-  if ($item.PSIsContainer) {
-    throw 'provenance path must be a file'
+  if ($RequireDirectory -and -not $item.PSIsContainer) {
+    throw "$Description must be a directory"
+  }
+  if (-not $RequireDirectory -and $item.PSIsContainer) {
+    throw "$Description must be a file"
   }
   for ($ancestor = $item; $null -ne $ancestor; $ancestor = $ancestor.Directory) {
     if (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw 'provenance path or parent must not be a reparse point'
+      throw "$Description or parent must not be a reparse point"
     }
   }
   return $item
+}
+
+function Get-OrdinaryProvenanceFile {
+  param([Parameter(Mandatory)][string]$Path)
+
+  return Get-OrdinaryPathItem -Path $Path -RequireDirectory $false -Description 'provenance path'
 }
 
 function Get-SafeProvenanceSnapshot {
@@ -442,7 +455,7 @@ function Get-LiveObservations {
     [pscustomobject]@{ status = if ($processes.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $processes.Count } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'c_storage_boundary' -Probe {
-    $state = Get-Item -LiteralPath $StateRoot -ErrorAction Stop
+    $state = Get-OrdinaryPathItem -Path $StateRoot -RequireDirectory $true -Description 'state root'
     $volume = Get-Volume -DriveLetter C -ErrorAction Stop
     $stateRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($state.FullName))
     $suitable = $state.PSIsContainer -and $stateRoot -ceq 'C:\' -and
@@ -457,23 +470,25 @@ function Get-LiveObservations {
     [pscustomobject]@{ status = if ($suitable) { 'pass' } else { 'fail' }; evidence = @{ suitable = $suitable } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'immutable_vhdx_presence' -Probe {
-    $vhdItem = Get-Item -LiteralPath $VhdxPath -ErrorAction Stop
+    $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
     $exists = -not $vhdItem.PSIsContainer -and $vhdItem.Extension -ieq '.vhdx'
     [pscustomobject]@{ status = if ($exists) { 'pass' } else { 'fail' }; evidence = @{ present = $exists } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'vhdx_immutability' -Probe {
-    $vhdItem = Get-Item -LiteralPath $VhdxPath -ErrorAction Stop
+    $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
     $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
     $readOnly = ($vhdItem.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0
     $fixed = [string]$vhd.VhdType -ceq 'Fixed'
     [pscustomobject]@{ status = if ($readOnly -and $fixed) { 'pass' } else { 'fail' }; evidence = @{ readonly = $readOnly; fixed = $fixed } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'vhdx_attachment' -Probe {
+    Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path' | Out-Null
     $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
     $detached = -not [bool]$vhd.Attached
     [pscustomobject]@{ status = if ($detached) { 'pass' } else { 'fail' }; evidence = @{ detached = $detached } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'vhdx_parent' -Probe {
+    Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path' | Out-Null
     $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
     $parentless = [string]::IsNullOrWhiteSpace([string]$vhd.ParentPath)
     [pscustomobject]@{ status = if ($parentless) { 'pass' } else { 'fail' }; evidence = @{ parentless = $parentless } }
@@ -493,14 +508,16 @@ function Get-LiveObservations {
   $result.Add((Invoke-LiveObservation -Code 'package_hash' -Probe {
     if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
     $provenance = $provenanceSnapshot.value
-    $packageHash = Get-Sha256File -Path $CandidatePackagePath
+    $package = Get-OrdinaryPathItem -Path $CandidatePackagePath -RequireDirectory $false -Description 'candidate package path'
+    $packageHash = Get-Sha256File -Path $package.FullName
     $matches = [string]$provenance.package.sha256 -ceq $packageHash
     [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'binary_hash' -Probe {
     if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
     $provenance = $provenanceSnapshot.value
-    $binaryHash = Get-Sha256File -Path $CandidateBinaryPath
+    $binary = Get-OrdinaryPathItem -Path $CandidateBinaryPath -RequireDirectory $false -Description 'candidate binary path'
+    $binaryHash = Get-Sha256File -Path $binary.FullName
     $matches = [string]$provenance.candidate_binary.sha256 -ceq $binaryHash
     [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
   }))

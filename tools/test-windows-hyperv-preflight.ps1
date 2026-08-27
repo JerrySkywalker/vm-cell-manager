@@ -78,16 +78,21 @@ function Assert-StaticDenyList {
   }
 }
 
-function Assert-ProvenanceSafetyAndDeterminism {
+function Assert-PathSafetyAndDeterminism {
   $source = [IO.File]::ReadAllText($scriptPath)
   foreach ($required in @(
       'function Get-SafeProvenanceSnapshot',
+      'function Get-OrdinaryPathItem',
       'function Get-OrdinaryProvenanceFile',
       '[IO.FileAttributes]::ReparsePoint',
       '$beforeHash = Get-Sha256File',
       '$afterHash = Get-Sha256File',
       '$verifiedItem = Get-OrdinaryProvenanceFile',
       'provenance evidence changed while it was read',
+      "Get-OrdinaryPathItem -Path `$StateRoot -RequireDirectory `$true -Description 'state root'",
+      "Get-OrdinaryPathItem -Path `$VhdxPath -RequireDirectory `$false -Description 'VHDX path'",
+      "Get-OrdinaryPathItem -Path `$CandidatePackagePath -RequireDirectory `$false -Description 'candidate package path'",
+      "Get-OrdinaryPathItem -Path `$CandidateBinaryPath -RequireDirectory `$false -Description 'candidate binary path'",
       'Get-ObservationDigest -Observations $liveObservations',
       '$requiredStrings[17]'
     )) {
@@ -128,7 +133,7 @@ foreach (`$name in @(
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 try {
   Assert-StaticDenyList
-  Assert-ProvenanceSafetyAndDeterminism
+  Assert-PathSafetyAndDeterminism
   $eligible = Invoke-Fixture -Path $fixturePath
   Assert-True -Condition ($eligible.contract -ceq 'vmcell.hyperv-r5-preflight.v1') -Message 'fixture result contract drifted'
   Assert-True -Condition ($eligible.authority -ceq 'none' -and $eligible.acceptance -eq $false) `
@@ -201,4 +206,4 @@ try {
   Remove-Item -LiteralPath $temporaryRoot -Force -Recurse -ErrorAction SilentlyContinue
 }
 
-Write-Host 'Windows Hyper-V R5 fixture, isolation, and static safety contracts passed (31 cases)'
+Write-Host 'Windows Hyper-V R5 fixture, isolation, and static safety contracts passed (32 cases)'
