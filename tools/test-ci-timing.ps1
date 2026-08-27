@@ -16,6 +16,7 @@ $stages = @(
   'format',
   'powershell-static',
   'windows-preflight-contract',
+  'windows-hyperv-r5-fixture-contract',
   'linux-validation-contract',
   'linux-reliability-contract',
   'clippy',
@@ -44,6 +45,7 @@ $requiredWorkflow = [ordered]@{
   'PowerShell static command' = '& \.\\tools\\check-powershell\.ps1'
   'Windows timing behavioral contract command' = '& \.\\tools\\test-ci-timing\.ps1'
   'Windows preflight contract command' = '& \.\\tools\\test-windows-whpx-preflight\.ps1'
+  'Windows Hyper-V R5 fixture preflight contract command' = '& \.\\tools\\test-windows-hyperv-r5-preflight\.ps1'
   'Linux workflow contract command' = '& \.\\tools\\test-linux-validation-workflow\.ps1'
   'Linux reliability contract command' = '& \.\\tools\\test-linux-reliability-workflow\.ps1'
   'Clippy command' = 'cargo clippy --all-targets --all-features -- -D warnings'
@@ -119,6 +121,7 @@ try {
     throw 'timing helper failed to preserve an immediate native command failure'
   }
   Invoke-VmcellCiTimedStage -Stage powershell-static -Action {}
+  Invoke-VmcellCiTimedStage -Stage windows-hyperv-r5-fixture-contract -Action {}
 
   $failedActionObserved = $false
   try {
@@ -141,12 +144,13 @@ try {
   }
 
   foreach ($line in @($summary -split '\r?\n' | Where-Object { $_ })) {
-    if ($line -notmatch '^vmcell\.windows-timing-summary\.v1 stage=(?:format|powershell-static|windows-preflight-contract|linux-validation-contract|linux-reliability-contract|clippy|test|windows-package-contract|checkout-and-setup) state=(?:started|completed|failed|uninstrumented) timestamp_utc=[0-9T:.+\-Z]+ duration_ms=[0-9]{1,7}$') {
+    if ($line -notmatch '^vmcell\.windows-timing-summary\.v1 stage=(?:format|powershell-static|windows-preflight-contract|windows-hyperv-r5-fixture-contract|linux-validation-contract|linux-reliability-contract|clippy|test|windows-package-contract|checkout-and-setup) state=(?:started|completed|failed|uninstrumented) timestamp_utc=[0-9T:.+\-Z]+ duration_ms=[0-9]{1,7}$') {
       throw 'timing summary did not retain its fixed sanitized shape'
     }
   }
   foreach ($expectedRecord in @(
       'stage=format state=completed',
+      'stage=windows-hyperv-r5-fixture-contract state=completed',
       'stage=clippy state=failed',
       'stage=test state=started',
       'stage=checkout-and-setup state=uninstrumented'
