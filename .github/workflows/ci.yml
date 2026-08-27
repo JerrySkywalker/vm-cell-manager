@@ -199,7 +199,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           . .\tools\ci-timing.ps1
           Invoke-VmcellCiTimedStage -Stage 'windows-hyperv-r5-fixture-contract' -Action {
-            & .\tools\test-windows-hyperv-r5-preflight.ps1
+            & .\tools\test-windows-hyperv-preflight.ps1
           }
 
       - name: Linux validation workflow contract

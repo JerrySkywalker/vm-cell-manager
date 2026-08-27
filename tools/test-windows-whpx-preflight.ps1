@@ -6,6 +6,13 @@ $temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $temporaryRoot = [IO.Path]::GetFullPath((Join-Path $temporaryBase ('vmcell-whpx-preflight-' + [Guid]::NewGuid().ToString('N'))))
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 try {
+  $fixtureRepository = Join-Path $temporaryRoot 'clean-repository'
+  & git clone --quiet --no-hardlinks $repositoryRoot $fixtureRepository
+  if ($LASTEXITCODE -ne 0) { throw 'could not create clean-repository fixture' }
+  $origin = (& git -C $repositoryRoot remote get-url origin).Trim()
+  & git -C $fixtureRepository remote set-url origin $origin
+  if ($LASTEXITCODE -ne 0) { throw 'could not bind clean-repository origin' }
+
   $stateRoot = Join-Path $temporaryRoot 'state'
   New-Item -ItemType Directory -Path $stateRoot | Out-Null
   $base = Join-Path $temporaryRoot 'linux.qcow2'
@@ -31,11 +38,11 @@ try {
   $fixturePath = Join-Path $temporaryRoot 'fixture.json'
   $fixture | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $fixturePath -Encoding utf8NoBOM
   $receiptPath = Join-Path $temporaryRoot 'receipt.json'
-  $head = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+  $head = (& git -C $fixtureRepository rev-parse HEAD).Trim()
   if ($LASTEXITCODE -ne 0) { throw 'could not resolve repository HEAD' }
 
   & (Join-Path $PSScriptRoot 'windows-whpx-preflight.ps1') `
-    -RepositoryRoot $repositoryRoot `
+    -RepositoryRoot $fixtureRepository `
     -CandidateSha $head `
     -StateRoot $stateRoot `
     -BaseImagePath $base `
@@ -69,7 +76,7 @@ try {
   $staleReceiptCaught = $false
   try {
     & (Join-Path $PSScriptRoot 'windows-whpx-preflight.ps1') `
-      -RepositoryRoot $repositoryRoot `
+    -RepositoryRoot $fixtureRepository `
       -CandidateSha $head `
       -StateRoot $stateRoot `
       -BaseImagePath $base `
@@ -89,9 +96,8 @@ try {
   }
 
   $dirtyRepository = Join-Path $temporaryRoot 'dirty-repository'
-  & git clone --quiet --no-hardlinks $repositoryRoot $dirtyRepository
+  & git clone --quiet --no-hardlinks $fixtureRepository $dirtyRepository
   if ($LASTEXITCODE -ne 0) { throw 'could not create dirty-repository fixture' }
-  $origin = (& git -C $repositoryRoot remote get-url origin).Trim()
   & git -C $dirtyRepository remote set-url origin $origin
   if ($LASTEXITCODE -ne 0) { throw 'could not bind dirty-repository origin' }
   [IO.File]::WriteAllText((Join-Path $dirtyRepository 'untracked-evidence.txt'), 'dirty')
@@ -115,7 +121,7 @@ try {
   if (-not $dirtyCaught) { throw 'dirty candidate worktree did not fail closed' }
 
   $spoofedRepository = Join-Path $temporaryRoot 'spoofed-origin-repository'
-  & git clone --quiet --no-hardlinks $repositoryRoot $spoofedRepository
+  & git clone --quiet --no-hardlinks $fixtureRepository $spoofedRepository
   if ($LASTEXITCODE -ne 0) { throw 'could not create spoofed-origin fixture' }
   & git -C $spoofedRepository remote set-url origin 'https://evil.example/JerrySkywalker/vm-cell-manager.git'
   if ($LASTEXITCODE -ne 0) { throw 'could not bind spoofed origin' }
@@ -145,7 +151,7 @@ try {
   $caught = $false
   try {
     & (Join-Path $PSScriptRoot 'windows-whpx-preflight.ps1') `
-      -RepositoryRoot $repositoryRoot `
+    -RepositoryRoot $fixtureRepository `
       -CandidateSha $head `
       -StateRoot $stateRoot `
       -BaseImagePath $base `
@@ -161,7 +167,7 @@ try {
   }
   if (-not $caught) { throw 'missing WHPX did not fail deterministically' }
 
-  $templatePath = Join-Path $repositoryRoot 'docs\receipts\windows-whpx-acceptance-template.json'
+  $templatePath = Join-Path $fixtureRepository 'docs\receipts\windows-whpx-acceptance-template.json'
   $template = Get-Content -LiteralPath $templatePath -Raw | ConvertFrom-Json
   if ($template.contract -ne 'vmcell.windows-whpx-acceptance.v1' -or
       $template.real_platform_acceptance -ne 'pending' -or

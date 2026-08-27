@@ -164,7 +164,7 @@ jobs:
         shell: pw
         run: |
           $ErrorActionPreference = 'Stop'
-          & .\tools\test-windows-hyperv-r5-preflight.ps1
+          & .\tools\test-windows-hyperv-preflight.ps1
 
       - name: Windows QEMU Job containment contract
         shell: pwsh

@@ -73,6 +73,45 @@ function Get-Sha256File {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
 }
 
+function Get-OrdinaryProvenanceFile {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $fullPath = [IO.Path]::GetFullPath($Path)
+  $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+  if ($item.PSIsContainer) {
+    throw 'provenance path must be a file'
+  }
+  for ($ancestor = $item; $null -ne $ancestor; $ancestor = $ancestor.Directory) {
+    if (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw 'provenance path or parent must not be a reparse point'
+    }
+  }
+  return $item
+}
+
+function Get-SafeProvenanceSnapshot {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $item = Get-OrdinaryProvenanceFile -Path $Path
+  $fullPath = $item.FullName
+  $beforeHash = Get-Sha256File -Path $fullPath
+  $bytes = [IO.File]::ReadAllBytes($fullPath)
+  $verifiedItem = Get-OrdinaryProvenanceFile -Path $fullPath
+  $afterHash = Get-Sha256File -Path $fullPath
+  if ($beforeHash -cne $afterHash -or
+      $item.Length -ne $verifiedItem.Length -or
+      $item.LastWriteTimeUtc -ne $verifiedItem.LastWriteTimeUtc) {
+    throw 'provenance evidence changed while it was read'
+  }
+
+  try {
+    $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw 'provenance evidence is not valid UTF-8 JSON'
+  }
+  return [pscustomobject]@{ value = $value; sha256 = $afterHash }
+}
+
 function Test-Sha256 {
   param([AllowNull()][string]$Value)
 
@@ -115,7 +154,7 @@ function Test-LiveProvenance {
   )
   $hashes = @(
     $requiredStrings[2], $requiredStrings[3], $requiredStrings[7], $requiredStrings[8],
-    $requiredStrings[14], $requiredStrings[16]
+    $requiredStrings[14], $requiredStrings[17]
   )
   $vhdx = Get-ObjectProperty -InputObject $Provenance -Name 'vhdx'
   $immutability = Get-ObjectProperty -InputObject $Provenance -Name 'immutability'
@@ -132,6 +171,10 @@ function Test-LiveProvenance {
   } catch {}
   return $Provenance.schema_version -eq 1 -and
     $Provenance.contract -ceq 'vmcell.hyperv-r5-image-provenance.v1' -and
+    $Provenance.authority -ceq 'none' -and
+    $Provenance.acceptance -is [bool] -and -not [bool]$Provenance.acceptance -and
+    $Provenance.real_platform_acceptance -ceq 'not_started' -and
+    $Provenance.authorizing -is [bool] -and -not [bool]$Provenance.authorizing -and
     $requiredStrings.Count -eq @($requiredStrings | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -and
     @($hashes | Where-Object { -not (Test-Sha256 -Value $_) }).Count -eq 0 -and
     [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'windows') -Name 'architecture') -ceq 'x86_64' -and
@@ -165,6 +208,15 @@ function New-Observation {
     status = $Status
     evidence_sha256 = $EvidenceSha256
   }
+}
+
+function Get-ObservationDigest {
+  param([Parameter(Mandatory)][object[]]$Observations)
+
+  $digestInput = @($Observations | ForEach-Object {
+    "$($_.code)|$($_.status)|$($_.evidence_sha256)"
+  }) -join "`n"
+  return Get-Sha256Text -Text $digestInput
 }
 
 function New-InvalidFixtureResult {
@@ -223,9 +275,7 @@ function New-PreflightResult {
     $code = $_
     @($Observations | Where-Object { $_.code -ceq $code })[0]
   })
-  $observationDigestInput = @($orderedObservations | ForEach-Object {
-    "$($_.code)|$($_.status)|$($_.evidence_sha256)"
-  }) -join "`n"
+  $observationDigest = Get-ObservationDigest -Observations $orderedObservations
   $eligible = $blockers.Count -eq 0
   if ($eligible) {
     $actions.Add('obtain_separate_authorization_before_any_real_platform_action')
@@ -243,7 +293,7 @@ function New-PreflightResult {
     owner_actions = @($actions | Sort-Object -Unique)
     evidence_digests = [ordered]@{
       source_sha256 = $EvidenceSourceDigest
-      observations_sha256 = Get-Sha256Text -Text $observationDigestInput
+      observations_sha256 = $observationDigest
     }
     mutation_flags = [ordered]@{
       host_observation = $HostObservation
@@ -327,12 +377,10 @@ function Invoke-LiveObservation {
 }
 
 function Get-LiveObservations {
-  $provenance = $null
-  $vhd = $null
-  $vhdItem = $null
-  $packageHash = $null
-  $binaryHash = $null
-  $vhdxHash = $null
+  $provenanceSnapshot = $null
+  try {
+    $provenanceSnapshot = Get-SafeProvenanceSnapshot -Path $ProvenancePath
+  } catch {}
 
   $result = [System.Collections.Generic.List[object]]::new()
   $result.Add((Invoke-LiveObservation -Code 'elevation' -Probe {
@@ -431,42 +479,49 @@ function Get-LiveObservations {
     [pscustomobject]@{ status = if ($parentless) { 'pass' } else { 'fail' }; evidence = @{ parentless = $parentless } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'image_provenance' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $valid = Test-LiveProvenance -Provenance $provenance
     [pscustomobject]@{ status = if ($valid) { 'pass' } else { 'fail' }; evidence = @{ valid = $valid } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'candidate_hash' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $matches = [string]$provenance.candidate.sha -ceq $CandidateSha
     [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'package_hash' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $packageHash = Get-Sha256File -Path $CandidatePackagePath
     $matches = [string]$provenance.package.sha256 -ceq $packageHash
     [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'binary_hash' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $binaryHash = Get-Sha256File -Path $CandidateBinaryPath
     $matches = [string]$provenance.candidate_binary.sha256 -ceq $binaryHash
     [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'vhdx_hash' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $vhdxHash = Get-Sha256File -Path $VhdxPath
     $matches = [string]$provenance.vhdx.sha256 -ceq $vhdxHash
     [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'admission_receipt' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $issued = [DateTimeOffset]::Parse([string]$provenance.admission_receipt.issued_at_utc)
     $fresh = ([DateTimeOffset]::UtcNow - $issued).TotalHours -ge 0 -and
       ([DateTimeOffset]::UtcNow - $issued).TotalHours -le $MaximumReceiptAgeHours
     [pscustomobject]@{ status = if ($fresh) { 'pass' } else { 'fail' }; evidence = @{ fresh = $fresh } }
   }))
   $result.Add((Invoke-LiveObservation -Code 'exclusive_window' -Probe {
-    $provenance = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ProvenancePath)) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
+    $provenance = $provenanceSnapshot.value
     $eligible = $provenance.exclusive_window.eligible -is [bool] -and
       [bool]$provenance.exclusive_window.eligible -and
       [DateTimeOffset]::Parse([string]$provenance.exclusive_window.ends_at_utc) -gt [DateTimeOffset]::UtcNow
@@ -487,7 +542,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Fixture') {
 } else {
   $liveObservations = Get-LiveObservations
   New-PreflightResult -EvidenceSource 'live-read-only' -Observations $liveObservations `
-    -EvidenceSourceDigest (Get-Sha256Text -Text ([DateTimeOffset]::UtcNow.ToString('O'))) `
+    -EvidenceSourceDigest (Get-ObservationDigest -Observations $liveObservations) `
     -HostObservation $true |
     ConvertTo-Json -Compress -Depth 12
 }

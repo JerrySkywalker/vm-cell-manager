@@ -1,8 +1,11 @@
 {
   "schema_version": 1,
   "contract": "vmcell.hyperv-r5-image-provenance.v1",
+  "authority": "none",
+  "acceptance": false,
   "authorizing": false,
   "real_platform_acceptance": "not_started",
+  "support_status": "untested",
   "candidate": {
     "sha": "REQUIRED_EXACT_40_HEX_SHA",
     "version": "REQUIRED_VERSION"

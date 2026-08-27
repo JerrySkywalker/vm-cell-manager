@@ -2,8 +2,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$scriptPath = Join-Path $PSScriptRoot 'windows-hyperv-r5-preflight.ps1'
-$fixturePath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-r5-preflight\eligible.json'
+$scriptPath = Join-Path $PSScriptRoot 'windows-hyperv-preflight.ps1'
+$fixturePath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-preflight\eligible.json'
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('vmcell-hyperv-r5-preflight-' + [Guid]::NewGuid().ToString('N'))
 
 function Assert-True {
@@ -54,22 +54,49 @@ function Assert-StaticDenyList {
   }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
   $forbidden = @(
     'Enable-WindowsOptionalFeature', 'Disable-WindowsOptionalFeature',
+    'Install-WindowsFeature', 'Uninstall-WindowsFeature',
+    'Add-WindowsCapability', 'Remove-WindowsCapability',
     'Add-LocalGroupMember', 'Remove-LocalGroupMember',
-    'Start-Service', 'Stop-Service', 'Restart-Service',
+    'Start-Service', 'Stop-Service', 'Restart-Service', 'Set-Service', 'New-Service', 'Remove-Service',
     'New-VM', 'Set-VM', 'Remove-VM', 'Start-VM', 'Stop-VM', 'Import-VM', 'Export-VM',
-    'Checkpoint-VM', 'Restore-VM',
-    'New-VMSwitch', 'Set-VMSwitch', 'Remove-VMSwitch',
-    'New-VHD', 'Set-VHD', 'Remove-VHD', 'Resize-VHD', 'Mount-VHD', 'Dismount-VHD', 'Convert-VHD',
-    'Initialize-Disk', 'Clear-Disk', 'Format-Volume', 'New-Partition', 'Remove-Partition',
-    'Set-Acl', 'icacls.exe',
-    'New-NetIPAddress', 'Set-NetIPAddress', 'Remove-NetIPAddress',
-    'New-NetRoute', 'Set-NetIPInterface', 'Restart-NetAdapter',
-    'Stop-Process', 'taskkill.exe', 'sc.exe'
+    'Checkpoint-VM', 'Restore-VM', 'Suspend-VM', 'Resume-VM',
+    'Add-VMHardDiskDrive', 'Remove-VMHardDiskDrive', 'Add-VMNetworkAdapter', 'Remove-VMNetworkAdapter',
+    'Set-VMProcessor', 'Set-VMMemory',
+    'New-VMSwitch', 'Set-VMSwitch', 'Remove-VMSwitch', 'Add-VMSwitchExtension', 'Remove-VMSwitchExtension',
+    'New-VHD', 'Set-VHD', 'Remove-VHD', 'Resize-VHD', 'Mount-VHD', 'Dismount-VHD', 'Convert-VHD', 'Merge-VHD',
+    'Initialize-Disk', 'Clear-Disk', 'Set-Disk', 'Format-Volume', 'Set-Volume', 'Dismount-Volume',
+    'New-Partition', 'Set-Partition', 'Remove-Partition',
+    'Set-Acl', 'Clear-Acl', 'icacls.exe', 'takeown.exe',
+    'New-NetIPAddress', 'Set-NetIPAddress', 'Remove-NetIPAddress', 'New-NetRoute', 'Set-NetRoute', 'Remove-NetRoute',
+    'Set-NetIPInterface', 'Restart-NetAdapter', 'Enable-NetAdapter', 'Disable-NetAdapter',
+    'New-NetNat', 'Remove-NetNat', 'Set-NetFirewallProfile',
+    'Stop-Process', 'taskkill.exe', 'Stop-Computer', 'Restart-Computer', 'shutdown.exe', 'sc.exe'
   )
   foreach ($command in $forbidden) {
     Assert-True -Condition ($commands -cnotcontains $command) `
       -Message "R5 preflight contains forbidden mutating command $command"
   }
+}
+
+function Assert-ProvenanceSafetyAndDeterminism {
+  $source = [IO.File]::ReadAllText($scriptPath)
+  foreach ($required in @(
+      'function Get-SafeProvenanceSnapshot',
+      'function Get-OrdinaryProvenanceFile',
+      '[IO.FileAttributes]::ReparsePoint',
+      '$beforeHash = Get-Sha256File',
+      '$afterHash = Get-Sha256File',
+      '$verifiedItem = Get-OrdinaryProvenanceFile',
+      'provenance evidence changed while it was read',
+      'Get-ObservationDigest -Observations $liveObservations',
+      '$requiredStrings[17]'
+    )) {
+    Assert-True -Condition $source.Contains($required) `
+      -Message "R5 preflight omitted required provenance safety binding: $required"
+  }
+  Assert-True -Condition ($source -notmatch [regex]::Escape(
+      'EvidenceSourceDigest (Get-Sha256Text -Text ([DateTimeOffset]::UtcNow.ToString(''O'')))'
+    )) -Message 'live result digest must not be derived from wall-clock time'
 }
 
 function Assert-FixtureIsolation {
@@ -101,6 +128,7 @@ foreach (`$name in @(
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 try {
   Assert-StaticDenyList
+  Assert-ProvenanceSafetyAndDeterminism
   $eligible = Invoke-Fixture -Path $fixturePath
   Assert-True -Condition ($eligible.contract -ceq 'vmcell.hyperv-r5-preflight.v1') -Message 'fixture result contract drifted'
   Assert-True -Condition ($eligible.authority -ceq 'none' -and $eligible.acceptance -eq $false) `

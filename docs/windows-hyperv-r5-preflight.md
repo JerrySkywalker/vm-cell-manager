@@ -1,6 +1,6 @@
 # Windows Hyper-V R5 read-only preflight
 
-`tools/windows-hyperv-r5-preflight.ps1` is an admission evidence collector for
+`tools/windows-hyperv-preflight.ps1` is an admission evidence collector for
 the v0.4.1 Windows Hyper-V / Windows guest / PowerShell Direct R5 packet. It is
 not an authorization mechanism, does not claim functional acceptance, and does
 not change the support matrix.
@@ -19,8 +19,8 @@ does not inspect the host, Hyper-V, services, VMs, disks, images, network,
 runners, registry, GitHub, or Git state.
 
 ```powershell
-pwsh -NoProfile -File .\tools\windows-hyperv-r5-preflight.ps1 `
-  -FixturePath .\tests\fixtures\hyperv-r5-preflight\eligible.json
+pwsh -NoProfile -File .\tools\windows-hyperv-preflight.ps1 `
+  -FixturePath .\tests\fixtures\hyperv-preflight\eligible.json
 ```
 
 Live mode is observational only. It reads the candidate bindings, supplied
@@ -30,7 +30,7 @@ Run it only in a separately authorized owner window and keep its raw output
 outside the repository.
 
 ```powershell
-pwsh -NoProfile -File .\tools\windows-hyperv-r5-preflight.ps1 `
+pwsh -NoProfile -File .\tools\windows-hyperv-preflight.ps1 `
   -CandidateSha REQUIRED_EXACT_40_HEX_SHA `
   -CandidatePackagePath REQUIRED_PACKAGE_PATH `
   -CandidateBinaryPath REQUIRED_BINARY_PATH `
@@ -61,25 +61,33 @@ VM names, command lines, credentials, or process identities.
 The live V: check rejects ReFS and `File Backed Virtual` storage as unsuitable
 for the R5 boundary. The tool also rejects a missing, dynamic, writable,
 attached, differencing, or parented VHDX. It leaves all such evidence untouched.
+Before live observation uses provenance, it reads one UTF-8 JSON snapshot,
+rejects a reparse-point file or parent, and compares the before/after content
+digest. A missing, changed, or unsafe receipt becomes an evidence gap and can
+never produce `PREFLIGHT_ELIGIBLE`. The live result digest is derived from its
+ordered sanitized observations, not wall-clock time.
 
 ## Provenance template
 
 Start with
-[`hyperv-r5-image-provenance-template.json`](receipts/hyperv-r5-image-provenance-template.json).
+[`windows-hyperv-image-provenance-template.json`](receipts/windows-hyperv-image-provenance-template.json).
 The template deliberately contains placeholders, not evidence. A completed
 owner packet must bind the exact candidate SHA, package and binary hashes,
 Windows edition/build, source, VHDX digest, generation and security properties,
 parent/attachment state, creation time, immutability declaration, receipt, and
 exclusive-window evidence before live observation can evaluate it.
+The non-executing packet instructions are in
+[`windows-hyperv-r5-image-preparation.md`](windows-hyperv-r5-image-preparation.md).
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-r5-preflight.ps1` runs 31 deterministic checks. It
+`tools/test-windows-hyperv-preflight.ps1` runs 31 deterministic checks. It
 includes the eligible fixture; evidence gaps and failed predicates for every
 R5 boundary; malformed input, deterministic rendering, path/secret-like input
 redaction, and a guarded fixture-isolation process. Its AST deny list rejects
 feature, membership, service, VM, switch, VHD, disk/partition, ACL, network,
-process, runner, and service mutation command families in the production tool.
+process-termination, shutdown, restart, runner, and service mutation command
+families in the production tool.
 
 Windows CI invokes only that fixture/static/template contract. It does not run
 the live mode, invoke Hyper-V, request elevation, create a VM, manipulate a
