@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "contract": "vmcell.hyperv-r5-image-provenance.v1",
+  "authority": "none",
+  "acceptance": false,
+  "authorizing": false,
+  "real_platform_acceptance": "not_started",
+  "support_status": "untested",
+  "candidate": {
+    "sha": "REQUIRED_EXACT_40_HEX_SHA",
+    "version": "REQUIRED_VERSION"
+  },
+  "package": {
+    "archive_name": "REQUIRED_PACKAGE_NAME",
+    "archive_sha256": "REQUIRED_SHA256",
+    "checksum_manifest_sha256": "REQUIRED_SHA256",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "candidate_binary": {
+    "name": "REQUIRED_BINARY_NAME",
+    "version": "REQUIRED_VERSION",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "windows": {
+    "edition": "REQUIRED_WINDOWS_EDITION",
+    "build": "REQUIRED_WINDOWS_BUILD",
+    "architecture": "x86_64"
+  },
+  "image_source": {
+    "kind": "REQUIRED_IMAGE_SOURCE_KIND",
+    "reference": "REQUIRED_SANITIZED_SOURCE_REFERENCE",
+    "source_sha256": "REQUIRED_SHA256"
+  },
+  "vhdx": {
+    "sha256": "REQUIRED_SHA256",
+    "generation": "REQUIRED_GENERATION",
+    "secure_boot": "REQUIRED_SECURITY_PROPERTY",
+    "virtualization_based_security": "REQUIRED_SECURITY_PROPERTY",
+    "vhd_type": "fixed",
+    "parent_path": null,
+    "attached": false
+  },
+  "creation": {
+    "created_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
+    "created_by_evidence_id": "REQUIRED_OPAQUE_EVIDENCE_ID"
+  },
+  "immutability": {
+    "declared": "REQUIRED_BOOLEAN",
+    "verification_evidence_sha256": "REQUIRED_SHA256"
+  },
+  "admission_receipt": {
+    "receipt_id": "REQUIRED_OPAQUE_RECEIPT_ID",
+    "issued_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
+    "sha256": "REQUIRED_SHA256"
+  },
+  "exclusive_window": {
+    "eligible": "REQUIRED_BOOLEAN",
+    "starts_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
+    "ends_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
+    "evidence_sha256": "REQUIRED_SHA256"
+  }
+}

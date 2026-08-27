@@ -1,5 +1,10 @@
 # M1 Hyper-V Acceptance Gate
 
+For the v0.4.1 R5 Windows Hyper-V admission evidence collector, see
+[`windows-hyperv-r5-preflight.md`](windows-hyperv-r5-preflight.md). It is
+strictly read-only and non-authorizing; it does not change the acceptance or
+support status described here.
+
 Implementation does not authorize real Hyper-V mutation. Real acceptance requires a separately approved, dedicated Hyper-V-capable host and must not run on the existing GitHub Actions runner labeled `core` and `trusted`.
 
 ## Admission

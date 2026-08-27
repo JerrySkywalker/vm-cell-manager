@@ -160,6 +160,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\test-windows-whpx-preflight.ps1
 
+      - name: Windows Hyper-V R5 fixture preflight contract
+        shell: pw
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\test-windows-hyperv-preflight.ps1
+
       - name: Windows QEMU Job containment contract
         shell: pwsh
         run: |
