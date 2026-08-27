@@ -189,6 +189,7 @@ function Test-LiveProvenance {
     $Provenance.real_platform_acceptance -ceq 'not_started' -and
     $Provenance.authorizing -is [bool] -and -not [bool]$Provenance.authorizing -and
     $requiredStrings.Count -eq @($requiredStrings | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -and
+    $requiredStrings[1] -ceq '0.4.1' -and
     @($hashes | Where-Object { -not (Test-Sha256 -Value $_) }).Count -eq 0 -and
     [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'windows') -Name 'architecture') -ceq 'x86_64' -and
     [string](Get-ObjectProperty -InputObject $vhdx -Name 'vhd_type') -ceq 'fixed' -and

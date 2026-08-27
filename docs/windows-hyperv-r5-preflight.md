@@ -74,7 +74,7 @@ sanitized observations, not wall-clock time.
 Start with
 [`windows-hyperv-image-provenance-template.json`](receipts/windows-hyperv-image-provenance-template.json).
 The template deliberately contains placeholders, not evidence. A completed
-owner packet must bind the exact candidate SHA, package and binary hashes,
+owner packet must bind the exact v0.4.1 candidate SHA and version, package and binary hashes,
 Windows edition/build, source, VHDX digest, generation and security properties,
 parent/attachment state, creation time, immutability declaration, receipt, and
 exclusive-window evidence before live observation can evaluate it.
@@ -83,7 +83,7 @@ The non-executing packet instructions are in
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-preflight.ps1` runs 32 deterministic checks. It
+`tools/test-windows-hyperv-preflight.ps1` runs 33 deterministic checks. It
 includes the eligible fixture; evidence gaps and failed predicates for every
 R5 boundary; malformed input, deterministic rendering, path/secret-like input
 redaction, and a guarded fixture-isolation process. Its AST deny list rejects

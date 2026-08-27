@@ -93,6 +93,7 @@ function Assert-PathSafetyAndDeterminism {
       "Get-OrdinaryPathItem -Path `$VhdxPath -RequireDirectory `$false -Description 'VHDX path'",
       "Get-OrdinaryPathItem -Path `$CandidatePackagePath -RequireDirectory `$false -Description 'candidate package path'",
       "Get-OrdinaryPathItem -Path `$CandidateBinaryPath -RequireDirectory `$false -Description 'candidate binary path'",
+      "`$requiredStrings[1] -ceq '0.4.1'",
       'Get-ObservationDigest -Observations $liveObservations',
       '$requiredStrings[17]'
     )) {
@@ -206,4 +207,4 @@ try {
   Remove-Item -LiteralPath $temporaryRoot -Force -Recurse -ErrorAction SilentlyContinue
 }
 
-Write-Host 'Windows Hyper-V R5 fixture, isolation, and static safety contracts passed (32 cases)'
+Write-Host 'Windows Hyper-V R5 fixture, isolation, and static safety contracts passed (33 cases)'
