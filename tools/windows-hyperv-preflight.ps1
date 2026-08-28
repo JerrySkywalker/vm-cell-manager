@@ -73,6 +73,66 @@ function Get-Sha256File {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
 }
 
+function Assert-NotReparsePoint {
+  param(
+    [Parameter(Mandatory)][IO.FileSystemInfo]$Item,
+    [Parameter(Mandatory)][string]$Description
+  )
+
+  if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "$Description or parent must not be a reparse point"
+  }
+}
+
+function Get-PathItemWithoutFollowingReparse {
+  param(
+    [Parameter(Mandatory)][string]$FullPath,
+    [Parameter(Mandatory)][string]$Description
+  )
+
+  $rootPath = [IO.Path]::GetPathRoot($FullPath)
+  if ([string]::IsNullOrWhiteSpace($rootPath)) {
+    throw "$Description must have a filesystem root"
+  }
+
+  $currentItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+  if (-not $currentItem.PSIsContainer) {
+    throw "$Description root must be a directory"
+  }
+  Assert-NotReparsePoint -Item $currentItem -Description $Description
+
+  $relativePath = $FullPath.Substring($rootPath.Length)
+  $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  $segments = $relativePath.Split($separators, [StringSplitOptions]::RemoveEmptyEntries)
+  foreach ($segment in $segments) {
+    if (-not $currentItem.PSIsContainer) {
+      throw "$Description ancestor must be a directory"
+    }
+    $nextPath = Join-Path -Path $currentItem.FullName -ChildPath $segment
+    $currentItem = Get-Item -LiteralPath $nextPath -Force -ErrorAction Stop
+    Assert-NotReparsePoint -Item $currentItem -Description $Description
+  }
+  return $currentItem
+}
+
+function Assert-OrdinaryPathAncestry {
+  param(
+    [Parameter(Mandatory)][IO.FileSystemInfo]$Item,
+    [Parameter(Mandatory)][string]$Description
+  )
+
+  for ($ancestor = $Item; $null -ne $ancestor) {
+    Assert-NotReparsePoint -Item $ancestor -Description $Description
+    if ($ancestor -is [IO.FileInfo]) {
+      $ancestor = $ancestor.Directory
+    } elseif ($ancestor -is [IO.DirectoryInfo]) {
+      $ancestor = $ancestor.Parent
+    } else {
+      throw "$Description has an unsupported filesystem item type"
+    }
+  }
+}
+
 function Get-OrdinaryPathItem {
   param(
     [Parameter(Mandatory)][string]$Path,
@@ -81,18 +141,14 @@ function Get-OrdinaryPathItem {
   )
 
   $fullPath = [IO.Path]::GetFullPath($Path)
-  $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+  $item = Get-PathItemWithoutFollowingReparse -FullPath $fullPath -Description $Description
   if ($RequireDirectory -and -not $item.PSIsContainer) {
     throw "$Description must be a directory"
   }
   if (-not $RequireDirectory -and $item.PSIsContainer) {
     throw "$Description must be a file"
   }
-  for ($ancestor = $item; $null -ne $ancestor; $ancestor = $ancestor.Directory) {
-    if (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-      throw "$Description or parent must not be a reparse point"
-    }
-  }
+  Assert-OrdinaryPathAncestry -Item $item -Description $Description
   return $item
 }
 

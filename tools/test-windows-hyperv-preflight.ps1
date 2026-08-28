@@ -82,9 +82,16 @@ function Assert-PathSafetyAndDeterminism {
   $source = [IO.File]::ReadAllText($scriptPath)
   foreach ($required in @(
       'function Get-SafeProvenanceSnapshot',
+      'function Assert-NotReparsePoint',
+      'function Get-PathItemWithoutFollowingReparse',
+      'function Assert-OrdinaryPathAncestry',
       'function Get-OrdinaryPathItem',
       'function Get-OrdinaryProvenanceFile',
       '[IO.FileAttributes]::ReparsePoint',
+      '$ancestor -is [IO.FileInfo]',
+      '$ancestor = $ancestor.Directory',
+      '$ancestor -is [IO.DirectoryInfo]',
+      '$ancestor = $ancestor.Parent',
       '$beforeHash = Get-Sha256File',
       '$afterHash = Get-Sha256File',
       '$verifiedItem = Get-OrdinaryProvenanceFile',
@@ -103,6 +110,68 @@ function Assert-PathSafetyAndDeterminism {
   Assert-True -Condition ($source -notmatch [regex]::Escape(
       'EvidenceSourceDigest (Get-Sha256Text -Text ([DateTimeOffset]::UtcNow.ToString(''O'')))'
     )) -Message 'live result digest must not be derived from wall-clock time'
+}
+
+function Assert-PathAncestryBehavior {
+  . $scriptPath -FixturePath $fixturePath | Out-Null
+
+  $ordinaryDirectory = Join-Path $temporaryRoot 'ordinary\nested\state-root'
+  New-Item -ItemType Directory -Path $ordinaryDirectory -Force | Out-Null
+  $ordinaryFile = Join-Path $ordinaryDirectory 'evidence.json'
+  [IO.File]::WriteAllText($ordinaryFile, '{}', [Text.UTF8Encoding]::new($false))
+
+  Get-OrdinaryPathItem -Path $ordinaryDirectory -RequireDirectory $true -Description 'ordinary nested directory' | Out-Null
+  Get-OrdinaryPathItem -Path $ordinaryFile -RequireDirectory $false -Description 'ordinary nested file' | Out-Null
+  $rootTraversalCompleted = $false
+  try {
+    Get-OrdinaryPathItem -Path $ordinaryDirectory -RequireDirectory $true -Description 'filesystem root traversal' | Out-Null
+    $rootTraversalCompleted = $true
+  } catch {
+    throw 'ordinary ancestry did not reach the filesystem root'
+  }
+  Assert-True -Condition $rootTraversalCompleted -Message 'filesystem root traversal did not complete'
+
+  $reparseTarget = Join-Path $temporaryRoot 'reparse-target'
+  New-Item -ItemType Directory -Path (Join-Path $reparseTarget 'nested') -Force | Out-Null
+  $reparseFile = Join-Path $reparseTarget 'nested\evidence.json'
+  [IO.File]::WriteAllText($reparseFile, '{}', [Text.UTF8Encoding]::new($false))
+  $reparsePath = Join-Path $temporaryRoot 'reparse-boundary'
+  try {
+    New-Item -ItemType Junction -Path $reparsePath -Target $reparseTarget -ErrorAction Stop | Out-Null
+  } catch {
+    throw 'test_environment_blocker.reparse_fixture_unavailable'
+  }
+  $reparseItem = Get-Item -LiteralPath $reparsePath -Force
+  Assert-True -Condition ([bool]($reparseItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) `
+    -Message 'test_environment_blocker.reparse_fixture_not_created'
+
+  $reparseItemRejected = $false
+  try {
+    Get-OrdinaryPathItem -Path $reparsePath -RequireDirectory $true -Description 'reparse item' | Out-Null
+  } catch {
+    $reparseItemRejected = $true
+  }
+  Assert-True -Condition $reparseItemRejected -Message 'reparse item was accepted'
+
+  $directParentRejected = $false
+  try {
+    Get-OrdinaryPathItem -Path (Join-Path $reparsePath 'nested') -RequireDirectory $true `
+      -Description 'direct reparse parent' | Out-Null
+  } catch {
+    $directParentRejected = $true
+  }
+  Assert-True -Condition $directParentRejected -Message 'direct reparse parent was accepted'
+
+  $grandparentRejected = $false
+  try {
+    Get-OrdinaryPathItem -Path (Join-Path $reparsePath 'nested\evidence.json') -RequireDirectory $false `
+      -Description 'reparse grandparent' | Out-Null
+  } catch {
+    $grandparentRejected = $true
+  }
+  Assert-True -Condition $grandparentRejected -Message 'reparse grandparent was accepted'
+
+  return 6
 }
 
 function Assert-FixtureIsolation {
@@ -133,8 +202,11 @@ foreach (`$name in @(
 
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 try {
+  $executedCaseCount = 0
   Assert-StaticDenyList
+  $executedCaseCount += 1
   Assert-PathSafetyAndDeterminism
+  $executedCaseCount += 1
   $eligible = Invoke-Fixture -Path $fixturePath
   Assert-True -Condition ($eligible.contract -ceq 'vmcell.hyperv-r5-preflight.v1') -Message 'fixture result contract drifted'
   Assert-True -Condition ($eligible.authority -ceq 'none' -and $eligible.acceptance -eq $false) `
@@ -144,6 +216,7 @@ try {
   Assert-True -Condition ($eligible.disposition -ceq 'PREFLIGHT_ELIGIBLE') -Message 'eligible fixture was not eligible'
   Assert-True -Condition (@($eligible.observations).Count -eq 25) -Message 'eligible fixture result did not preserve every observation'
   Assert-True -Condition ($eligible.mutation_flags.host_observation -eq $false) -Message 'fixture result claimed host observation'
+  $executedCaseCount += 1
 
   $cases = @(
     @{ name = 'non-elevated-token'; code = 'elevation'; status = 'fail' },
@@ -184,6 +257,7 @@ try {
       "precondition_failed.$($case.code)"
     }
     Assert-True -Condition (@($result.blockers) -ccontains $expected) "fixture case omitted blocker: $($case.name)"
+    $executedCaseCount += 1
   }
 
   $malformedPath = Join-Path $temporaryRoot 'malformed.json'
@@ -191,20 +265,25 @@ try {
   $malformed = Invoke-Fixture -Path $malformedPath
   Assert-True -Condition ($malformed.disposition -ceq 'BLOCKED' -and
     @($malformed.blockers) -ccontains 'fixture.schema_invalid') 'malformed fixture was not rejected'
+  $executedCaseCount += 1
 
   $first = @(& $scriptPath -FixturePath $fixturePath)
   $second = @(& $scriptPath -FixturePath $fixturePath)
   Assert-True -Condition ($first.Count -eq 1 -and $first[0] -ceq $second[0]) 'fixture output was not deterministic'
+  $executedCaseCount += 1
 
   $redactionPath = Join-Path $temporaryRoot 'redaction.json'
   Write-CaseFixture -Path $redactionPath -RawDetail 'C:\\private\\credential-password.txt'
   $redacted = @(& $scriptPath -FixturePath $redactionPath)
   Assert-True -Condition ($redacted.Count -eq 1 -and $redacted[0] -cnotmatch '(?i)C:\\|credential|password|private') `
     -Message 'fixture output disclosed a raw path or secret-like detail'
+  $executedCaseCount += 1
 
+  $executedCaseCount += Assert-PathAncestryBehavior
   Assert-FixtureIsolation -Path $fixturePath
+  $executedCaseCount += 1
 } finally {
   Remove-Item -LiteralPath $temporaryRoot -Force -Recurse -ErrorAction SilentlyContinue
 }
 
-Write-Host 'Windows Hyper-V R5 fixture, isolation, and static safety contracts passed (33 cases)'
+Write-Host "Windows Hyper-V R5 fixture, isolation, and static safety contracts passed ($executedCaseCount cases)"

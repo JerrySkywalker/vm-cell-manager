@@ -83,7 +83,7 @@ The non-executing packet instructions are in
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-preflight.ps1` runs 33 deterministic checks. It
+`tools/test-windows-hyperv-preflight.ps1` runs 39 deterministic checks. It
 includes the eligible fixture; evidence gaps and failed predicates for every
 R5 boundary; malformed input, deterministic rendering, path/secret-like input
 redaction, and a guarded fixture-isolation process. Its AST deny list rejects
