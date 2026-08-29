@@ -56,6 +56,7 @@ function Assert-WindowsValidationContract {
     'Windows workflow contract gate' = '& \.\\tools\\test-windows-validation-workflow\.ps1'
     'Windows fixture preflight gate' = '& \.\\tools\\test-windows-whpx-preflight\.ps1'
     'Windows Hyper-V R5 fixture preflight gate' = '& \.\\tools\\test-windows-hyperv-preflight\.ps1'
+    'Windows Hyper-V R5 fixture exact shell gate' = '(?ms)^      - name: Windows Hyper-V R5 fixture preflight contract\r?\n        shell: pwsh\r?\n        run: \|\r?\n          \$ErrorActionPreference = ''Stop''\r?\n          & \.\\tools\\test-windows-hyperv-preflight\.ps1\r?$'
     'Windows Job containment gate' = '& \.\\tools\\test-windows-job-containment\.ps1'
     'Linux workflow contract gate' = '& \.\\tools\\test-linux-validation-workflow\.ps1'
     'R3 workflow contract gate' = '& \.\\tools\\test-linux-reliability-workflow\.ps1'
@@ -150,6 +151,13 @@ Assert-RejectedWindowsMutation -Name 'self-hosted correctness runner' `
   -Dispatcher $dispatcher -SelfHosted $selfHosted
 Assert-RejectedWindowsMutation -Name 'hosted timeout drift' `
   -Workflow ($workflow -replace 'timeout-minutes: 45', 'timeout-minutes: 90') `
+  -Dispatcher $dispatcher -SelfHosted $selfHosted
+$hyperVFixtureShellPattern = '(?m)(^      - name: Windows Hyper-V R5 fixture preflight contract\r?\n)        shell: pwsh\r?$'
+Assert-RejectedWindowsMutation -Name 'Hyper-V R5 fixture pw shell typo' `
+  -Workflow ($workflow -replace $hyperVFixtureShellPattern, '${1}        shell: pw') `
+  -Dispatcher $dispatcher -SelfHosted $selfHosted
+Assert-RejectedWindowsMutation -Name 'Hyper-V R5 fixture unknown shell' `
+  -Workflow ($workflow -replace $hyperVFixtureShellPattern, '${1}        shell: unknown-shell') `
   -Dispatcher $dispatcher -SelfHosted $selfHosted
 Assert-RejectedWindowsMutation -Name 'removed doc tests' `
   -Workflow ($workflow -replace 'cargo test --locked --offline --workspace --all-features --doc', 'cargo test --locked --workspace') `
