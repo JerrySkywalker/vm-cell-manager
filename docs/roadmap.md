@@ -775,22 +775,38 @@ A technically competent external user can install vmcell, follow the public supp
 ## Repository-local status
 
 Reliability packets A-G are already `COMPLETE_REPOSITORY_LOCAL` under
-[issue #48](https://github.com/jerrygao96/vm-cell-manager/issues/48). Their
-deterministic stress, crash/interruption, concurrency, compatibility,
-resource-bound, observational-performance, and long-running contracts remain
-the foundation for later release evidence.
+[issue #48](https://github.com/JerrySkywalker/vm-cell-manager/issues/48). Their
+completed repository-local evidence is reusable foundation; it is not
+candidate-specific real-platform evidence, does not create a v0.8 release or
+support claim, and does not reopen the completed repository-local A-G work.
 
-This roadmap realignment does not reimplement those packets, reopen their
-repository-local closeout, set version 0.8.0, or manufacture a v0.8 release.
-Any future v0.8 candidate must consume the completed A-G artifacts and obtain
-only the additional exact real-platform evidence required for tuples it
-actually advertises.
+## Exact-candidate obligations
+
+A future exact v0.8 candidate must obtain bounded, candidate-specific evidence
+for every tuple it advertises. The qualification must cover:
+
+- repeated/soak operation with fixed duration, case-count, and output bounds;
+- interruption and crash recovery, including unknown-effect operations that
+  are never replayed automatically;
+- concurrency, ownership, cleanup, and preservation of foreign state;
+- resource-growth and leak observations with declared measurement bounds;
+- performance observations treated as evidence signals, not universal SLOs;
+- upgrade, rollback, and durable-state recovery rehearsal;
+- exact candidate, package, tuple, host, image, and guest identity; and
+- rollback behavior that never silently deletes user state, images, cells,
+  artifacts, or foreign provider objects.
+
+CI, mocks, WSL2, and static evidence cannot replace real-platform acceptance
+for an advertised tuple. This roadmap realignment does not manufacture a v0.8
+release, infer support from completed repository-local evidence, or change the
+meaning of A-G.
 
 ## Human-visible completion criterion
 
-A separately admitted v0.8 release, if created, demonstrates repeated reliable
-use for its advertised tuples without changing the completed repository-local
-A-G meaning or inferring support from it.
+A separately admitted v0.8 release, if created, binds all of the preceding
+candidate-specific evidence to its exact advertised tuples and demonstrates
+bounded repeated use and recovery without changing the completed
+repository-local A-G meaning or inferring support from it.
 
 ---
 

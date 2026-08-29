@@ -49,6 +49,25 @@ misstate history.
   decision is independently audited and merged. This authoring change does not
   update or close issues #43, #44, #45, #49, or #50.
 
+## History-preserving issue alignment
+
+Issue #43 remains the historical Apple/HVF Three-Host Portability planning
+record. Its title, body, comments, and timeline must not be retitled, rewritten,
+or made to imply that the planned Apple work was completed or accepted.
+
+After PR #77 is merged and exact-dev CI is green, the intended sequence is:
+
+1. Close Issue #43 as `not_planned` or superseded with a short pointer to this
+   ADR, PR #77, and the new v0.5 issue, while preserving all existing history.
+2. Create a new **v0.5 Windows/Linux Portability Closeout** issue.
+3. Update Issues #44, #45, #49, and #50 to depend on the new issue rather than
+   rewriting Issue #43 into a different project.
+
+The closeout must state that Apple/macOS/HVF work was deferred, not completed
+or accepted. Apple Silicon, Intel Mac, macOS lifecycle work, and HVF acceptance
+remain post-v1, non-blocking future direction. This ADR records the plan only;
+it does not authorize or perform any issue mutation.
+
 ## Residual occurrence classification
 
 Every remaining Apple/macOS/HVF occurrence must fit exactly one category:

@@ -846,37 +846,85 @@ mod tests {
     }
 
     #[test]
-    fn tcg_requires_both_explicit_flags_and_never_falls_back() {
+    fn tcg_allow_flag_without_explicit_accelerator_is_rejected() {
         let image = image(GuestOs::Linux, Architecture::X86_64, &["qemu"]);
         let probes = [ready_probe("qemu", &["tcg"], &["linux"], &["qga"])];
-        for rejected in [
-            RunSelectionIntent {
-                allow_tcg: true,
-                ..intent()
-            },
-            RunSelectionIntent {
-                explicit_accelerator: Some(RequestedAccelerator::Tcg),
-                ..intent()
-            },
-            intent(),
-        ] {
-            assert!(
-                resolve_run_execution_plan(host(HostOs::Linux), &image, &probes, rejected).is_err()
-            );
+        assert_eq!(
+            resolve_run_execution_plan(
+                host(HostOs::Linux),
+                &image,
+                &probes,
+                RunSelectionIntent {
+                    allow_tcg: true,
+                    ..intent()
+                },
+            ),
+            Err(RunSelectionError::TcgRequiresExplicitOptIn)
+        );
+    }
+
+    #[test]
+    fn explicit_tcg_without_allow_flag_is_rejected() {
+        let image = image(GuestOs::Linux, Architecture::X86_64, &["qemu"]);
+        let probes = [ready_probe("qemu", &["tcg"], &["linux"], &["qga"])];
+        assert_eq!(
+            resolve_run_execution_plan(
+                host(HostOs::Linux),
+                &image,
+                &probes,
+                RunSelectionIntent {
+                    explicit_accelerator: Some(RequestedAccelerator::Tcg),
+                    ..intent()
+                },
+            ),
+            Err(RunSelectionError::TcgRequiresExplicitOptIn)
+        );
+    }
+
+    #[test]
+    fn tcg_is_never_an_implicit_hardware_fallback() {
+        let image = image(GuestOs::Linux, Architecture::X86_64, &["qemu"]);
+        let probes = [ready_probe("qemu", &["tcg"], &["linux"], &["qga"])];
+        assert_eq!(
+            resolve_run_execution_plan(host(HostOs::Linux), &image, &probes, intent()),
+            Err(RunSelectionError::AcceleratorUnavailable)
+        );
+    }
+
+    #[test]
+    fn explicit_tcg_selects_only_documented_tuples() {
+        let image = image(GuestOs::Linux, Architecture::X86_64, &["qemu"]);
+        let probes = [ready_probe("qemu", &["tcg"], &["linux"], &["qga"])];
+        let explicit_tcg = RunSelectionIntent {
+            explicit_accelerator: Some(RequestedAccelerator::Tcg),
+            allow_tcg: true,
+            ..intent()
+        };
+        for host_os in [HostOs::Windows, HostOs::Linux] {
+            let plan =
+                resolve_run_execution_plan(host(host_os), &image, &probes, explicit_tcg).unwrap();
+            assert_eq!(plan.accelerator, Accelerator::Tcg);
+            assert_eq!(plan.support_status, SupportStatus::DevelopmentOnly);
         }
-        let plan = resolve_run_execution_plan(
-            host(HostOs::Linux),
-            &image,
-            &probes,
-            RunSelectionIntent {
-                explicit_accelerator: Some(RequestedAccelerator::Tcg),
-                allow_tcg: true,
-                ..intent()
-            },
-        )
-        .unwrap();
-        assert_eq!(plan.accelerator, Accelerator::Tcg);
-        assert_eq!(plan.support_status, SupportStatus::DevelopmentOnly);
+    }
+
+    #[test]
+    fn explicit_tcg_undocumented_tuple_fails_closed() {
+        let image = image(GuestOs::Linux, Architecture::X86_64, &["qemu"]);
+        let probes = [ready_probe("qemu", &["tcg"], &["linux"], &["qga"])];
+        assert_eq!(
+            resolve_run_execution_plan(
+                host(HostOs::Macos),
+                &image,
+                &probes,
+                RunSelectionIntent {
+                    explicit_accelerator: Some(RequestedAccelerator::Tcg),
+                    allow_tcg: true,
+                    ..intent()
+                },
+            ),
+            Err(RunSelectionError::UndocumentedCombination)
+        );
     }
 
     #[test]

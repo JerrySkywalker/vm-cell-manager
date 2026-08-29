@@ -22,4 +22,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-Platform-specific provider tests may require Hyper-V, QEMU, KVM, HVF, or WHPX and should be clearly marked when they cannot run in generic CI.
+Generic repository validation consists of fixture, static, and unit tests. It
+does not perform live Hyper-V, WHPX, KVM, QEMU, or HVF provider access in
+generic CI.
+
+Live provider tests are separate, explicitly admitted real-platform work. The
+active pre-v1 paths are Windows x86_64 with Hyper-V or QEMU/WHPX and native
+Linux x86_64 with QEMU/KVM. Any such live test must state its host prerequisites
+and must not be presented as part of the generic repository-local gate.
+
+macOS and HVF remain modeled as post-v1, non-blocking future direction. That
+deferral is not a permanent rejection of Apple support; future live macOS/HVF
+work requires its own admission and evidence.
