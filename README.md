@@ -6,8 +6,9 @@
 > candidate combines the v0.4 Reproducible Jobs surface with the reliability
 > A-G closeout, frozen-state compatibility contracts, and atomic Windows QEMU
 > Job containment. It is not a public release. Real Hyper-V, PowerShell Direct,
-> QEMU, WHPX, KVM, QGA, and HVF acceptance remains separately gated and is not
-> established by repository CI.
+> QEMU, WHPX, KVM, and QGA acceptance remains separately gated and is not
+> established by repository CI. macOS/HVF remains modeled vocabulary deferred
+> to a non-blocking post-v1 direction.
 
 The project is aimed at local development, CI, engineering software, and autonomous-tool workloads that need a clean, reproducible VM without turning a workstation into a cloud control plane.
 
@@ -34,13 +35,17 @@ There are already strong open-source VM tools. VM Cell Manager exists only for t
 - [smolvm](https://github.com/smol-machines/smolvm) is a strong Rust microVM runtime, but its current guest model is Linux-oriented.
 - [Multipass](https://github.com/canonical/multipass) provides excellent cross-platform Ubuntu/cloud-style instances, but is Ubuntu-centric and daemon-managed.
 - [Vagrant](https://github.com/hashicorp/vagrant) is a mature environment-provisioning system, but has a broader configuration/provisioning product model.
-- libvirt, QEMU, Hyper-V, Virtualization.framework, and similar systems are lower-level virtualization technologies rather than the narrow execution-cell abstraction this project targets.
+- libvirt, QEMU, Hyper-V, and similar systems are lower-level virtualization
+  technologies rather than the narrow execution-cell abstraction this project
+  targets; Apple Virtualization.framework is considered only as a post-v1
+  example in this roadmap.
 
 VM Cell Manager focuses on a deliberately smaller intersection:
 
 - full Windows and Linux guests as first-class workloads;
 - native Hyper-V on Windows rather than forcing a portable backend everywhere;
-- QEMU as the portable reference provider across KVM, HVF, and WHPX;
+- QEMU as the portable reference provider across pre-v1 KVM/WHPX paths, with
+  HVF retained only as post-v1 vocabulary;
 - immutable base images with disposable copy-on-write overlays;
 - local ownership and predictable cleanup;
 - machine-readable automation from day one;
@@ -62,13 +67,17 @@ If the project ever becomes merely another Linux microVM runtime, Ubuntu VM laun
     Hyper-V           QEMU          future providers
     Provider         Provider
        │               │
-       ▼        ┌──────┼──────┐
-    Windows     ▼      ▼      ▼
-               KVM    HVF    WHPX
-              Linux   mac    Windows
+       ▼        ┌──────┼──────────┐
+    Windows     ▼      ▼          ▼
+               KVM    WHPX       HVF
+              Linux   Windows   post-v1
 ```
 
-Windows uses Hyper-V as the first-class native path. QEMU is the portable reference provider: KVM on Linux, HVF on macOS, and WHPX on Windows. A future provider must solve a problem that these two do not; provider count is not a goal by itself.
+Windows uses Hyper-V as the first-class native path. The active pre-v1 host
+contract is Windows x86_64 and native Linux x86_64; QEMU uses WHPX on Windows
+and KVM on Linux. macOS/HVF remains modeled for post-v1 compatibility but has
+no active support row or release gate. A future provider must solve a problem
+that Hyper-V and QEMU do not; provider count is not a goal by itself.
 
 ### Internal architecture
 
@@ -197,8 +206,9 @@ infrastructure on a new state root. Guest
 credentials are accepted only through bounded stdin and are never written to
 state. Guest actions require a current installation identity, a pinned runtime,
 and an exact-owned running VM rechecked by its provider identity. Windows uses
-PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM, WHPX, and
-HVF acceptance remain separate host gates.
+PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM and WHPX
+acceptance remain separate pre-v1 host gates. HVF is a post-v1, non-blocking
+direction rather than an active gate.
 
 The optional [user configuration](docs/user-configuration.md) is bounded,
 versioned, and non-authorizing. CLI values win. Configuration may supply safe
@@ -329,7 +339,10 @@ transport status. An absent combination is not inferred from a similar row.
 Repository CI, mocks, fake protocols, and WSL2 evidence cannot promote a real
 platform combination to `supported`.
 
-An Apple Virtualization.framework provider may be considered later if it provides clear value beyond QEMU/HVF. libvirt, VirtualBox, VMware, Parallels, and cloud providers are not bootstrap dependencies.
+The active pre-v1 hosts are Windows x86_64 and native Linux x86_64. macOS,
+Apple Silicon, Intel Mac, HVF, and a possible Apple Virtualization.framework
+provider are explicitly deferred post-v1 and do not block that roadmap. libvirt,
+VirtualBox, VMware, Parallels, and cloud providers are not bootstrap dependencies.
 
 ## Engineering workloads
 
@@ -404,12 +417,12 @@ The first milestones are intentionally incremental:
 - **M0 — Architecture bootstrap:** complete; read-only provider discovery, domain model, documentation, and local-first self-hosted Windows CI.
 - **M1 — Hyper-V cell foundation:** repository-local implementation is merged; real Hyper-V acceptance remains gated.
 - **M2 — Windows guest control:** repository-local implementation is merged; real PowerShell Direct guest acceptance remains gated.
-- **M3 — QEMU provider:** repository-local QMP lifecycle, QCOW2 overlay, and QGA contracts are merged; real QEMU/WHPX/KVM/HVF acceptance remains gated.
+- **M3 — QEMU provider:** repository-local QMP lifecycle, QCOW2 overlay, and QGA contracts are merged; real pre-v1 QEMU/WHPX/KVM acceptance remains gated, while HVF vocabulary is preserved for post-v1.
 - **v0.3 Windows QEMU/WHPX:** the repository-local Linux QCOW2 + QGA path,
   executable/process identity hardening, [human walkthrough](docs/windows-qemu-whpx.md),
   and non-mutating acceptance preflight are implemented; real WHPX/QGA
   acceptance remains pending and the support row remains `untested`.
-- **M4 — Linux portability foundation:** Unix state/path/process and KVM capability foundations are merged; native Linux/KVM and macOS/HVF acceptance remains gated.
+- **M4 — Linux portability foundation:** Unix state/path/process and KVM capability foundations are merged; native Linux/KVM acceptance remains gated and the historical macOS/HVF direction is now explicitly post-v1.
 - **v0.3 native Linux QEMU/KVM/QGA:** the repository-local Linux human workflow,
   typed KVM admission, bounded Unix control endpoints, exact process/state
   identity, [walkthrough](docs/linux-kvm-qga.md), and non-mutating acceptance
@@ -424,6 +437,9 @@ The first milestones are intentionally incremental:
   operation/artifact correlation, and explicit repeatability compatibility are
   implemented. They reuse existing lifecycle authority, do not add provisioning
   or scheduling, and do not promote any real-platform support row.
+- **v0.5 Windows and Linux Portability Closeout:** the active pre-v1 host list is
+  Windows x86_64 and native Linux x86_64; workflow/distribution parity and an
+  independent audit close the milestone without support promotion.
 
 Provider-specific capabilities such as TPM, Secure Boot, nested virtualization, GPU/device support, or additional native providers come only after the core lifecycle is stable.
 

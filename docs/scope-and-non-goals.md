@@ -4,10 +4,11 @@ VM Cell Manager is intentionally narrow. Its purpose is to make a disposable ful
 
 ## In scope
 
-- Windows, Linux, and macOS host portability where the underlying platform permits it.
+- Windows x86_64 and native Linux x86_64 host portability before v1.
 - Full-system Windows and Linux guests as first-class engineering workloads.
 - Native Hyper-V on Windows.
-- QEMU with KVM, HVF, and WHPX as the portable reference path.
+- QEMU with KVM and WHPX as active pre-v1 paths; macOS/HVF remains a post-v1
+  modeled direction without an active support row.
 - Immutable logical images with provider-specific variants.
 - Single-layer copy-on-write cell overlays.
 - Local lifecycle: create, start, inspect, stop, destroy, garbage collect.

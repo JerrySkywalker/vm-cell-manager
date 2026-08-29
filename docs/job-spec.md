@@ -54,6 +54,10 @@ timeout_seconds = 60
 max_bytes_per_file = 1048576
 ```
 
+`hvf` remains accepted typed vocabulary for post-v1 compatibility but has no
+active support row. `tcg` always requires explicit accelerator selection plus
+`allow_tcg = true`; neither value is an implicit fallback.
+
 Unknown fields, unsupported schema versions, invalid resource/timeout bounds,
 unsafe guest paths, invalid provider/accelerator combinations, and authority-
 like or credential fields fail deterministically before lifecycle authority.

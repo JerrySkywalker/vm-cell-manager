@@ -20,7 +20,7 @@ Every real-platform claim binds all of the following at once:
 | Binding | Required exact evidence | Never substitute |
 | --- | --- | --- |
 | Candidate | Frozen release commit, clean checkout, binary version/hash, and receipt contract | A later `dev` build, merge parent, or an unbound package |
-| Tuple | Host OS/architecture, provider, accelerator, guest OS/architecture, and transport | A related accelerator, another guest, Intel macOS for Apple Silicon, or explicit TCG |
+| Tuple | Host OS/architecture, provider, accelerator, guest OS/architecture, and transport | A related accelerator, another guest, a different host architecture, or explicit TCG |
 | Host | Effective identity, private state/runtime root, canonical tools, capability, writer window, and foreign prestate | Core CI, WSL2, a shared workstation, or a host without exclusive control |
 | Image and guest | Canonical ordinary base, format, content hash/size, provenance, backing chain, and transport expectation | A same-named image, a mutated base, or a different guest build |
 | Run and cleanup | Exact-owned namespace, lifecycle/guest evidence, recovery result, cleanup proof, and foreign poststate | Name/PID/socket-only discovery or manual cleanup of ambiguous state |
@@ -54,13 +54,14 @@ the release-specific packet supplies the exact candidate, tuple, and sequence.
 | v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | Windows/x86_64 + QEMU/WHPX + Linux/x86_64 + credentialless QGA | Same exact candidate repository evidence; atomic Job/empty-tree contracts; R5 dry run only | `V041-R5-WHPX-QGA-V1`; dedicated authorized host/window, exact QEMU/QCOW2/guest/package/ownership/cleanup bindings | `NOT_EXECUTED` |
 | v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | Native Linux/x86_64 + QEMU/KVM + Linux/x86_64 + credentialless QGA | Same exact candidate repository evidence; native Linux package and fixture contracts; R5 dry run only | `V041-R5-KVM-QGA-V1`; dedicated native authorized host/window, exact KVM/QEMU/QCOW2/guest/package/cleanup bindings | `NOT_EXECUTED` |
 | v0.4.1 `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | JobSpec overlay on one exact accepted v0.4.1 base tuple | Same exact candidate JobSpec/result/artifact compatibility and two-run contract rehearsal | `V041-R5-JOBSPEC-OVERLAY-V1`; same A5 window as an exact base packet with terminal `PASS` | `NOT_EXECUTED` |
-| v0.5 planning base `0e7fcf37f4310562d318f9d5c709ddf8e8ca1637` | macOS/Apple Silicon/aarch64 + QEMU/HVF + Linux/aarch64 + credentialless QGA | Corrected frozen v0.4.1 repository baseline; no macOS lifecycle evidence | [v0.5 preflight handoff](#v05--apple-silicon-observe-only-preflight); dedicated Apple-Silicon host and fresh observe-only preflight | `BLOCKED_EXTERNAL` |
 
 `Windows QEMU/WHPX` and `native Linux QEMU/KVM` are separate tuple rows. WSL2,
 fixture success, package validation, or a capability probe cannot satisfy either
 row. v0.4 is an overlay: its JobSpec resolves through existing image/provider/
 accelerator/guest/lifecycle authority and never carries image bytes,
 provisioning, credentials, or a second lifecycle state machine.
+The frozen register intentionally ends at v0.4.1. The v0.5 roadmap decision
+does not add fabricated Windows/Linux acceptance or a future-host planning row.
 
 ## Tooling and receipt ownership
 
@@ -70,15 +71,14 @@ conservative support status. The repository verifies that shared core in
 `tests/acceptance_receipt_templates.rs`.
 
 Do not merge the host collectors. Windows ACL/reparse/process semantics, Linux
-UID/mode/device-inode/atomic-publication semantics, Hyper-V VM/switch/VHDX
-inventory, and future macOS/HVF admission are distinct safety boundaries.
+UID/mode/device-inode/atomic-publication semantics and Hyper-V
+VM/switch/VHDX inventory are distinct Windows/Linux safety boundaries.
 
 | Path | Repository-local owner | Boundary |
 | --- | --- | --- |
 | Hyper-V + PowerShell Direct | [M1 gate](m1-hyperv-acceptance.md) and the v0.1/v0.2 packets below | Manual owner packet only; no script claims to preflight Hyper-V acceptance. |
 | Windows QEMU/WHPX + QGA | `tools/windows-whpx-preflight.ps1`, its fixture test, and [`windows-whpx-acceptance-template.json`](receipts/windows-whpx-acceptance-template.json) | Fixture preflight is non-mutating and never starts QEMU or enables WHPX. |
 | Native Linux QEMU/KVM + QGA | `tools/linux-kvm-preflight.sh`, its fixture/race test, and [`linux-kvm-acceptance-template.json`](receipts/linux-kvm-acceptance-template.json) | Fixture preflight is non-mutating and never creates a VM, issues KVM ioctls, or repairs KVM. |
-| macOS QEMU/HVF + QGA | [issue #43](https://github.com/JerrySkywalker/vm-cell-manager/issues/43) and the v0.5 packet below | No repository collector is admitted before the dedicated Apple-Silicon host preflight. |
 
 Each current JSON acceptance template is a *pending*, `authorizing: false`
 template. A future filled acceptance record must still have a separate operator
@@ -144,16 +144,13 @@ operation/artifact correlation, bounds, cleanup disposition, and retained
 unknown-effect state. A job ID or source digest never authorizes replay, reuse,
 image import, or cleanup.
 
-### v0.5 — Apple-Silicon observe-only preflight
+## Post-v1 deferred Apple direction
 
-Keep issue #43 open and do not start v0.5 slices. On the future dedicated
-Apple-Silicon host, observe macOS version/build, native arm64 identity, private
-state root, canonical `qemu-system-aarch64`/`qemu-img` identities/hashes, HVF
-capability, immutable Ubuntu 24.04 LTS aarch64 QCOW2/QGA provenance, bounded
-socket namespace, foreign QEMU/socket/writer prestate, and writer exclusivity.
-Report zero VM launches, QMP/QGA connections, guest operations, image writes,
-package installs, driver/network/service/ACL changes, and reboots. A passing
-preflight is only input to a later admitted implementation/acceptance goal.
+macOS, Apple Silicon, Intel Mac, and HVF are post-v1 and non-blocking. There is
+no active pre-v1 support row, acceptance packet, collector/tool owner, package
+gate, or release gate for those paths. A future Apple effort must begin with a
+new audited repository decision and a separately authorized, architecture-
+specific evidence design; this historical register supplies no acceptance.
 
 ## Ordering and correction rule
 

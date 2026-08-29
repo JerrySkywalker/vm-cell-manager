@@ -80,9 +80,8 @@ cleanup_and_poststate:
 2. State the exact release-specific overlay used:
    - v0.1 baseline lifecycle and PowerShell Direct;
    - v0.2 repeated session/image/state behavior;
-   - v0.3 Windows WHPX or native Linux KVM QGA path;
-   - v0.4 JobSpec/result correlation on an already accepted base tuple; or
-   - v0.5 Apple-Silicon observe-only preflight.
+   - v0.3 Windows WHPX or native Linux KVM QGA path; or
+   - v0.4 JobSpec/result correlation on an already accepted base tuple.
 3. State every missing or mismatched prerequisite as a bounded terminal result.
    Do not repair host configuration, install packages, enable features, change
    permissions/groups, load modules, alter networking, or adopt foreign state.

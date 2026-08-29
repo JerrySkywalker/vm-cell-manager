@@ -393,15 +393,15 @@ fn release_acceptance_matrix_retires_frozen_candidates_without_promotion() {
             "Overlay on an independently accepted v0.1/v0.3 tuple",
             "RETIRED_CORRECTION_REQUIRED",
         ),
-        (
-            "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
-            "macOS/Apple Silicon/aarch64 + QEMU/HVF + Linux/aarch64 + credentialless QGA",
-            "BLOCKED_EXTERNAL",
-        ),
     ] {
         assert!(row(candidate, tuple).contains(status));
     }
-    assert!(ACCEPTANCE_MATRIX.contains("issue #43"));
+    let active_matrix = ACCEPTANCE_MATRIX
+        .split("## Post-v1 deferred Apple direction")
+        .next()
+        .expect("acceptance matrix must have an active section");
+    assert!(!active_matrix.contains("v0.5 planning base"));
+    assert!(!active_matrix.contains("Apple-Silicon observe-only preflight"));
     assert!(
         ACCEPTANCE_MATRIX
             .contains("A later release does not retroactively accept an older frozen candidate.")
@@ -446,7 +446,6 @@ fn owner_packet_template_is_sanitized_and_non_authorizing() {
         "v0.2 repeated session/image/state behavior",
         "v0.3 Windows WHPX or native Linux KVM QGA path",
         "v0.4 JobSpec/result correlation",
-        "v0.5 Apple-Silicon observe-only preflight",
         "`PREFLIGHT_PASS`, `PASS`, `PARTIAL`, `BLOCKED_EXTERNAL`, or",
         "real_platform_acceptance: pending`",
         "with `completed` only for a completed authorized run",
@@ -458,6 +457,7 @@ fn owner_packet_template_is_sanitized_and_non_authorizing() {
             "owner packet template omitted required contract field: {required_text}"
         );
     }
+    assert!(!OWNER_PACKET_TEMPLATE.contains("v0.5 Apple-Silicon"));
     for prohibited_text in ["password:", "credential:", "command_argv:", "guest_output:"] {
         assert!(
             !OWNER_PACKET_TEMPLATE.contains(prohibited_text),

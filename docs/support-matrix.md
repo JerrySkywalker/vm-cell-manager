@@ -27,8 +27,6 @@ Repository-local tests validate the source and require this file to match it byt
 | linux | x86_64 | qemu | kvm | linux | x86_64 | qga | `untested` | none |
 | linux | x86_64 | qemu | kvm | linux | x86_64 | ssh | `unsupported` | none |
 | linux | x86_64 | qemu | tcg | linux | x86_64 | qga | `development-only` | none |
-| macos | x86_64 | qemu | hvf | linux | x86_64 | qga | `untested` | none |
-| macos | x86_64 | qemu | tcg | linux | x86_64 | qga | `development-only` | none |
 
 An absent combination is undocumented and must fail closed; it never inherits support from a similar row.
 No current row is `supported` or `experimental`. Repository CI, mocks, fake protocols, and WSL2 development evidence cannot promote a row; those statuses require declared real-platform acceptance evidence.

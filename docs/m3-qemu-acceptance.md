@@ -75,4 +75,5 @@ may require operator cleanup inside the disposable cell.
 
 Real Linux/KVM acceptance requires a real Linux host. WSL2 may validate builds,
 Unix compilation, state permissions, symlink containment, and fake protocol
-tests, but is not final KVM acceptance. macOS/HVF acceptance is deferred.
+tests, but is not final KVM acceptance. The historical macOS/HVF direction is
+now explicitly deferred post-v1 and does not block pre-v1 QEMU closeout.

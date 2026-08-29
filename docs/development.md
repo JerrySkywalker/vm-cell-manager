@@ -24,8 +24,9 @@ cargo test --locked --workspace --all-features --doc
 Core CI observes Rust code on the dedicated self-hosted Windows `core` runner,
 while the manual GitHub-hosted Windows lane supplies disposable repository
 correctness evidence. Both remain non-privileged with respect to VM lifecycle.
-Real provider acceptance must use a different, explicitly isolated runner/host
-that exposes Hyper-V, KVM, HVF, or WHPX. See
+Real provider acceptance must use a different, explicitly isolated runner/host.
+The active pre-v1 paths expose Hyper-V, KVM, or WHPX; HVF remains a post-v1
+modeled capability and is not a current acceptance gate. See
 `docs/adr/0016-disposable-correctness-and-windows-performance-evidence.md`.
 
 ## Branch and integration policy
@@ -59,7 +60,8 @@ force-push or allow a hotfix to remain unsynchronized.
 
 Repository-local merge eligibility and real-platform acceptance are distinct.
 P0/P1-clean, exact-head-green work may merge while separately documented
-Hyper-V, PowerShell Direct, QEMU, KVM, WHPX, or HVF acceptance remains pending.
+Hyper-V, PowerShell Direct, QEMU, KVM, or WHPX acceptance remains pending.
+Post-v1 HVF vocabulary does not add a pre-v1 merge or release dependency.
 Never describe mock, WSL2, or core CI evidence as real-provider acceptance.
 
 The Windows portable-package contract is implemented by
@@ -179,7 +181,9 @@ not substitute for real provider or guest acceptance.
 
 - Windows-native lifecycle work belongs under `src/providers/hyperv`.
 - Provider-neutral mutation ordering and ownership proof belong under `src/engine`.
-- Portable QEMU lifecycle work belongs under `src/providers/qemu`; KVM/HVF/WHPX are accelerators, not separate top-level providers.
+- Portable QEMU lifecycle work belongs under `src/providers/qemu`; KVM and WHPX
+  are active pre-v1 accelerators, while HVF is a preserved post-v1 accelerator
+  vocabulary value rather than a separate top-level provider or support row.
 - Unix state is private-owner state: directories `0700`, files `0600`, and
   authority-bearing opens use no-follow/inode checks.
 - PowerShell Direct, QGA, and SSH belong under `src/guest`.

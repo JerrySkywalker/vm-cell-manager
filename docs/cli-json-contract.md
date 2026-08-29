@@ -54,6 +54,10 @@ vmcell operation reconcile OPERATION_ID
 vmcell gc
 ```
 
+The `hvf` token is preserved post-v1 parsing vocabulary and does not imply an
+active macOS support row. TCG requires both explicit `--accelerator tcg` and
+`--allow-tcg`; native accelerator failure never falls back to it.
+
 `--config PATH`, `--state-root PATH`, `--lock-timeout-ms N`, and
 `--human-output normal|quiet` are global. The lock timeout is
 bounded to 30 seconds per state-lock acquisition, defaults to fail-fast, and

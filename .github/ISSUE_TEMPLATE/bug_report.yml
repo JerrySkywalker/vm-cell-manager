@@ -20,14 +20,14 @@ body:
       options:
         - Windows
         - Linux
-        - macOS
+        - macOS (post-v1 modeled vocabulary)
     validations:
       required: true
   - type: input
     id: provider
     attributes:
       label: Provider
-      placeholder: hyperv, qemu/kvm, qemu/hvf, qemu/whpx
+      placeholder: hyperv, qemu/kvm, qemu/whpx, qemu/hvf (post-v1)
     validations:
       required: true
   - type: textarea

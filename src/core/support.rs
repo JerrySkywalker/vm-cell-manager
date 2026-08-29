@@ -303,32 +303,6 @@ pub const SUPPORT_MATRIX: &[SupportMatrixEntry] = &[
         status: SupportStatus::DevelopmentOnly,
         acceptance_evidence: NO_EVIDENCE,
     },
-    SupportMatrixEntry {
-        key: SupportKey {
-            host_os: HostOs::Macos,
-            host_architecture: Architecture::X86_64,
-            provider: ProviderId::Qemu,
-            accelerator: Accelerator::Hvf,
-            guest_os: GuestOs::Linux,
-            guest_architecture: Architecture::X86_64,
-            guest_transport: GuestTransportId::Qga,
-        },
-        status: SupportStatus::Untested,
-        acceptance_evidence: NO_EVIDENCE,
-    },
-    SupportMatrixEntry {
-        key: SupportKey {
-            host_os: HostOs::Macos,
-            host_architecture: Architecture::X86_64,
-            provider: ProviderId::Qemu,
-            accelerator: Accelerator::Tcg,
-            guest_os: GuestOs::Linux,
-            guest_architecture: Architecture::X86_64,
-            guest_transport: GuestTransportId::Qga,
-        },
-        status: SupportStatus::DevelopmentOnly,
-        acceptance_evidence: NO_EVIDENCE,
-    },
 ];
 
 #[derive(Debug, Error, PartialEq, Eq)]

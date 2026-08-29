@@ -175,7 +175,7 @@ fn run_selection_matrix_has_stable_outcomes_and_never_implicitly_selects_tcg() {
         "vmcell.run_plan.unsupported_combination",
     );
     assert_selection_error(
-        "undocumented-apple-silicon-row",
+        "modeled-post-v1-macos-hvf-row",
         HostPlatform {
             os: HostOs::Macos,
             architecture: Architecture::Aarch64,
