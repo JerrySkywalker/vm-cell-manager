@@ -63,16 +63,18 @@ for the R5 boundary. The tool also rejects a missing, dynamic, writable,
 attached, differencing, or parented VHDX. It leaves all such evidence untouched.
 Before live observation uses provenance, it reads one UTF-8 JSON snapshot,
 rejects a reparse-point file or parent, and compares the before/after content
-digest. A missing, changed, or unsafe receipt becomes an evidence gap and can
-never produce `PREFLIGHT_ELIGIBLE`. The live result digest is derived from its
-ordered sanitized observations, not wall-clock time.
+digest. The state root, VHDX, candidate package, and candidate binary also
+must each be ordinary non-reparse paths with non-reparse ancestors. A missing,
+changed, or unsafe receipt or path becomes an evidence gap and can never
+produce `PREFLIGHT_ELIGIBLE`. The live result digest is derived from its ordered
+sanitized observations, not wall-clock time.
 
 ## Provenance template
 
 Start with
 [`windows-hyperv-image-provenance-template.json`](receipts/windows-hyperv-image-provenance-template.json).
 The template deliberately contains placeholders, not evidence. A completed
-owner packet must bind the exact candidate SHA, package and binary hashes,
+owner packet must bind the exact v0.4.1 candidate SHA and version, package and binary hashes,
 Windows edition/build, source, VHDX digest, generation and security properties,
 parent/attachment state, creation time, immutability declaration, receipt, and
 exclusive-window evidence before live observation can evaluate it.
@@ -81,7 +83,7 @@ The non-executing packet instructions are in
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-preflight.ps1` runs 31 deterministic checks. It
+`tools/test-windows-hyperv-preflight.ps1` runs 39 deterministic checks. It
 includes the eligible fixture; evidence gaps and failed predicates for every
 R5 boundary; malformed input, deterministic rendering, path/secret-like input
 redaction, and a guarded fixture-isolation process. Its AST deny list rejects
