@@ -1,7 +1,7 @@
 # Windows Hyper-V v0.4.1 owner-preview guide
 
-Status: **tooling contract only**  
-Real-platform acceptance: **NOT_STARTED**  
+Status: **tooling contract only**
+Real-platform acceptance: **NOT_STARTED**
 Support status: **untested**
 
 This guide binds a future owner-local preview to the frozen VMCell `0.4.1`
