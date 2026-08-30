@@ -123,9 +123,11 @@ The long-term topology has three mechanically distinct purposes:
 2. The current shared self-hosted Windows runner is R4-only, optional for merge
    correctness, and useful for performance/diagnostic observation. Its existing
    30-minute contract remains unchanged.
-3. Dedicated real Windows/Linux/macOS hosts are R5 provider-acceptance systems.
-   They require explicit owner authority, a release-specific tuple and receipt,
-   exclusive host/state-root control, and pre/post foreign-state proof.
+3. Dedicated real Windows/Linux hosts are the active pre-v1 R5
+   provider-acceptance systems. They require explicit owner authority, a
+   release-specific tuple and receipt, exclusive host/state-root control, and
+   pre/post foreign-state proof. Any macOS host is a post-v1 direction requiring
+   a new admission decision rather than a current R5 dependency.
 
 The repository dispatcher keys concurrency by selected lane plus exact source
 SHA. Cross-lane evidence may run or wait independently; a new pending request

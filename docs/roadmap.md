@@ -53,7 +53,7 @@ Version tags are immutable and are never moved, deleted, or reused. A correction
 
 # Completed technical foundation — M0-M5
 
-These milestones are retained as completed foundation history. They describe the internal technical capabilities that made the human-usable product roadmap possible; they are not the future release numbering scheme.
+These milestones are retained as completed foundation history. They describe the internal technical capabilities that made the human-usable product roadmap possible; they are not the future release numbering scheme. Apple/macOS/HVF references inside M0-M5 record historical abstraction goals and confer no active pre-v1 dependency.
 
 ## M0 — Architecture bootstrap
 
@@ -158,9 +158,16 @@ M5 was delivered as sequential short PRs against green integration history rathe
 
 The current code already contains Hyper-V and QEMU provider abstractions, immutable image registration and copy-on-write cells, lifecycle operations, PowerShell Direct and QGA guest-control implementations, exec/copy/artifact workflows, TTL/GC, versioned automation contracts, crash/concurrency foundations, and Windows/Unix host-safety abstractions.
 
-A user may inspect and exercise non-destructive CLI behavior, but the project must not yet claim a real Windows, Linux, QEMU, KVM, WHPX, or HVF production path solely from repository-local evidence.
+A user may inspect and exercise non-destructive CLI behavior, but the project
+must not yet claim a real Windows, Linux, QEMU, KVM, or WHPX production path
+solely from repository-local evidence. HVF is preserved post-v1 vocabulary, not
+an active production claim.
 
 The package currently uses pre-1.0 versioning, but no official release tag is assigned to this foundation baseline. The first official `v0.1.0` tag is created only after the release workflow below succeeds.
+
+The v0.1-v0.4 sections below are retained historical release narratives. Their
+Apple/macOS/HVF exclusions or deferrals are non-authorizing historical context;
+the active forward roadmap begins at the resequenced v0.5 section.
 
 ---
 
@@ -623,49 +630,62 @@ A user can place a small versioned vmcell job specification next to a project an
 
 ---
 
-# v0.5.0 — Three-Host Portability
+# v0.5.0 — Windows and Linux Portability Closeout
 
 ## Product promise
 
-> Windows, Linux, and macOS users can use the same vmcell product model on an explicitly supported local virtualization path.
+> Windows x86_64 and native Linux x86_64 users can follow the same conservative
+> vmcell product model without an undeclared host becoming a pre-v1 dependency.
 
-This closes the original desktop-host portability story.
+The active pre-v1 host list is exactly Windows x86_64 and native Linux x86_64.
+Repository correctness never substitutes for real-platform evidence, and this
+milestone does not promote a support row.
 
-## Required accepted platform path
+## Sequential slices
 
-Add real macOS acceptance through QEMU/HVF and a supported guest. Supported host architecture is stated explicitly; Apple Silicon and Intel are not treated as equivalent unless both are tested.
+### A. Active Windows/Linux platform contract
 
-## Required capabilities
+- make the authoritative pre-v1 host list explicit across product,
+  architecture, development, support, and acceptance documentation;
+- retain a conservative typed support catalog in which every undeclared tuple
+  is absent and fails closed;
+- preserve future parsing and capability vocabulary without turning it into an
+  active row or release gate;
+- keep Windows/Linux TCG rows development-only, explicit-only, and never a
+  fallback;
+- do not promote any Windows or Linux row without exact real-platform evidence.
 
-- real QEMU/HVF accelerator discovery and architecture diagnostics;
-- immutable QCOW2 base/overlay lifecycle;
-- QMP/QGA where supported;
-- command execution, artifact transfer, interruption, cleanup, foreign-state preservation;
-- native supported macOS binary for each claimed architecture;
-- platform-consistent doctor/image/run/inspect/destroy UX;
-- explicit distinction among hardware virtualization, emulation required, and unsupported architecture combinations;
-- no silent TCG fallback.
+### B. Two-host workflow and distribution parity
 
-After real QEMU/HVF experience exists, explicitly decide whether a native Apple Virtualization.framework provider solves a demonstrated gap. Provider count remains a cost, not a goal.
+- align `doctor`, image validation/registration, `run`, status/inspection,
+  recovery, and package behavior and documentation for Windows x86_64 and
+  native Linux x86_64;
+- retain provider differences as explicit capabilities rather than forcing a
+  false lowest-common-denominator implementation;
+- require deterministic package and workflow contracts for both hosts while
+  keeping repository CI non-authorizing for real-platform claims.
 
-## Explicitly not required
+### C. Audit and closeout
 
-- feature parity for every guest OS on every host;
-- Apple Virtualization.framework provider;
-- nested virtualization;
-- GPU/device assignment;
-- GUI;
-- cloud execution.
+- prove no undeclared host remains an active pre-v1 dependency;
+- prove frozen v0.4.1 and all four exact R5 `NOT_EXECUTED` rows are unchanged;
+- require exact-head and exact-`dev` GitHub-hosted Windows and Linux correctness;
+- require an independent audit before merge.
 
 ## Human-visible completion criterion
 
-A documented Windows, Linux, or macOS user can install vmcell and recognize substantially the same product/workflow on each supported platform.
+A documented Windows x86_64 or native Linux x86_64 user sees a consistent
+product workflow, with provider differences and unevidenced support status
+stated explicitly.
 
 ---
 
 # v0.6.0 — Image and Distribution Maturity
 
 **Admission status:** architecture planning is recorded in [issue #44](https://github.com/JerrySkywalker/vm-cell-manager/issues/44). Product implementation remains sequenced after v0.5 closeout; publication and real-platform acceptance remain separate owner gates.
+
+This milestone depends on the v0.5 Windows/Linux closeout, not on an undeclared
+host or unavailable hardware.
 
 ## Product promise
 
@@ -719,7 +739,10 @@ A user can install vmcell on a new supported machine, import a known image defin
 
 ### Supported platform matrix
 
-Primary advertised combinations have repeated real-platform acceptance and are categorized explicitly as supported, experimental, development-only, untested, or unsupported. There is no ambiguous "should work" category.
+Only tuples actually advertised for the beta require repeated real-platform
+acceptance. Every declared tuple is categorized explicitly as supported,
+experimental, development-only, untested, or unsupported; there is no
+ambiguous "should work" category and no dependency on an undeclared host.
 
 ### Installation documentation
 
@@ -749,45 +772,41 @@ A technically competent external user can install vmcell, follow the public supp
 
 # v0.8.0 — Reliability Beta
 
-## Product promise
+## Repository-local status
 
-> vmcell remains trustworthy under repeated, interrupted, concurrent, upgraded, and long-running everyday use, not only in a one-off demonstration.
+Reliability packets A-G are already `COMPLETE_REPOSITORY_LOCAL` under
+[issue #48](https://github.com/JerrySkywalker/vm-cell-manager/issues/48). Their
+completed repository-local evidence is reusable foundation; it is not
+candidate-specific real-platform evidence, does not create a v0.8 release or
+support claim, and does not reopen the completed repository-local A-G work.
 
-This milestone is deliberately reliability-heavy rather than feature-heavy.
+## Exact-candidate obligations
 
-## Required validation themes
+A future exact v0.8 candidate must obtain bounded, candidate-specific evidence
+for every tuple it advertises. The qualification must cover:
 
-### Repeated lifecycle stress
+- repeated/soak operation with fixed duration, case-count, and output bounds;
+- interruption and crash recovery, including unknown-effect operations that
+  are never replayed automatically;
+- concurrency, ownership, cleanup, and preservation of foreign state;
+- resource-growth and leak observations with declared measurement bounds;
+- performance observations treated as evidence signals, not universal SLOs;
+- upgrade, rollback, and durable-state recovery rehearsal;
+- exact candidate, package, tuple, host, image, and guest identity; and
+- rollback behavior that never silently deletes user state, images, cells,
+  artifacts, or foreign provider objects.
 
-Exercise large repeated create/start/exec/artifact/stop/destroy sequences and prove no systematic accumulation of owned VMs, overlays, sockets, orphaned processes, stale operation state, or unbounded artifacts.
-
-### Crash/interruption campaigns
-
-Validate vmcell process termination, guest command timeout, provider process death, host session loss where relevant, reboot where a supported recovery contract exists, and corrupted/incomplete durable records. Unknown effects remain non-replayed unless explicitly safe.
-
-### Concurrency behavior
-
-Define deterministic locking, contention diagnostics, and safe serialization of conflicting local mutations without turning vmcell into a daemon or scheduler.
-
-### Upgrade matrix
-
-Repeatedly prove supported upgrades across real previous released versions. Durable-state evolution becomes part of release acceptance.
-
-### Resource bounds
-
-Document/validate practical bounds for command output, copy sizes, artifact retention, concurrent cells where applicable, timeout values, disk growth, and state growth.
-
-### Performance baseline
-
-Establish observational regression baselines for create/start/guest-ready/destroy. They are regression signals, not hard cross-machine guarantees.
-
-### Long-running usage
-
-Use realistic multi-hour workloads to expose TTL, timeout, guest-transport, artifact, and cleanup reliability issues.
+CI, mocks, WSL2, and static evidence cannot replace real-platform acceptance
+for an advertised tuple. This roadmap realignment does not manufacture a v0.8
+release, infer support from completed repository-local evidence, or change the
+meaning of A-G.
 
 ## Human-visible completion criterion
 
-A user can keep vmcell installed and use it repeatedly over an extended period without regularly needing to manually repair vmcell state or provider leftovers.
+A separately admitted v0.8 release, if created, binds all of the preceding
+candidate-specific evidence to its exact advertised tuples and demonstrates
+bounded repeated use and recovery without changing the completed
+repository-local A-G meaning or inferring support from it.
 
 ---
 
@@ -798,6 +817,9 @@ A user can keep vmcell installed and use it repeatedly over an extended period w
 > The intended v1.0 feature set is substantially complete; remaining work is contract validation, compatibility, documentation, and release hardening.
 
 No broad new subsystem should normally enter after this point.
+
+The contract freeze depends on the preceding Windows/Linux product closeout
+and advertised-tuple evidence; an undeclared host is not a freeze prerequisite.
 
 ## Contract freeze candidates
 
@@ -838,6 +860,9 @@ A user of the final `v0.9.x` / `v1.0.0-rc` experiences essentially the same norm
 > vmcell is a stable, installable, documented local runtime for creating disposable full-system execution cells on explicitly supported desktop/server host platforms, with predictable automation contracts and safe ownership/cleanup semantics.
 
 v1.0 is primarily a **contract commitment**, not a declaration that every virtualization feature exists.
+
+Stable readiness depends on evidence for declared Windows/Linux paths and the
+tuples actually advertised. It does not wait for undeclared host work.
 
 ## Required v1 guarantees
 
@@ -897,7 +922,6 @@ The following may be useful future capabilities but are not prerequisites for a 
 - Secure Boot / vTPM on every provider;
 - shared folders;
 - snapshot/checkpoint trees;
-- Apple Virtualization.framework provider;
 - libvirt provider.
 
 Some may be added before v1 only when a concrete user requirement and safe design justify them; they must not become artificial release gates.
@@ -910,7 +934,18 @@ After v1.0, roadmap decisions are demand-driven rather than completeness-driven.
 
 Potential execution-cell capabilities include Secure Boot/vTPM, nested virtualization, controlled shared folders, GPU/device capability discovery/assignment, and richer network isolation policies.
 
-Additional providers are justified only by demonstrated value: Apple Virtualization.framework if QEMU/HVF leaves a material gap, or libvirt if it materially improves Linux operational integration.
+## Deferred Apple platforms and accelerators
+
+macOS, Apple Silicon, Intel Mac, and HVF are deferred post-v1, non-blocking
+directions. Their typed vocabulary remains modeled, but there is no active
+support row, acceptance packet, package gate, CI gate, or pre-v1 release
+dependency. A future effort must bind the exact host architecture and produce
+honest real-platform evidence before declaring a row.
+
+A possible Apple Virtualization.framework provider may be considered only if
+post-v1 QEMU/HVF experience demonstrates a material gap. Deferral does not mean
+that either path is impossible or unsupported forever. Additional providers
+such as libvirt likewise require demonstrated product value.
 
 Higher-level coordination normally remains above vmcell:
 
@@ -956,7 +991,7 @@ v0.3  Windows + Linux Human MVP
 v0.4  Reproducible Jobs
         |
         v
-v0.5  Windows + Linux + macOS portability
+v0.5  Windows + Linux Portability Closeout
         |
         v
 v0.6  Image / Distribution maturity
@@ -977,7 +1012,7 @@ v1.0  Stable Execution Cell Runtime
 Repository-local v0.4 Reproducible Jobs implementation is complete in the
 corrected frozen `release/v0.4.1` baseline. Post-freeze qualification tooling
 continues on `dev` and does not change the candidate tree.
-The next repository-development milestone is **v0.5.0 — Three-Host
-Portability**, subject to separate admission and a dedicated macOS environment.
+The next repository-development milestone is **v0.5.0 — Windows and Linux
+Portability Closeout**, followed by a separate independent audit before merge.
 Public release advancement remains separately blocked on dedicated
 real-platform acceptance, beginning with the frozen earlier candidates.

@@ -4,6 +4,9 @@ VM Cell Manager is not based on the premise that cross-platform VM tooling is em
 
 This document records the initial comparison so future contributors can decide when to build, wrap, or stop.
 
+References below to Apple platforms describe competitor capabilities and
+post-v1 research only. They are not active vmcell support rows or pre-v1 gates.
+
 ## smolvm
 
 Project: https://github.com/smol-machines/smolvm
@@ -66,7 +69,8 @@ Project: https://github.com/lima-vm/lima
 
 Lima is an excellent Linux-VM environment, especially on macOS. It is not the primary reference for full Windows engineering guests across all three host families.
 
-Decision: study its QEMU/HVF and host integration choices where relevant, but keep Windows/full-system requirements explicit.
+Decision: consider its QEMU/HVF and host integration choices only in a post-v1
+Apple effort; keep current Windows/full-system requirements explicit.
 
 ## Tart
 
@@ -74,7 +78,8 @@ Project: https://github.com/cirruslabs/tart
 
 Tart is a strong Apple Silicon virtualization/CI tool for macOS and Linux guests.
 
-Decision: study image/OCI and CI ergonomics for a future macOS-native path; do not make Apple Silicon the sole architecture model.
+Decision: study image/OCI and CI ergonomics only for a post-v1 macOS-native
+path; do not make Apple Silicon the sole architecture model.
 
 ## libvirt / virt-manager
 

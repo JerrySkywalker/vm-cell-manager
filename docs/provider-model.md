@@ -28,9 +28,11 @@ Portable reference provider.
 Expected accelerator mapping:
 
 - Linux: KVM;
-- macOS: HVF;
 - Windows: WHPX;
 - TCG: explicit emulation only, never a silent fallback for an accelerated request.
+
+macOS/HVF remains a modeled post-v1 mapping with no active support row,
+acceptance packet, or v1 release dependency.
 
 Expected responsibilities:
 
@@ -104,7 +106,6 @@ Initial defaults:
 ```text
 Windows -> Hyper-V
 Linux   -> QEMU/KVM
-macOS   -> QEMU/HVF
 ```
 
 QEMU/WHPX remains useful on Windows for portability and provider-contract testing even though Hyper-V is the preferred Windows-native path.
@@ -118,6 +119,8 @@ evidence before issuing its existing lifecycle authority. See
 
 A provider should be added only when it unlocks a meaningful workload that the existing Hyper-V/QEMU pair cannot serve well.
 
-Possible future candidates include Apple Virtualization.framework, libvirt, or VirtualBox. They are not roadmap commitments.
+Post-v1 candidates may include Apple Virtualization.framework for a separately
+evidenced macOS/HVF path, libvirt, or VirtualBox. They are not pre-v1 roadmap
+commitments.
 
 OpenStack is not a local provider and is deliberately outside this interface. See `openstack-boundary.md`.

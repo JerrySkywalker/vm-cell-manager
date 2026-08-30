@@ -16,13 +16,17 @@ VM Cell Manager is a daemonless local runtime for disposable full-system VM exec
     Hyper-V           QEMU          future providers
     Provider         Provider
        │               │
-       ▼        ┌──────┼──────┐
-    Windows     ▼      ▼      ▼
-               KVM    HVF    WHPX
-              Linux   mac    Windows
+       ▼        ┌──────┼──────────┐
+    Windows     ▼      ▼          ▼
+               KVM    WHPX       HVF
+              Linux   Windows   post-v1
 ```
 
 The core selects or validates a local provider. It does not schedule across hosts and it does not delegate placement to a cloud controller.
+The active pre-v1 host architecture contract is Windows x86_64 plus native
+Linux x86_64. `HostOs::Macos` and `Accelerator::Hvf` remain typed future
+vocabulary only: the corresponding tuples are absent from the support matrix,
+fail closed, and belong to post-v1 planning.
 
 ## Internal modules
 

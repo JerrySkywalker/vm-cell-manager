@@ -68,7 +68,8 @@ processes. It proves:
    fixture paths or sentinel content.
 
 The rehearsal is provider-free. It neither probes nor mutates Hyper-V, QEMU,
-WHPX, KVM, HVF, QGA, a guest, a runner, or a host service.
+WHPX, KVM, the post-v1 modeled HVF vocabulary, QGA, a guest, a runner, or a host
+service.
 
 ## Golden, redaction, and error-taxonomy gaps
 

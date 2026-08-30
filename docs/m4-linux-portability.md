@@ -52,4 +52,5 @@ still an external writer and invalidates acceptance.
 - WSL2 validation is development evidence only.
 - Real Linux/KVM lifecycle, QCOW2, QMP, and QGA acceptance requires a dedicated
   host and disposable image.
-- Real macOS/HVF acceptance is deferred; M4 keeps the abstraction fail-closed.
+- The historical macOS/HVF abstraction remains fail-closed vocabulary and is
+  now explicitly deferred to a non-blocking post-v1 direction.
