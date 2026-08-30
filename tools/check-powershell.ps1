@@ -55,7 +55,8 @@ $files += @(
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-release-supply-chain.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-package-linux-workflow.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\ci-timing.ps1')),
-  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-ci-timing.ps1'))
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-ci-timing.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\powershell-mutation-detector.psm1'))
 )
 if ($files.Count -eq 0) { throw 'no PowerShell provider or guest scripts were found' }
 
@@ -102,6 +103,19 @@ foreach ($file in $files) {
         $text -match '(?i)\bGet-VM\b[^\r\n|;]*\s-Name\b') {
       throw "guest shim contains a forbidden environment, secret, or name-authority channel: $fullName"
     }
+  }
+}
+
+$detectorPath = Join-Path $repositoryRoot 'tools\powershell-mutation-detector.psm1'
+Import-Module $detectorPath -Force
+foreach ($qualificationTool in @(
+    (Join-Path $repositoryRoot 'tools\windows-hyperv-preflight.ps1'),
+    (Join-Path $repositoryRoot 'tools\windows-hyperv-stopped-cell-qualification.ps1')
+  )) {
+  $result = Test-VmcellPowerShellMutationSurface -Path $qualificationTool
+  if (-not $result.safe) {
+    $codes = @($result.violations | ForEach-Object { $_.code } | Sort-Object -Unique) -join ','
+    throw "qualification mutation detector rejected ${qualificationTool}: $codes"
   }
 }
 

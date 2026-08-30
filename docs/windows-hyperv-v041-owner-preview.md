@@ -18,6 +18,10 @@ The only admitted candidate for this guide is:
 release_ref=release/v0.4.1
 release_sha=0e7fcf37f4310562d318f9d5c709ddf8e8ca1637
 version=0.4.1
+windows_package=vmcell-v0.4.1-windows-x86_64.zip
+windows_package_sha256=3802a045148849c2dc7a385e2fee43865336dbd3d12ea64347503713230324b7
+windows_checksum_manifest_sha256=ad0825847013090138ddfd7ab899a13b3d5588e0b60c893760eb2c8f27804a03
+windows_target=x86_64-pc-windows-msvc
 windows_binary_sha256=249db6841161d634449142584ad7924b26cbe7b31a41eca9b813dd2eb8acec1b
 ```
 
@@ -29,7 +33,7 @@ as `0.4.1`.
 
 The narrow target is one owner-controlled Windows Server 2022 x86_64 image in
 a Hyper-V Generation 2 VM. The VM must be stopped and must independently prove
-Secure Boot enabled with the expected Windows template before its first start.
+Secure Boot `On` with the exact `MicrosoftWindows` template before its first start.
 The image manifest's generation or Secure Boot statements are not substitutes
 for this read-back.
 

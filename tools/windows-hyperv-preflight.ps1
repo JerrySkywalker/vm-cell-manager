@@ -97,6 +97,20 @@ $observationCodes = @(
   'admission_receipt',
   'exclusive_window'
 )
+$frozenCandidate = [ordered]@{
+  release_ref = 'release/v0.4.1'
+  sha = '0e7fcf37f4310562d318f9d5c709ddf8e8ca1637'
+  version = '0.4.1'
+  package_name = 'vmcell-v0.4.1-windows-x86_64.zip'
+  package_sha256 = '3802a045148849c2dc7a385e2fee43865336dbd3d12ea64347503713230324b7'
+  checksum_manifest_sha256 = 'ad0825847013090138ddfd7ab899a13b3d5588e0b60c893760eb2c8f27804a03'
+  binary_name = 'vmcell.exe'
+  binary_sha256 = '249db6841161d634449142584ad7924b26cbe7b31a41eca9b813dd2eb8acec1b'
+  windows_target = 'x86_64-pc-windows-msvc'
+  windows_edition = 'Windows Server 2022'
+  windows_architecture = 'x86_64'
+  secure_boot_template = 'MicrosoftWindows'
+}
 
 function Get-Sha256Text {
   param([Parameter(Mandatory)][string]$Text)
@@ -228,10 +242,11 @@ function Test-Sha256 {
 
 function Get-ObjectProperty {
   param(
-    [Parameter(Mandatory)][object]$InputObject,
+    [AllowNull()][object]$InputObject,
     [Parameter(Mandatory)][string]$Name
   )
 
+  if ($null -eq $InputObject) { return $null }
   $property = $InputObject.PSObject.Properties[$Name]
   if ($null -eq $property) { return $null }
   return $property.Value
@@ -405,42 +420,57 @@ function Write-SanitizedReceiptCreateNew {
 function Test-LiveProvenance {
   param([Parameter(Mandatory)][object]$Provenance)
 
-  $requiredStrings = @(
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'candidate') -Name 'sha'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'candidate') -Name 'version'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'package') -Name 'sha256'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'candidate_binary') -Name 'sha256'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'windows') -Name 'edition'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'windows') -Name 'build'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'image_source') -Name 'kind'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'image_source') -Name 'source_sha256'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'vhdx') -Name 'sha256'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'vhdx') -Name 'generation'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'vhdx') -Name 'secure_boot'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'vhdx') -Name 'virtualization_based_security'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'creation') -Name 'created_at_utc'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'admission_receipt') -Name 'issued_at_utc'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'admission_receipt') -Name 'sha256'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'exclusive_window') -Name 'starts_at_utc'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'exclusive_window') -Name 'ends_at_utc'),
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'exclusive_window') -Name 'evidence_sha256')
-  )
-  $hashes = @(
-    $requiredStrings[2], $requiredStrings[3], $requiredStrings[7], $requiredStrings[8],
-    $requiredStrings[14], $requiredStrings[17]
-  )
+  $candidate = Get-ObjectProperty -InputObject $Provenance -Name 'candidate'
+  $package = Get-ObjectProperty -InputObject $Provenance -Name 'package'
+  $binary = Get-ObjectProperty -InputObject $Provenance -Name 'candidate_binary'
+  $windows = Get-ObjectProperty -InputObject $Provenance -Name 'windows'
+  $imageSource = Get-ObjectProperty -InputObject $Provenance -Name 'image_source'
   $vhdx = Get-ObjectProperty -InputObject $Provenance -Name 'vhdx'
   $immutability = Get-ObjectProperty -InputObject $Provenance -Name 'immutability'
   $receipt = Get-ObjectProperty -InputObject $Provenance -Name 'admission_receipt'
   $exclusiveWindow = Get-ObjectProperty -InputObject $Provenance -Name 'exclusive_window'
+  $requiredStrings = @(
+    [string](Get-ObjectProperty -InputObject $candidate -Name 'release_ref'),
+    [string](Get-ObjectProperty -InputObject $candidate -Name 'sha'),
+    [string](Get-ObjectProperty -InputObject $candidate -Name 'version'),
+    [string](Get-ObjectProperty -InputObject $package -Name 'archive_name'),
+    [string](Get-ObjectProperty -InputObject $package -Name 'archive_sha256'),
+    [string](Get-ObjectProperty -InputObject $package -Name 'checksum_manifest_sha256'),
+    [string](Get-ObjectProperty -InputObject $package -Name 'sha256'),
+    [string](Get-ObjectProperty -InputObject $binary -Name 'name'),
+    [string](Get-ObjectProperty -InputObject $binary -Name 'version'),
+    [string](Get-ObjectProperty -InputObject $binary -Name 'target'),
+    [string](Get-ObjectProperty -InputObject $binary -Name 'sha256'),
+    [string](Get-ObjectProperty -InputObject $windows -Name 'edition'),
+    [string](Get-ObjectProperty -InputObject $windows -Name 'build'),
+    [string](Get-ObjectProperty -InputObject $windows -Name 'architecture'),
+    [string](Get-ObjectProperty -InputObject $Provenance -Name 'support_status'),
+    [string](Get-ObjectProperty -InputObject $imageSource -Name 'kind'),
+    [string](Get-ObjectProperty -InputObject $imageSource -Name 'source_sha256'),
+    [string](Get-ObjectProperty -InputObject $vhdx -Name 'sha256'),
+    [string](Get-ObjectProperty -InputObject $vhdx -Name 'generation'),
+    [string](Get-ObjectProperty -InputObject $vhdx -Name 'secure_boot'),
+    [string](Get-ObjectProperty -InputObject $vhdx -Name 'secure_boot_template'),
+    [string](Get-ObjectProperty -InputObject $vhdx -Name 'virtualization_based_security'),
+    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'creation') -Name 'created_at_utc'),
+    [string](Get-ObjectProperty -InputObject $receipt -Name 'issued_at_utc'),
+    [string](Get-ObjectProperty -InputObject $receipt -Name 'sha256'),
+    [string](Get-ObjectProperty -InputObject $exclusiveWindow -Name 'starts_at_utc'),
+    [string](Get-ObjectProperty -InputObject $exclusiveWindow -Name 'ends_at_utc'),
+    [string](Get-ObjectProperty -InputObject $exclusiveWindow -Name 'evidence_sha256')
+  )
+  $hashes = @(
+    $requiredStrings[4], $requiredStrings[5], $requiredStrings[6], $requiredStrings[10],
+    $requiredStrings[16], $requiredStrings[17], $requiredStrings[24], $requiredStrings[27]
+  )
   $timestampValid = $true
-  foreach ($timestamp in @($requiredStrings[12], $requiredStrings[13], $requiredStrings[15], $requiredStrings[16])) {
+  foreach ($timestamp in @($requiredStrings[22], $requiredStrings[23], $requiredStrings[25], $requiredStrings[26])) {
     try { [DateTimeOffset]::Parse($timestamp) | Out-Null } catch { $timestampValid = $false }
   }
   $windowOrdered = $false
   try {
-    $windowOrdered = [DateTimeOffset]::Parse($requiredStrings[15]) -lt
-      [DateTimeOffset]::Parse($requiredStrings[16])
+    $windowOrdered = [DateTimeOffset]::Parse($requiredStrings[25]) -lt
+      [DateTimeOffset]::Parse($requiredStrings[26])
   } catch {}
   return $Provenance.schema_version -eq 1 -and
     $Provenance.contract -ceq 'vmcell.hyperv-r5-image-provenance.v1' -and
@@ -449,9 +479,26 @@ function Test-LiveProvenance {
     $Provenance.real_platform_acceptance -ceq 'not_started' -and
     $Provenance.authorizing -is [bool] -and -not [bool]$Provenance.authorizing -and
     $requiredStrings.Count -eq @($requiredStrings | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -and
-    $requiredStrings[1] -ceq '0.4.1' -and
+    $requiredStrings[0] -ceq $frozenCandidate.release_ref -and
+    $requiredStrings[1] -ceq $frozenCandidate.sha -and
+    $requiredStrings[2] -ceq $frozenCandidate.version -and
+    $requiredStrings[3] -ceq $frozenCandidate.package_name -and
+    $requiredStrings[4] -ceq $frozenCandidate.package_sha256 -and
+    $requiredStrings[5] -ceq $frozenCandidate.checksum_manifest_sha256 -and
+    $requiredStrings[6] -ceq $frozenCandidate.package_sha256 -and
+    $requiredStrings[7] -ceq $frozenCandidate.binary_name -and
+    $requiredStrings[8] -ceq $frozenCandidate.version -and
+    $requiredStrings[9] -ceq $frozenCandidate.windows_target -and
+    $requiredStrings[10] -ceq $frozenCandidate.binary_sha256 -and
+    $requiredStrings[11] -ceq $frozenCandidate.windows_edition -and
+    $requiredStrings[12] -cmatch '^[0-9]{4,10}$' -and
+    $requiredStrings[13] -ceq $frozenCandidate.windows_architecture -and
+    $requiredStrings[14] -ceq 'untested' -and
+    $requiredStrings[18] -ceq '2' -and
+    $requiredStrings[19] -ceq 'On' -and
+    $requiredStrings[20] -ceq $frozenCandidate.secure_boot_template -and
     @($hashes | Where-Object { -not (Test-Sha256 -Value $_) }).Count -eq 0 -and
-    [string](Get-ObjectProperty -InputObject (Get-ObjectProperty -InputObject $Provenance -Name 'windows') -Name 'architecture') -ceq 'x86_64' -and
+    [string](Get-ObjectProperty -InputObject $windows -Name 'architecture') -ceq $frozenCandidate.windows_architecture -and
     [string](Get-ObjectProperty -InputObject $vhdx -Name 'vhd_type') -ceq 'fixed' -and
     $null -eq (Get-ObjectProperty -InputObject $vhdx -Name 'parent_path') -and
     (Get-ObjectProperty -InputObject $vhdx -Name 'attached') -is [bool] -and
@@ -634,11 +681,193 @@ function Convert-FixtureToObservations {
 function Invoke-LiveObservation {
   param(
     [Parameter(Mandatory)][string]$Code,
-    [Parameter(Mandatory)][scriptblock]$Probe
+    [AllowNull()][object]$ProvenanceSnapshot
   )
 
   try {
-    $value = & $Probe
+    $value = switch ($Code) {
+      'elevation' {
+        $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+        $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        [pscustomobject]@{ status = if ($admin) { 'pass' } else { 'fail' }; evidence = @{ elevated = $admin } }
+        break
+      }
+      'administrators_membership' {
+        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)
+        $member = @($members | Where-Object { $_.SID.Value -ceq $currentSid }).Count -eq 1
+        [pscustomobject]@{ status = if ($member) { 'pass' } else { 'fail' }; evidence = @{ member = $member } }
+        break
+      }
+      'os_build_architecture' {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $x64 = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ceq 'X64'
+        $valid = $x64 -and [string]$os.Caption -match 'Windows' -and [string]$os.BuildNumber -match '^\d+$'
+        [pscustomobject]@{ status = if ($valid) { 'pass' } else { 'fail' }; evidence = @{ x64 = $x64; build = [string]$os.BuildNumber } }
+        break
+      }
+      'hyperv_feature' {
+        $feature = Get-WindowsOptionalFeature -Online -FeatureName 'Microsoft-Hyper-V-All' -ErrorAction Stop
+        $enabled = [string]$feature.State -ceq 'Enabled'
+        [pscustomobject]@{ status = if ($enabled) { 'pass' } else { 'fail' }; evidence = @{ enabled = $enabled } }
+        break
+      }
+      'hyperv_module' {
+        $module = @(Get-Module -ListAvailable -Name Hyper-V -ErrorAction Stop)
+        [pscustomobject]@{ status = if ($module.Count -gt 0) { 'pass' } else { 'fail' }; evidence = @{ count = $module.Count } }
+        break
+      }
+      'hyperv_cmdlets' {
+        $names = @('Get-VM', 'Get-VHD', 'Get-VMSwitch')
+        $resolved = @($names | ForEach-Object { Get-Command -Name $_ -ErrorAction Stop })
+        [pscustomobject]@{ status = if ($resolved.Count -eq $names.Count) { 'pass' } else { 'fail' }; evidence = @{ count = $resolved.Count } }
+        break
+      }
+      'vmms_state' {
+        $vmms = Get-Service -Name vmms -ErrorAction Stop
+        $running = [string]$vmms.Status -ceq 'Running'
+        [pscustomobject]@{ status = if ($running) { 'pass' } else { 'fail' }; evidence = @{ running = $running } }
+        break
+      }
+      'hyperv_read_access' {
+        $vms = @(Get-VM -ErrorAction Stop)
+        [pscustomobject]@{ status = 'pass'; evidence = @{ count = $vms.Count } }
+        break
+      }
+      'vm_inventory' {
+        $vms = @(Get-VM -ErrorAction Stop)
+        [pscustomobject]@{ status = if ($vms.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $vms.Count } }
+        break
+      }
+      'switch_inventory' {
+        $switches = @(Get-VMSwitch -ErrorAction Stop)
+        [pscustomobject]@{ status = if ($switches.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $switches.Count } }
+        break
+      }
+      'virtualization_writers' {
+        $names = @('vmwp', 'vmcompute', 'vmmem', 'qemu-system-x86_64', 'VirtualBoxVM', 'vmware-vmx')
+        $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -ccontains $_.ProcessName })
+        [pscustomobject]@{ status = if ($processes.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $processes.Count } }
+        break
+      }
+      'runner_codex_activity' {
+        $names = @('Runner.Listener', 'Runner.Worker', 'codex')
+        $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -ccontains $_.ProcessName })
+        [pscustomobject]@{ status = if ($processes.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $processes.Count } }
+        break
+      }
+      'state_root_storage' {
+        $facts = Get-LiveOperationalStorageFacts -Path $StateRoot -RequireDirectory $true -RequiredFreeBytes $StateRequiredFreeBytes -RollbackBytes $RollbackMarginBytes -Description 'state root'
+        Test-OperationalStorageFacts -Facts $facts
+        break
+      }
+      'runtime_root_storage' {
+        $facts = Get-LiveOperationalStorageFacts -Path $RuntimeRoot -RequireDirectory $true -RequiredFreeBytes $RuntimeRequiredFreeBytes -RollbackBytes $RollbackMarginBytes -Description 'runtime root'
+        Test-OperationalStorageFacts -Facts $facts
+        break
+      }
+      'image_storage' {
+        $facts = Get-LiveOperationalStorageFacts -Path $VhdxPath -RequireDirectory $false -RequiredFreeBytes $ImageRequiredFreeBytes -RollbackBytes $RollbackMarginBytes -Description 'image path'
+        Test-OperationalStorageFacts -Facts $facts
+        break
+      }
+      'package_storage' {
+        $facts = Get-LiveOperationalStorageFacts -Path $CandidatePackagePath -RequireDirectory $false -RequiredFreeBytes $PackageRequiredFreeBytes -RollbackBytes $RollbackMarginBytes -Description 'candidate package path'
+        Test-OperationalStorageFacts -Facts $facts
+        break
+      }
+      'binary_storage' {
+        $facts = Get-LiveOperationalStorageFacts -Path $CandidateBinaryPath -RequireDirectory $false -RequiredFreeBytes $BinaryRequiredFreeBytes -RollbackBytes $RollbackMarginBytes -Description 'candidate binary path'
+        Test-OperationalStorageFacts -Facts $facts
+        break
+      }
+      'provenance_storage' {
+        $facts = Get-LiveOperationalStorageFacts -Path $ProvenancePath -RequireDirectory $false -RequiredFreeBytes $ProvenanceRequiredFreeBytes -RollbackBytes $RollbackMarginBytes -Description 'provenance path'
+        Test-OperationalStorageFacts -Facts $facts
+        break
+      }
+      'evidence_output' {
+        Test-EvidenceOutputFacts -Facts (Get-LiveEvidenceOutputFacts -Path $ReceiptPath)
+        break
+      }
+      'immutable_vhdx_presence' {
+        $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
+        $exists = -not $vhdItem.PSIsContainer -and $vhdItem.Extension -ieq '.vhdx'
+        [pscustomobject]@{ status = if ($exists) { 'pass' } else { 'fail' }; evidence = @{ present = $exists } }
+        break
+      }
+      'vhdx_immutability' {
+        $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
+        $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
+        $readOnly = ($vhdItem.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0
+        $fixed = [string]$vhd.VhdType -ceq 'Fixed'
+        [pscustomobject]@{ status = if ($readOnly -and $fixed) { 'pass' } else { 'fail' }; evidence = @{ readonly = $readOnly; fixed = $fixed } }
+        break
+      }
+      'vhdx_attachment' {
+        Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path' | Out-Null
+        $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
+        $detached = -not [bool]$vhd.Attached
+        [pscustomobject]@{ status = if ($detached) { 'pass' } else { 'fail' }; evidence = @{ detached = $detached } }
+        break
+      }
+      'vhdx_parent' {
+        Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path' | Out-Null
+        $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
+        $parentless = [string]::IsNullOrWhiteSpace([string]$vhd.ParentPath)
+        [pscustomobject]@{ status = if ($parentless) { 'pass' } else { 'fail' }; evidence = @{ parentless = $parentless } }
+        break
+      }
+      'image_provenance' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $valid = Test-LiveProvenance -Provenance $ProvenanceSnapshot.value
+        [pscustomobject]@{ status = if ($valid) { 'pass' } else { 'fail' }; evidence = @{ valid = $valid } }
+        break
+      }
+      'candidate_hash' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $matches = $CandidateSha -ceq $frozenCandidate.sha -and [string]$ProvenanceSnapshot.value.candidate.sha -ceq $frozenCandidate.sha
+        [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
+        break
+      }
+      'package_hash' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $package = Get-OrdinaryPathItem -Path $CandidatePackagePath -RequireDirectory $false -Description 'candidate package path'
+        $packageHash = Get-Sha256File -Path $package.FullName
+        $matches = $packageHash -ceq $frozenCandidate.package_sha256 -and [string]$ProvenanceSnapshot.value.package.sha256 -ceq $frozenCandidate.package_sha256
+        [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
+        break
+      }
+      'binary_hash' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $binary = Get-OrdinaryPathItem -Path $CandidateBinaryPath -RequireDirectory $false -Description 'candidate binary path'
+        $binaryHash = Get-Sha256File -Path $binary.FullName
+        $matches = $binaryHash -ceq $frozenCandidate.binary_sha256 -and [string]$ProvenanceSnapshot.value.candidate_binary.sha256 -ceq $frozenCandidate.binary_sha256
+        [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
+        break
+      }
+      'vhdx_hash' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $vhdxHash = Get-Sha256File -Path $VhdxPath
+        $matches = [string]$ProvenanceSnapshot.value.vhdx.sha256 -ceq $vhdxHash
+        [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
+        break
+      }
+      'admission_receipt' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $issued = [DateTimeOffset]::Parse([string]$ProvenanceSnapshot.value.admission_receipt.issued_at_utc)
+        $fresh = ([DateTimeOffset]::UtcNow - $issued).TotalHours -ge 0 -and ([DateTimeOffset]::UtcNow - $issued).TotalHours -le $MaximumReceiptAgeHours
+        [pscustomobject]@{ status = if ($fresh) { 'pass' } else { 'fail' }; evidence = @{ fresh = $fresh } }
+        break
+      }
+      'exclusive_window' {
+        if ($null -eq $ProvenanceSnapshot) { throw 'provenance snapshot unavailable' }
+        $eligible = $ProvenanceSnapshot.value.exclusive_window.eligible -is [bool] -and [bool]$ProvenanceSnapshot.value.exclusive_window.eligible -and [DateTimeOffset]::Parse([string]$ProvenanceSnapshot.value.exclusive_window.ends_at_utc) -gt [DateTimeOffset]::UtcNow
+        [pscustomobject]@{ status = if ($eligible) { 'pass' } else { 'fail' }; evidence = @{ eligible = $eligible } }
+        break
+      }
+      default { throw "unknown observation code: $Code" }
+    }
     $status = [string](Get-ObjectProperty -InputObject $value -Name 'status')
     if ($status -cnotin @('pass', 'fail', 'unavailable')) {
       throw 'probe did not return a supported status'
@@ -659,159 +888,9 @@ function Get-LiveObservations {
     $provenanceSnapshot = Get-SafeProvenanceSnapshot -Path $ProvenancePath
   } catch {}
 
-  $result = [System.Collections.Generic.List[object]]::new()
-  $result.Add((Invoke-LiveObservation -Code 'elevation' -Probe {
-    $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
-    $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    [pscustomobject]@{ status = if ($admin) { 'pass' } else { 'fail' }; evidence = @{ elevated = $admin } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'administrators_membership' -Probe {
-    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)
-    $member = @($members | Where-Object { $_.SID.Value -ceq $currentSid }).Count -eq 1
-    [pscustomobject]@{ status = if ($member) { 'pass' } else { 'fail' }; evidence = @{ member = $member } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'os_build_architecture' -Probe {
-    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-    $x64 = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ceq 'X64'
-    $valid = $x64 -and [string]$os.Caption -match 'Windows' -and [string]$os.BuildNumber -match '^\d+$'
-    [pscustomobject]@{ status = if ($valid) { 'pass' } else { 'fail' }; evidence = @{ x64 = $x64; build = [string]$os.BuildNumber } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'hyperv_feature' -Probe {
-    $feature = Get-WindowsOptionalFeature -Online -FeatureName 'Microsoft-Hyper-V-All' -ErrorAction Stop
-    $enabled = [string]$feature.State -ceq 'Enabled'
-    [pscustomobject]@{ status = if ($enabled) { 'pass' } else { 'fail' }; evidence = @{ enabled = $enabled } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'hyperv_module' -Probe {
-    $module = @(Get-Module -ListAvailable -Name Hyper-V -ErrorAction Stop)
-    [pscustomobject]@{ status = if ($module.Count -gt 0) { 'pass' } else { 'fail' }; evidence = @{ count = $module.Count } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'hyperv_cmdlets' -Probe {
-    $names = @('Get-VM', 'Get-VHD', 'Get-VMSwitch')
-    $resolved = @($names | ForEach-Object { Get-Command -Name $_ -ErrorAction Stop })
-    [pscustomobject]@{ status = if ($resolved.Count -eq $names.Count) { 'pass' } else { 'fail' }; evidence = @{ count = $resolved.Count } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'vmms_state' -Probe {
-    $vmms = Get-Service -Name vmms -ErrorAction Stop
-    $running = [string]$vmms.Status -ceq 'Running'
-    [pscustomobject]@{ status = if ($running) { 'pass' } else { 'fail' }; evidence = @{ running = $running } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'hyperv_read_access' -Probe {
-    $vms = @(Get-VM -ErrorAction Stop)
-    [pscustomobject]@{ status = 'pass'; evidence = @{ count = $vms.Count } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'vm_inventory' -Probe {
-    $vms = @(Get-VM -ErrorAction Stop)
-    [pscustomobject]@{ status = if ($vms.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $vms.Count } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'switch_inventory' -Probe {
-    $switches = @(Get-VMSwitch -ErrorAction Stop)
-    [pscustomobject]@{ status = if ($switches.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $switches.Count } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'virtualization_writers' -Probe {
-    $names = @('vmwp', 'vmcompute', 'vmmem', 'qemu-system-x86_64', 'VirtualBoxVM', 'vmware-vmx')
-    $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -ccontains $_.ProcessName })
-    [pscustomobject]@{ status = if ($processes.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $processes.Count } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'runner_codex_activity' -Probe {
-    $names = @('Runner.Listener', 'Runner.Worker', 'codex')
-    $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -ccontains $_.ProcessName })
-    [pscustomobject]@{ status = if ($processes.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $processes.Count } }
-  }))
-  $storageRoles = @(
-    @{ code = 'state_root_storage'; path = $StateRoot; directory = $true; required = $StateRequiredFreeBytes; description = 'state root' },
-    @{ code = 'runtime_root_storage'; path = $RuntimeRoot; directory = $true; required = $RuntimeRequiredFreeBytes; description = 'runtime root' },
-    @{ code = 'image_storage'; path = $VhdxPath; directory = $false; required = $ImageRequiredFreeBytes; description = 'image path' },
-    @{ code = 'package_storage'; path = $CandidatePackagePath; directory = $false; required = $PackageRequiredFreeBytes; description = 'candidate package path' },
-    @{ code = 'binary_storage'; path = $CandidateBinaryPath; directory = $false; required = $BinaryRequiredFreeBytes; description = 'candidate binary path' },
-    @{ code = 'provenance_storage'; path = $ProvenancePath; directory = $false; required = $ProvenanceRequiredFreeBytes; description = 'provenance path' }
-  )
-  foreach ($role in $storageRoles) {
-    $result.Add((Invoke-LiveObservation -Code $role.code -Probe {
-      $facts = Get-LiveOperationalStorageFacts -Path $role.path -RequireDirectory $role.directory `
-        -RequiredFreeBytes $role.required -RollbackBytes $RollbackMarginBytes -Description $role.description
-      Test-OperationalStorageFacts -Facts $facts
-    }))
-  }
-  $result.Add((Invoke-LiveObservation -Code 'evidence_output' -Probe {
-    Test-EvidenceOutputFacts -Facts (Get-LiveEvidenceOutputFacts -Path $ReceiptPath)
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'immutable_vhdx_presence' -Probe {
-    $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
-    $exists = -not $vhdItem.PSIsContainer -and $vhdItem.Extension -ieq '.vhdx'
-    [pscustomobject]@{ status = if ($exists) { 'pass' } else { 'fail' }; evidence = @{ present = $exists } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'vhdx_immutability' -Probe {
-    $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
-    $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
-    $readOnly = ($vhdItem.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0
-    $fixed = [string]$vhd.VhdType -ceq 'Fixed'
-    [pscustomobject]@{ status = if ($readOnly -and $fixed) { 'pass' } else { 'fail' }; evidence = @{ readonly = $readOnly; fixed = $fixed } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'vhdx_attachment' -Probe {
-    Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path' | Out-Null
-    $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
-    $detached = -not [bool]$vhd.Attached
-    [pscustomobject]@{ status = if ($detached) { 'pass' } else { 'fail' }; evidence = @{ detached = $detached } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'vhdx_parent' -Probe {
-    Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path' | Out-Null
-    $vhd = Get-VHD -Path $VhdxPath -ErrorAction Stop
-    $parentless = [string]::IsNullOrWhiteSpace([string]$vhd.ParentPath)
-    [pscustomobject]@{ status = if ($parentless) { 'pass' } else { 'fail' }; evidence = @{ parentless = $parentless } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'image_provenance' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $valid = Test-LiveProvenance -Provenance $provenance
-    [pscustomobject]@{ status = if ($valid) { 'pass' } else { 'fail' }; evidence = @{ valid = $valid } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'candidate_hash' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $matches = [string]$provenance.candidate.sha -ceq $CandidateSha
-    [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'package_hash' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $package = Get-OrdinaryPathItem -Path $CandidatePackagePath -RequireDirectory $false -Description 'candidate package path'
-    $packageHash = Get-Sha256File -Path $package.FullName
-    $matches = [string]$provenance.package.sha256 -ceq $packageHash
-    [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'binary_hash' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $binary = Get-OrdinaryPathItem -Path $CandidateBinaryPath -RequireDirectory $false -Description 'candidate binary path'
-    $binaryHash = Get-Sha256File -Path $binary.FullName
-    $matches = [string]$provenance.candidate_binary.sha256 -ceq $binaryHash
-    [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'vhdx_hash' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $vhdxHash = Get-Sha256File -Path $VhdxPath
-    $matches = [string]$provenance.vhdx.sha256 -ceq $vhdxHash
-    [pscustomobject]@{ status = if ($matches) { 'pass' } else { 'fail' }; evidence = @{ matches = $matches } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'admission_receipt' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $issued = [DateTimeOffset]::Parse([string]$provenance.admission_receipt.issued_at_utc)
-    $fresh = ([DateTimeOffset]::UtcNow - $issued).TotalHours -ge 0 -and
-      ([DateTimeOffset]::UtcNow - $issued).TotalHours -le $MaximumReceiptAgeHours
-    [pscustomobject]@{ status = if ($fresh) { 'pass' } else { 'fail' }; evidence = @{ fresh = $fresh } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'exclusive_window' -Probe {
-    if ($null -eq $provenanceSnapshot) { throw 'provenance snapshot unavailable' }
-    $provenance = $provenanceSnapshot.value
-    $eligible = $provenance.exclusive_window.eligible -is [bool] -and
-      [bool]$provenance.exclusive_window.eligible -and
-      [DateTimeOffset]::Parse([string]$provenance.exclusive_window.ends_at_utc) -gt [DateTimeOffset]::UtcNow
-    [pscustomobject]@{ status = if ($eligible) { 'pass' } else { 'fail' }; evidence = @{ eligible = $eligible } }
-  }))
-  return @($result)
+  return @($observationCodes | ForEach-Object {
+    Invoke-LiveObservation -Code $_ -ProvenanceSnapshot $provenanceSnapshot
+  })
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'Fixture') {

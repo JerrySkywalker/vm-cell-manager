@@ -4,6 +4,7 @@ Set-StrictMode -Version 3.0
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $PSScriptRoot 'windows-hyperv-preflight.ps1'
 $stoppedScriptPath = Join-Path $PSScriptRoot 'windows-hyperv-stopped-cell-qualification.ps1'
+$mutationDetectorPath = Join-Path $PSScriptRoot 'powershell-mutation-detector.psm1'
 $fixturePath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-preflight\eligible.json'
 $stoppedFixturePath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-stopped-cell\eligible.json'
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('vmcell-hyperv-r5-preflight-' + [Guid]::NewGuid().ToString('N'))
@@ -52,21 +53,12 @@ function Write-CaseFixture {
 function Write-StoppedCaseFixture {
   param(
     [Parameter(Mandatory)][string]$Path,
-    [AllowNull()][string]$Code,
-    [AllowNull()][string]$Status,
-    [AllowNull()][string]$RawDetail
+    [Parameter(Mandatory)][scriptblock]$Mutate
   )
 
   $fixture = Get-Content -LiteralPath $stoppedFixturePath -Raw | ConvertFrom-Json
-  if (-not [string]::IsNullOrWhiteSpace($Code)) {
-    $row = @($fixture.observations | Where-Object { $_.code -ceq $Code })[0]
-    if ($null -eq $row) { throw "stopped-cell fixture did not contain observation $Code" }
-    $row.status = $Status
-  }
-  if (-not [string]::IsNullOrWhiteSpace($RawDetail)) {
-    $fixture | Add-Member -NotePropertyName raw_detail -NotePropertyValue $RawDetail
-  }
-  $fixture | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+  & $Mutate $fixture.raw_facts
+  $fixture | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
 }
 
 function Assert-StaticDenyList {
@@ -95,40 +87,79 @@ function Assert-StaticDenyList {
     'Stop-Process', 'Start-Process', 'taskkill.exe', 'Stop-Computer', 'Restart-Computer', 'shutdown.exe', 'sc.exe'
   )
 
+  Import-Module $mutationDetectorPath -Force
   foreach ($candidatePath in @($scriptPath, $stoppedScriptPath)) {
-    $tokens = $null
-    $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-      $candidatePath,
-      [ref]$tokens,
-      [ref]$parseErrors
-    )
-    Assert-True -Condition ($parseErrors.Count -eq 0) -Message "PowerShell parser error in $candidatePath"
-    $commands = @($ast.FindAll({
-      param($node)
-      $node -is [System.Management.Automation.Language.CommandAst]
-    }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
-    foreach ($command in $forbidden) {
-      Assert-True -Condition ($commands -cnotcontains $command) `
-        -Message "qualification tooling contains forbidden mutating command $command"
-    }
+    $result = Test-VmcellPowerShellMutationSurface -Path $candidatePath
+    Assert-True -Condition $result.safe -Message "qualification tooling mutation detector rejected $candidatePath"
   }
 
   foreach ($command in $forbidden) {
-    $tokens = $null
-    $parseErrors = $null
-    $mutationAst = [System.Management.Automation.Language.Parser]::ParseInput(
-      "$command -WhatIf",
-      [ref]$tokens,
-      [ref]$parseErrors
-    )
-    $parsedCommands = @($mutationAst.FindAll({
-      param($node)
-      $node -is [System.Management.Automation.Language.CommandAst]
-    }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
-    Assert-True -Condition ($parseErrors.Count -eq 0 -and $parsedCommands -ccontains $command) `
-      -Message "forbidden mutation AST coverage omitted $command"
+    $result = Test-VmcellPowerShellMutationSurface -Text "$command -WhatIf" -Name "direct-$command"
+    Assert-True -Condition (-not $result.safe) -Message "forbidden mutation detector omitted $command"
   }
+
+  $evasionCases = [ordered]@{
+    direct = 'New-VM -Name harmless'
+    alias = 'Set-Alias nvm New-VM; nvm -Name harmless'
+    encoded = 'pwsh -EncodedCommand TgBlAHcALQBWAE0AIAAtAE4AYQBtAGUAIABoAGEAcgBtAGwAZQBzAHMA'
+    concatenated = "& ('New' + '-VM') -Name harmless"
+    indirect = "`$command = 'New-VM'; & (Get-Variable -Name command).Value -Name harmless"
+    variable_call_operator = "`$command = 'New-VM'; & `$command -Name harmless"
+    get_command = '& (Get-Command New-VM) -Name harmless'
+    invoke_expression = "Invoke-Expression 'New-VM -Name harmless'"
+    scriptblock_dispatch = "[ScriptBlock]::Create('New-VM -Name harmless').Invoke()"
+  }
+  foreach ($case in $evasionCases.GetEnumerator()) {
+    $result = Test-VmcellPowerShellMutationSurface -Text $case.Value -Name "evasion-$($case.Key)"
+    Assert-True -Condition (-not $result.safe) -Message "mutation detector accepted evasion: $($case.Key)"
+  }
+}
+
+function New-AdmittedProvenanceFixture {
+  return [pscustomobject]@{
+    schema_version = 1
+    contract = 'vmcell.hyperv-r5-image-provenance.v1'
+    authority = 'none'
+    acceptance = $false
+    authorizing = $false
+    real_platform_acceptance = 'not_started'
+    support_status = 'untested'
+    candidate = [pscustomobject]@{ release_ref = 'release/v0.4.1'; sha = '0e7fcf37f4310562d318f9d5c709ddf8e8ca1637'; version = '0.4.1' }
+    package = [pscustomobject]@{ archive_name = 'vmcell-v0.4.1-windows-x86_64.zip'; archive_sha256 = '3802a045148849c2dc7a385e2fee43865336dbd3d12ea64347503713230324b7'; checksum_manifest_sha256 = 'ad0825847013090138ddfd7ab899a13b3d5588e0b60c893760eb2c8f27804a03'; sha256 = '3802a045148849c2dc7a385e2fee43865336dbd3d12ea64347503713230324b7' }
+    candidate_binary = [pscustomobject]@{ name = 'vmcell.exe'; version = '0.4.1'; target = 'x86_64-pc-windows-msvc'; sha256 = '249db6841161d634449142584ad7924b26cbe7b31a41eca9b813dd2eb8acec1b' }
+    windows = [pscustomobject]@{ edition = 'Windows Server 2022'; build = '20348'; architecture = 'x86_64' }
+    image_source = [pscustomobject]@{ kind = 'owner-controlled'; source_sha256 = ('a' * 64) }
+    vhdx = [pscustomobject]@{ sha256 = ('b' * 64); generation = '2'; secure_boot = 'On'; secure_boot_template = 'MicrosoftWindows'; virtualization_based_security = 'off'; vhd_type = 'fixed'; parent_path = $null; attached = $false }
+    creation = [pscustomobject]@{ created_at_utc = '2026-01-01T00:00:00Z' }
+    immutability = [pscustomobject]@{ declared = $true; verification_evidence_sha256 = ('c' * 64) }
+    admission_receipt = [pscustomobject]@{ receipt_id = 'fixture-receipt-0001'; issued_at_utc = '2026-01-01T00:00:00Z'; sha256 = ('d' * 64) }
+    exclusive_window = [pscustomobject]@{ eligible = $true; starts_at_utc = '2026-01-01T00:00:00Z'; ends_at_utc = '2027-01-01T00:00:00Z'; evidence_sha256 = ('e' * 64) }
+  }
+}
+
+function Assert-ProvenanceBindingBehavior {
+  . $scriptPath -FixturePath $fixturePath | Out-Null
+  $admitted = New-AdmittedProvenanceFixture
+  Assert-True -Condition (Test-LiveProvenance -Provenance $admitted) -Message 'admitted frozen provenance was rejected'
+  $cases = @(
+    @{ name = 'candidate-drift'; mutate = { param($p) $p.candidate.sha = ('f' * 40) } },
+    @{ name = 'package-drift'; mutate = { param($p) $p.package.sha256 = ('f' * 64) } },
+    @{ name = 'binary-drift'; mutate = { param($p) $p.candidate_binary.sha256 = ('f' * 64) } },
+    @{ name = 'windows-target-drift'; mutate = { param($p) $p.candidate_binary.target = 'x86_64-pc-windows-gnu' } },
+    @{ name = 'support-status-promotion'; mutate = { param($p) $p.support_status = 'supported' } },
+    @{ name = 'support-status-unknown'; mutate = { param($p) $p.support_status = 'unknown' } },
+    @{ name = 'missing-candidate-binding'; mutate = { param($p) $p.PSObject.Properties.Remove('candidate') } },
+    @{ name = 'malformed-windows-target'; mutate = { param($p) $p.candidate_binary.target = '' } },
+    @{ name = 'generation-drift'; mutate = { param($p) $p.vhdx.generation = '1' } },
+    @{ name = 'secure-boot-state-drift'; mutate = { param($p) $p.vhdx.secure_boot = 'Off' } },
+    @{ name = 'secure-boot-template-drift'; mutate = { param($p) $p.vhdx.secure_boot_template = 'MicrosoftUEFICertificateAuthority' } }
+  )
+  foreach ($case in $cases) {
+    $candidate = (New-AdmittedProvenanceFixture | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+    & $case.mutate $candidate
+    Assert-True -Condition (-not (Test-LiveProvenance -Provenance $candidate)) -Message "provenance drift was accepted: $($case.name)"
+  }
+  return 1 + $cases.Count
 }
 
 function Assert-PathSafetyAndDeterminism {
@@ -153,17 +184,18 @@ function Assert-PathSafetyAndDeterminism {
       'function Get-LiveOperationalStorageFacts',
       'function Test-EvidenceOutputFacts',
       'function Write-SanitizedReceiptCreateNew',
-      "@{ code = 'state_root_storage'; path = `$StateRoot",
-      "@{ code = 'runtime_root_storage'; path = `$RuntimeRoot",
-      "@{ code = 'image_storage'; path = `$VhdxPath",
-      "@{ code = 'package_storage'; path = `$CandidatePackagePath",
-      "@{ code = 'binary_storage'; path = `$CandidateBinaryPath",
-      "@{ code = 'provenance_storage'; path = `$ProvenancePath",
-      "Invoke-LiveObservation -Code 'evidence_output'",
+      "'state_root_storage' {",
+      "'runtime_root_storage' {",
+      "'image_storage' {",
+      "'package_storage' {",
+      "'binary_storage' {",
+      "'provenance_storage' {",
+      'Invoke-LiveObservation -Code $_ -ProvenanceSnapshot $provenanceSnapshot',
       "[IO.FileMode]::CreateNew",
-      "`$requiredStrings[1] -ceq '0.4.1'",
+      "`$requiredStrings[14] -ceq 'untested'",
+      "`$requiredStrings[20] -ceq `$frozenCandidate.secure_boot_template",
       'Get-ObservationDigest -Observations $liveObservations',
-      '$requiredStrings[17]'
+      '$frozenCandidate.package_sha256'
     )) {
     Assert-True -Condition $source.Contains($required) `
       -Message "R5 preflight omitted required provenance safety binding: $required"
@@ -183,18 +215,17 @@ function Assert-PathSafetyAndDeterminism {
 
   $stoppedSource = [IO.File]::ReadAllText($stoppedScriptPath)
   foreach ($required in @(
-      "Get-VM -Id `$ExpectedVmId",
-      "[string]`$vm.State -ceq 'Off'",
-      '[int]$vm.Generation -eq 2',
+      'function Convert-StoppedCellRawFactsToObservations',
+      'function Convert-FixtureToRawFacts',
+      'function Get-LiveRawFacts',
+      'Get-VM -Id $ExpectedVmId',
       'Get-VMFirmware -VM $vm',
-      "[string]`$firmware.SecureBoot -ceq 'On'",
       'Get-VMHardDiskDrive -VM $vm',
-      "[string]`$disk.VhdType -ceq 'Differencing'",
       'Get-VMNetworkAdapter -VM $vm',
       '[IO.FileMode]::CreateNew'
     )) {
     Assert-True -Condition $stoppedSource.Contains($required) `
-      -Message "stopped-cell qualification omitted required invariant: $required"
+      -Message "stopped-cell qualification omitted required classifier boundary: $required"
   }
 }
 
@@ -360,28 +391,29 @@ function Assert-StoppedCellFixtures {
   $count += 1
 
   $cases = @(
-    @{ name = 'generation-1'; code = 'generation_2'; status = 'fail' },
-    @{ name = 'secure-boot-disabled'; code = 'secure_boot'; status = 'fail' },
-    @{ name = 'wrong-disk-parent'; code = 'disk_layout'; status = 'fail' },
-    @{ name = 'extra-disk'; code = 'disk_layout'; status = 'fail' },
-    @{ name = 'unexpected-network-adapter'; code = 'network_adapters'; status = 'fail' },
-    @{ name = 'running-vm'; code = 'stopped_state'; status = 'fail' },
-    @{ name = 'wrong-vm-identity'; code = 'vm_identity'; status = 'fail' },
-    @{ name = 'unavailable-firmware'; code = 'secure_boot'; status = 'unavailable' },
-    @{ name = 'wrong-resources'; code = 'resources'; status = 'fail' }
+    @{ name = 'wrong-vm-identity'; code = 'vm_identity'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.vm.name = 'different-cell' } },
+    @{ name = 'running-vm'; code = 'stopped_state'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.vm.state = 'Running' } },
+    @{ name = 'generation-1'; code = 'generation_2'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.vm.generation = 1 } },
+    @{ name = 'secure-boot-disabled'; code = 'secure_boot'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.firmware.secure_boot = 'Off' } },
+    @{ name = 'secure-boot-template-drift'; code = 'secure_boot'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.firmware.secure_boot_template = 'MicrosoftUEFICertificateAuthority' } },
+    @{ name = 'wrong-disk-parent'; code = 'disk_layout'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.disks.entries[0].parent_path = 'X:\fixture\other-base.vhdx' } },
+    @{ name = 'extra-disk'; code = 'disk_layout'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.disks.entries += ($facts.disks.entries[0] | ConvertTo-Json -Depth 8 | ConvertFrom-Json) } },
+    @{ name = 'wrong-cpu'; code = 'resources'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.vm.processor_count = 3 } },
+    @{ name = 'wrong-memory'; code = 'resources'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.vm.memory_startup_bytes = 2147483648 } },
+    @{ name = 'unexpected-network-adapter'; code = 'network_adapters'; prefix = 'precondition_failed'; mutate = { param($facts) $facts.network_adapters.count = 1 } },
+    @{ name = 'unavailable-firmware'; code = 'secure_boot'; prefix = 'evidence_gap'; mutate = { param($facts) $facts.firmware = [pscustomobject]@{ available = $false } } }
   )
   foreach ($case in $cases) {
     $path = Join-Path $temporaryRoot ("stopped-$($case.name).json")
-    Write-StoppedCaseFixture -Path $path -Code $case.code -Status $case.status
+    Write-StoppedCaseFixture -Path $path -Mutate $case.mutate
     $result = Invoke-StoppedFixture -Path $path
-    $prefix = if ($case.status -ceq 'unavailable') { 'evidence_gap' } else { 'precondition_failed' }
-    Assert-True -Condition ($result.disposition -ceq 'BLOCKED' -and @($result.blockers) -ccontains "$prefix.$($case.code)") `
+    Assert-True -Condition ($result.disposition -ceq 'BLOCKED' -and @($result.blockers) -ccontains "$($case.prefix).$($case.code)") `
       -Message "stopped-cell case drifted: $($case.name)"
     $count += 1
   }
 
   $malformedPath = Join-Path $temporaryRoot 'stopped-malformed.json'
-  '{' | Set-Content -LiteralPath $malformedPath -Encoding utf8NoBOM
+  Write-StoppedCaseFixture -Path $malformedPath -Mutate { param($facts) $facts.vm.processor_count = 'not-an-integer' }
   $malformed = Invoke-StoppedFixture -Path $malformedPath
   Assert-True -Condition ($malformed.disposition -ceq 'BLOCKED' -and @($malformed.blockers) -ccontains 'fixture.schema_invalid') `
     -Message 'malformed stopped-cell fixture was accepted'
@@ -390,11 +422,13 @@ function Assert-StoppedCellFixtures {
   $second = @(& $stoppedScriptPath -FixturePath $stoppedFixturePath)
   Assert-True -Condition ($first.Count -eq 1 -and $first[0] -ceq $second[0]) -Message 'stopped-cell output was not deterministic'
   $count += 1
-  $redactionPath = Join-Path $temporaryRoot 'stopped-redaction.json'
-  Write-StoppedCaseFixture -Path $redactionPath -RawDetail 'C:\private\credential-password.txt'
-  $redacted = @(& $stoppedScriptPath -FixturePath $redactionPath)
-  Assert-True -Condition ($redacted.Count -eq 1 -and $redacted[0] -cnotmatch '(?i)C:\\|credential|password|private') `
-    -Message 'stopped-cell fixture disclosed a raw path or secret-like detail'
+  . $stoppedScriptPath -FixturePath $stoppedFixturePath | Out-Null
+  $rawFixture = Convert-FixtureToRawFacts -Path $stoppedFixturePath
+  Assert-True -Condition ($null -ne $rawFixture) -Message 'raw stopped-cell fixture was rejected'
+  $directObservations = Convert-StoppedCellRawFactsToObservations -RawFacts $rawFixture.raw_facts
+  $directResult = New-QualificationResult -EvidenceSource fixture -Observations $directObservations -SourceSha256 $rawFixture.digest
+  Assert-True -Condition (($directResult | ConvertTo-Json -Compress -Depth 12) -ceq ($eligible | ConvertTo-Json -Compress -Depth 12)) `
+    -Message 'Fixture classification did not share the raw-fact classifier path'
   $count += 1
   return $count
 }
@@ -455,6 +489,7 @@ try {
   $executedCaseCount = 0
   Assert-StaticDenyList
   $executedCaseCount += 1
+  $executedCaseCount += Assert-ProvenanceBindingBehavior
   Assert-PathSafetyAndDeterminism
   $executedCaseCount += 1
   $eligible = Invoke-Fixture -Path $fixturePath

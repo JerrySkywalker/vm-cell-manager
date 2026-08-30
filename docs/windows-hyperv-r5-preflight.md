@@ -98,9 +98,11 @@ sanitized observations, not wall-clock time.
 
 Start with
 [`windows-hyperv-image-provenance-template.json`](receipts/windows-hyperv-image-provenance-template.json).
-The template deliberately contains placeholders, not evidence. A completed
-owner packet must bind the exact v0.4.1 candidate SHA and version, package and binary hashes,
-Windows edition/build, source, VHDX digest, generation and security properties,
+The template deliberately contains placeholders, not evidence. A completed owner packet is
+validated against the frozen v0.4.1 Windows candidate, package, checksum manifest, binary,
+and `x86_64-pc-windows-msvc` target. It must also bind the Windows Server 2022 build, source,
+VHDX digest, Generation 2,
+Secure Boot `On` with `MicrosoftWindows`, and the remaining security properties,
 parent/attachment state, creation time, immutability declaration, receipt, and
 exclusive-window evidence before live observation can evaluate it.
 The non-executing packet instructions are in

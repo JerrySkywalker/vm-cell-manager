@@ -2,14 +2,49 @@
   "schema_version": 1,
   "contract": "vmcell.hyperv-stopped-cell-qualification-fixture.v1",
   "fixture_id": "eligible-stopped-cell",
-  "observations": [
-    { "code": "vm_identity", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "stopped_state", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "generation_2", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "secure_boot", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "disk_layout", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "resources", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "network_adapters", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-    { "code": "evidence_output", "status": "pass", "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
-  ]
+  "raw_facts": {
+    "expected": {
+      "vm_id": "11111111-1111-1111-1111-111111111111",
+      "vm_name": "fixture-cell",
+      "disk_path": "X:\\fixture\\overlay.vhdx",
+      "disk_parent_path": "X:\\fixture\\base.vhdx",
+      "processor_count": 2,
+      "memory_startup_bytes": 1073741824,
+      "secure_boot_template": "MicrosoftWindows"
+    },
+    "vm": {
+      "available": true,
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "fixture-cell",
+      "state": "Off",
+      "generation": 2,
+      "processor_count": 2,
+      "memory_startup_bytes": 1073741824
+    },
+    "firmware": {
+      "available": true,
+      "secure_boot": "On",
+      "secure_boot_template": "MicrosoftWindows"
+    },
+    "disks": {
+      "available": true,
+      "entries": [
+        {
+          "path": "X:\\fixture\\overlay.vhdx",
+          "vhd_type": "Differencing",
+          "parent_path": "X:\\fixture\\base.vhdx",
+          "parent_parent_path": null
+        }
+      ]
+    },
+    "network_adapters": {
+      "available": true,
+      "count": 0
+    },
+    "evidence_output": {
+      "available": true,
+      "parent_ordinary": true,
+      "target_absent": true
+    }
+  }
 }

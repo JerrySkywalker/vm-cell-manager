@@ -7,6 +7,7 @@
   "real_platform_acceptance": "not_started",
   "support_status": "untested",
   "candidate": {
+    "release_ref": "REQUIRED_RELEASE_REF",
     "sha": "REQUIRED_EXACT_40_HEX_SHA",
     "version": "REQUIRED_VERSION"
   },
@@ -19,6 +20,7 @@
   "candidate_binary": {
     "name": "REQUIRED_BINARY_NAME",
     "version": "REQUIRED_VERSION",
+    "target": "REQUIRED_WINDOWS_TARGET",
     "sha256": "REQUIRED_SHA256"
   },
   "windows": {
@@ -35,6 +37,7 @@
     "sha256": "REQUIRED_SHA256",
     "generation": "REQUIRED_GENERATION",
     "secure_boot": "REQUIRED_SECURITY_PROPERTY",
+    "secure_boot_template": "REQUIRED_SECURE_BOOT_TEMPLATE",
     "virtualization_based_security": "REQUIRED_SECURITY_PROPERTY",
     "vhd_type": "fixed",
     "parent_path": null,
