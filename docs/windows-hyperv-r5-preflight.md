@@ -115,9 +115,11 @@ before any start, use
 `tools/windows-hyperv-stopped-cell-qualification.ps1` in a separately
 authorized read-only owner window. Its Live parameter set binds an exact VM ID
 and name, expected overlay and immutable parent paths, CPU count, startup
-memory, Secure Boot template, and a new receipt path. It reads by VM ID and
-requires:
+memory, Secure Boot template, and a new receipt path. It enumerates the complete
+read-only Hyper-V VM inventory, selects the expected VM by ID, and requires:
 
+- exactly one inventory entry matching the expected ID and name, with complete
+  inventory evidence and no foreign, ambiguous, or non-Off VM;
 - state `Off` and Hyper-V Generation 2;
 - Secure Boot `On` with the exact expected template;
 - exactly one disk at the exact expected overlay path;
@@ -126,7 +128,7 @@ requires:
 - exact processor and startup-memory values; and
 - zero network adapters.
 
-Unavailable firmware, disk, resource, network, or identity evidence is a
+Unavailable inventory, firmware, disk, resource, network, or identity evidence is a
 blocking `evidence_gap.*`; a mismatch is `precondition_failed.*`. The helper
 never starts, stops, creates, changes, or removes a VM, disk, adapter, feature,
 service, runner, or process. A qualified stopped cell still grants no start
@@ -134,16 +136,19 @@ authority.
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-preflight.ps1` runs 78 deterministic checks while
+`tools/test-windows-hyperv-preflight.ps1` runs 106 deterministic checks while
 retaining the original 39-case safety coverage. It includes every operational
 path role on admitted local NTFS; split state/runtime volumes; missing,
 reparse, network, removable, file-backed, ambiguous, non-NTFS, capacity, and
-receipt boundaries; stopped-cell firmware/disk/network/resource failures;
+receipt boundaries; stopped-cell inventory/firmware/disk/network/resource failures;
 malformed input; deterministic rendering; path/secret-like input redaction;
 and guarded fixture-isolation processes. Its AST deny list and mutation probes reject
 feature, membership, service, VM, switch, VHD, disk/partition, ACL, network,
 registry, process, shutdown, restart, runner, and service mutation command
-families in both qualification tools.
+families in both qualification tools. It also rejects alias-based dispatch,
+call operators, constructed command names, nested PowerShell hosts, encoded
+payload abbreviations, and dynamic invocation APIs while retaining ordinary
+read-only PowerShell observations.
 
 Windows CI invokes only that fixture/static/template contract. It does not run
 the live mode, invoke Hyper-V, request elevation, create a VM, manipulate a

@@ -79,7 +79,7 @@ Before any real mutation:
 8. verify no active VMCell, runner worker, Codex writer, image writer, or other
    virtualization writer conflicts with the window;
 9. run the non-authorizing Live preflight once;
-10. require `PREFLIGHT_PASS` with no evidence gap.
+10. require `PREFLIGHT_ELIGIBLE` with no evidence gap.
 
 An unavailable observation is a block. It is never inferred as PASS.
 

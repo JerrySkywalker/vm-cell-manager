@@ -84,7 +84,7 @@ This checklist is not execution authority.
 - [ ] Foreign VMs and switches have been inventoried through sanitized counts
       and fingerprints.
 - [ ] The evidence directory is new, ordinary, non-reparse, and empty.
-- [ ] I understand `PREFLIGHT_PASS` is not real-platform PASS.
+- [ ] I understand `PREFLIGHT_ELIGIBLE` is not real-platform PASS.
 
 ## G. Before real Hyper-V authorization
 

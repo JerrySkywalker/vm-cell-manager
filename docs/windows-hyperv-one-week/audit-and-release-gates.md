@@ -18,7 +18,7 @@ Every gate is fail-closed. Absence of evidence is not PASS.
 | E1 | Unit, fixture, static, AST, schema tests | No |
 | E2 | Generic Hosted Windows/Linux CI | No |
 | E3 | Exact candidate/package/binary identity | No |
-| E4 | Non-authorizing Live preflight | No; ceiling is `PREFLIGHT_PASS` |
+| E4 | Non-authorizing Live preflight | No; ceiling is `PREFLIGHT_ELIGIBLE` |
 | E5 | Owner-attended authorized real run | Yes, for the exact host/candidate/image tuple only |
 | E6 | Independent closeout audit | May validate an E5 claim; cannot create missing evidence |
 
@@ -119,7 +119,7 @@ source correctness failure is always blocking.
 - Owner-attended elevated read context and exclusive window are proven.
 - Every required observation is available and PASS.
 - Receipt is fresh, non-overwriting, sanitized, and digest-bound.
-- Result is exactly `PREFLIGHT_PASS`; authority remains none and acceptance
+- Result is exactly `PREFLIGHT_ELIGIBLE`; authority remains none and acceptance
   remains false.
 
 ### G7 — real-run authorization gate
@@ -129,7 +129,7 @@ source correctness failure is always blocking.
 - No active competing writer exists.
 - Credentials are available through interactive bounded stdin.
 - Mutation list and stop conditions match
-  `OWNER-ATTENDED-ACCEPTANCE-PLAN.md` exactly.
+  `owner-attended-acceptance-plan.md` exactly.
 - No authority is inferred from G0–G6.
 
 ### G8 — owner-preview completion gate

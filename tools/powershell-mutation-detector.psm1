@@ -25,9 +25,10 @@ $script:ForbiddenMutationCommands = @(
   'Stop-Process', 'Start-Process', 'taskkill.exe', 'Stop-Computer', 'Restart-Computer', 'shutdown.exe', 'sc.exe'
 )
 
-$script:AliasMutationCommands = @('Set-Alias', 'New-Alias', 'Import-Alias')
-$script:DynamicExecutionCommands = @('Invoke-Expression', 'iex')
+$script:AliasMutationCommands = @('Set-Alias', 'New-Alias', 'Import-Alias', 'sal', 'nal', 'ipal')
+$script:DynamicExecutionCommands = @('Invoke-Expression', 'iex', 'Invoke-Command', 'icm')
 $script:PowerShellHosts = @('powershell', 'powershell.exe', 'pwsh', 'pwsh.exe')
+$script:DynamicInvocationMembers = @('AddCommand', 'AddScript', 'InvokeScript')
 
 function Add-VmcellMutationViolation {
   param(
@@ -58,20 +59,21 @@ function Get-VmcellPowerShellMutationViolations {
       Add-VmcellMutationViolation -Violations $violations -Code 'dynamic_call_operator' -Node $command
     }
     if (-not [string]::IsNullOrWhiteSpace($name)) {
-      if ($script:ForbiddenMutationCommands -ccontains $name) {
+      if ($script:ForbiddenMutationCommands -icontains $name) {
         Add-VmcellMutationViolation -Violations $violations -Code 'forbidden_mutation_command' -Node $command
       }
-      if ($script:AliasMutationCommands -ccontains $name) {
+      if ($script:AliasMutationCommands -icontains $name) {
         Add-VmcellMutationViolation -Violations $violations -Code 'alias_dispatch' -Node $command
       }
-      if ($script:DynamicExecutionCommands -ccontains $name) {
+      if ($script:DynamicExecutionCommands -icontains $name) {
         Add-VmcellMutationViolation -Violations $violations -Code 'dynamic_expression_dispatch' -Node $command
       }
-      if ($script:PowerShellHosts -ccontains $name) {
+      if ($script:PowerShellHosts -icontains $name) {
+        Add-VmcellMutationViolation -Violations $violations -Code 'nested_powershell_host_dispatch' -Node $command
         foreach ($parameter in @($command.CommandElements | Where-Object {
           $_ -is [System.Management.Automation.Language.CommandParameterAst]
         })) {
-          if ($parameter.ParameterName -match '^(?:e|enc|encodedcommand)$') {
+          if ('EncodedCommand'.StartsWith($parameter.ParameterName, [StringComparison]::OrdinalIgnoreCase)) {
             Add-VmcellMutationViolation -Violations $violations -Code 'encoded_command_dispatch' -Node $command
           }
         }
@@ -83,10 +85,19 @@ function Get-VmcellPowerShellMutationViolations {
     param($node)
     $node -is [System.Management.Automation.Language.MemberExpressionAst]
   }, $true))) {
+    $memberName = $member.Member.Extent.Text.Trim('''', '"')
+    if ($script:DynamicInvocationMembers -icontains $memberName) {
+      Add-VmcellMutationViolation -Violations $violations -Code 'dynamic_member_dispatch' -Node $member
+    }
     if ($member.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
-        $member.Expression.TypeName.FullName -ieq 'ScriptBlock' -and
-        $member.Member.Extent.Text -ieq 'Create') {
+        $member.Expression.TypeName.FullName -iin @('ScriptBlock', 'System.Management.Automation.ScriptBlock') -and
+        $memberName -ieq 'Create') {
       Add-VmcellMutationViolation -Violations $violations -Code 'scriptblock_creation_dispatch' -Node $member
+    }
+    if ($member.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
+        $member.Expression.TypeName.FullName -iin @('PowerShell', 'System.Management.Automation.PowerShell') -and
+        $memberName -ieq 'Create') {
+      Add-VmcellMutationViolation -Violations $violations -Code 'nested_powershell_creation' -Node $member
     }
   }
 

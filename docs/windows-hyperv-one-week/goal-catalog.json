@@ -368,7 +368,7 @@
         "network": false,
         "receipt_only": true
       },
-      "success": "G07_PREFLIGHT_PASS_OWNER_DECISION_REQUIRED_FOR_G08",
+      "success": "G07_PREFLIGHT_ELIGIBLE_OWNER_DECISION_REQUIRED_FOR_G08",
       "automatic_transition_to_g08": false,
       "next": "OWNER_DECISION_THEN_G08"
     },
@@ -384,7 +384,7 @@
       },
       "elapsed_cap_hours": 10,
       "dependencies": [
-        "G07_PREFLIGHT_PASS",
+        "G07_PREFLIGHT_ELIGIBLE",
         "NEW_EXPLICIT_OWNER_AUTHORIZATION"
       ],
       "stages": [

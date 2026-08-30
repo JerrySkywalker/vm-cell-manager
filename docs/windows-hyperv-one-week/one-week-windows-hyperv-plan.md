@@ -152,7 +152,7 @@ The prepared image is not accepted merely because a manifest says
 - Stop if any observation is unavailable, access denied, stale, mismatched, or
   inferred rather than proven.
 
-Terminal Day-3 result: `PREFLIGHT_PASS` ceiling only. It is never real-platform
+Terminal Day-3 result: `PREFLIGHT_ELIGIBLE` ceiling only. It is never real-platform
 acceptance.
 
 ### Day 4 — separately authorized real Hyper-V acceptance

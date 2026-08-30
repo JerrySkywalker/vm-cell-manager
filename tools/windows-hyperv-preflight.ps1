@@ -420,6 +420,11 @@ function Write-SanitizedReceiptCreateNew {
 function Test-LiveProvenance {
   param([Parameter(Mandatory)][object]$Provenance)
 
+  $schemaVersion = Get-ObjectProperty -InputObject $Provenance -Name 'schema_version'
+  if ($schemaVersion -isnot [long] -or [long]$schemaVersion -ne 1L) {
+    return $false
+  }
+
   $candidate = Get-ObjectProperty -InputObject $Provenance -Name 'candidate'
   $package = Get-ObjectProperty -InputObject $Provenance -Name 'package'
   $binary = Get-ObjectProperty -InputObject $Provenance -Name 'candidate_binary'
@@ -472,8 +477,7 @@ function Test-LiveProvenance {
     $windowOrdered = [DateTimeOffset]::Parse($requiredStrings[25]) -lt
       [DateTimeOffset]::Parse($requiredStrings[26])
   } catch {}
-  return $Provenance.schema_version -eq 1 -and
-    $Provenance.contract -ceq 'vmcell.hyperv-r5-image-provenance.v1' -and
+  return $Provenance.contract -ceq 'vmcell.hyperv-r5-image-provenance.v1' -and
     $Provenance.authority -ceq 'none' -and
     $Provenance.acceptance -is [bool] -and -not [bool]$Provenance.acceptance -and
     $Provenance.real_platform_acceptance -ceq 'not_started' -and
@@ -644,7 +648,9 @@ function Convert-FixtureToObservations {
   } catch {
     return $null
   }
-  if ($fixture.schema_version -ne 1 -or $fixture.contract -cne $fixtureContract) {
+  $fixtureSchemaVersion = Get-ObjectProperty -InputObject $fixture -Name 'schema_version'
+  if ($fixtureSchemaVersion -isnot [long] -or [long]$fixtureSchemaVersion -ne 1L -or
+      $fixture.contract -cne $fixtureContract) {
     return $null
   }
   $fixtureId = Get-ObjectProperty -InputObject $fixture -Name 'fixture_id'

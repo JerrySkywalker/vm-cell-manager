@@ -39,6 +39,7 @@ $contract = 'vmcell.hyperv-stopped-cell-qualification.v1'
 $fixtureContract = 'vmcell.hyperv-stopped-cell-qualification-fixture.v1'
 $observationCodes = @(
   'vm_identity',
+  'vm_inventory',
   'stopped_state',
   'generation_2',
   'secure_boot',
@@ -210,10 +211,14 @@ function Get-RawFactString {
 function Get-RawFactInt64 {
   param([Parameter(Mandatory)][object]$Fact, [Parameter(Mandatory)][string]$Name, [long]$Minimum = 0)
   $value = Get-RawFactProperty -Fact $Fact -Name $Name
-  $parsed = 0L
-  if ($value -is [bool] -or -not [long]::TryParse([string]$value, [ref]$parsed) -or $parsed -lt $Minimum) {
+  $integerTypes = @([byte], [sbyte], [short], [ushort], [int], [uint], [long], [ulong])
+  if ($null -eq $value -or $value.GetType() -notin $integerTypes) {
     throw "stopped-cell raw fact $Name was not an admitted integer"
   }
+  try { $parsed = [Convert]::ToInt64($value, [Globalization.CultureInfo]::InvariantCulture) } catch {
+    throw "stopped-cell raw fact $Name was not an admitted integer"
+  }
+  if ($parsed -lt $Minimum) { throw "stopped-cell raw fact $Name was not an admitted integer" }
   return $parsed
 }
 
@@ -222,7 +227,7 @@ function New-RawClassificationObservation {
     [Parameter(Mandatory)][string]$Code,
     [Parameter(Mandatory)][bool]$Available,
     [Parameter(Mandatory)][bool]$Valid,
-    [Parameter(Mandatory)][hashtable]$Evidence
+    [Parameter(Mandatory)][System.Collections.IDictionary]$Evidence
   )
   $status = if (-not $Available) { 'unavailable' } elseif ($Valid) { 'pass' } else { 'fail' }
   return New-Observation -Code $Code -Status $status -EvidenceSha256 (Get-Sha256Text -Text ($Evidence | ConvertTo-Json -Compress -Depth 8))
@@ -233,6 +238,7 @@ function Convert-StoppedCellRawFactsToObservations {
 
   $expected = Get-RawFactProperty -Fact $RawFacts -Name 'expected'
   $vm = Get-RawFactProperty -Fact $RawFacts -Name 'vm'
+  $inventory = Get-RawFactProperty -Fact $RawFacts -Name 'inventory'
   $firmware = Get-RawFactProperty -Fact $RawFacts -Name 'firmware'
   $disks = Get-RawFactProperty -Fact $RawFacts -Name 'disks'
   $network = Get-RawFactProperty -Fact $RawFacts -Name 'network_adapters'
@@ -248,8 +254,10 @@ function Convert-StoppedCellRawFactsToObservations {
   if (-not [Guid]::TryParse($expectedVmId, [ref]$expectedGuid)) { throw 'stopped-cell expected VM ID was malformed' }
 
   $vmAvailable = Get-RawFactBoolean -Fact $vm -Name 'available'
+  $vmPresent = Get-RawFactBoolean -Fact $vm -Name 'present'
   $vmId = $null; $vmName = $null; $vmState = $null; $generation = $null; $processors = $null; $memory = $null
-  if ($vmAvailable) {
+  if ($vmPresent -and -not $vmAvailable) { throw 'stopped-cell raw VM presence contradicted availability' }
+  if ($vmAvailable -and $vmPresent) {
     $vmId = Get-RawFactString -Fact $vm -Name 'id'
     $vmName = Get-RawFactString -Fact $vm -Name 'name'
     $vmState = Get-RawFactString -Fact $vm -Name 'state'
@@ -259,17 +267,63 @@ function Convert-StoppedCellRawFactsToObservations {
   }
 
   $identityValid = $false
-  if ($vmAvailable) {
+  if ($vmAvailable -and $vmPresent) {
     $actualGuid = [Guid]::Empty
     if (-not [Guid]::TryParse($vmId, [ref]$actualGuid)) { throw 'stopped-cell raw VM ID was malformed' }
     $identityValid = $actualGuid -eq $expectedGuid -and $vmName -ceq $expectedVmName
   }
   $observations = [Collections.Generic.List[object]]::new()
-  $observations.Add((New-RawClassificationObservation -Code 'vm_identity' -Available $vmAvailable -Valid $identityValid -Evidence @{ exact = $identityValid }))
-  $stopped = $vmAvailable -and $vmState -ceq 'Off'
-  $observations.Add((New-RawClassificationObservation -Code 'stopped_state' -Available $vmAvailable -Valid $stopped -Evidence @{ stopped = $stopped }))
-  $generation2 = $vmAvailable -and $generation -eq 2
-  $observations.Add((New-RawClassificationObservation -Code 'generation_2' -Available $vmAvailable -Valid $generation2 -Evidence @{ generation_2 = $generation2 }))
+  $observations.Add((New-RawClassificationObservation -Code 'vm_identity' -Available $vmAvailable -Valid $identityValid -Evidence ([ordered]@{ exact = $identityValid })))
+
+  $inventoryAvailable = Get-RawFactBoolean -Fact $inventory -Name 'available'
+  $inventoryComplete = Get-RawFactBoolean -Fact $inventory -Name 'complete'
+  if (-not $inventoryAvailable -and $inventoryComplete) {
+    throw 'stopped-cell raw inventory completeness contradicted availability'
+  }
+  $inventoryTotal = 0L
+  $inventoryExact = 0L
+  $inventoryAmbiguous = 0L
+  $inventoryForeign = 0L
+  $inventoryNonOff = 0L
+  if ($inventoryAvailable -and $inventoryComplete) {
+    $entriesValue = Get-RawFactProperty -Fact $inventory -Name 'entries'
+    if ($null -eq $entriesValue -or $entriesValue -is [string] -or $entriesValue -is [ValueType]) {
+      throw 'stopped-cell raw inventory entries were malformed'
+    }
+    $entries = @($entriesValue)
+    $inventoryTotal = $entries.Count
+    foreach ($entry in $entries) {
+      $entryId = Get-RawFactString -Fact $entry -Name 'id'
+      $entryName = Get-RawFactString -Fact $entry -Name 'name'
+      $entryState = Get-RawFactString -Fact $entry -Name 'state'
+      $entryGuid = [Guid]::Empty
+      if (-not [Guid]::TryParse($entryId, [ref]$entryGuid)) { throw 'stopped-cell raw inventory VM ID was malformed' }
+      $idExact = $entryGuid -eq $expectedGuid
+      $nameExact = $entryName -ceq $expectedVmName
+      if ($idExact -and $nameExact) { $inventoryExact += 1 }
+      elseif ($idExact -or $nameExact) { $inventoryAmbiguous += 1 }
+      else { $inventoryForeign += 1 }
+      if ($entryState -cne 'Off') { $inventoryNonOff += 1 }
+    }
+  }
+  $inventoryEvidenceAvailable = $inventoryAvailable -and $inventoryComplete
+  $inventoryValid = $inventoryEvidenceAvailable -and $inventoryTotal -eq 1 -and $inventoryExact -eq 1 -and
+    $inventoryAmbiguous -eq 0 -and $inventoryForeign -eq 0 -and $inventoryNonOff -eq 0
+  $inventoryEvidence = [ordered]@{
+    available = $inventoryAvailable
+    complete = $inventoryComplete
+    total_count = $inventoryTotal
+    exact_count = $inventoryExact
+    ambiguous_count = $inventoryAmbiguous
+    foreign_count = $inventoryForeign
+    non_off_count = $inventoryNonOff
+  }
+  $observations.Add((New-RawClassificationObservation -Code 'vm_inventory' -Available $inventoryEvidenceAvailable -Valid $inventoryValid -Evidence $inventoryEvidence))
+
+  $stopped = $vmAvailable -and $vmPresent -and $vmState -ceq 'Off'
+  $observations.Add((New-RawClassificationObservation -Code 'stopped_state' -Available $vmAvailable -Valid $stopped -Evidence ([ordered]@{ stopped = $stopped })))
+  $generation2 = $vmAvailable -and $vmPresent -and $generation -eq 2
+  $observations.Add((New-RawClassificationObservation -Code 'generation_2' -Available $vmAvailable -Valid $generation2 -Evidence ([ordered]@{ generation_2 = $generation2 })))
 
   $firmwareAvailable = Get-RawFactBoolean -Fact $firmware -Name 'available'
   $secureBootValid = $false
@@ -278,7 +332,7 @@ function Convert-StoppedCellRawFactsToObservations {
     $template = Get-RawFactString -Fact $firmware -Name 'secure_boot_template'
     $secureBootValid = $secureBoot -ceq 'On' -and $template -ceq $expectedTemplate
   }
-  $observations.Add((New-RawClassificationObservation -Code 'secure_boot' -Available $firmwareAvailable -Valid $secureBootValid -Evidence @{ enabled_and_template_exact = $secureBootValid }))
+  $observations.Add((New-RawClassificationObservation -Code 'secure_boot' -Available $firmwareAvailable -Valid $secureBootValid -Evidence ([ordered]@{ enabled_and_template_exact = $secureBootValid })))
 
   $disksAvailable = Get-RawFactBoolean -Fact $disks -Name 'available'
   $diskLayoutValid = $false
@@ -298,16 +352,16 @@ function Convert-StoppedCellRawFactsToObservations {
         [string]::IsNullOrWhiteSpace([string]$parentParentPath)
     }
   }
-  $observations.Add((New-RawClassificationObservation -Code 'disk_layout' -Available $disksAvailable -Valid $diskLayoutValid -Evidence @{ exact_one_level_layout = $diskLayoutValid }))
+  $observations.Add((New-RawClassificationObservation -Code 'disk_layout' -Available $disksAvailable -Valid $diskLayoutValid -Evidence ([ordered]@{ exact_one_level_layout = $diskLayoutValid })))
 
-  $resourcesValid = $vmAvailable -and $processors -eq $expectedProcessorCount -and $memory -eq $expectedMemoryStartupBytes
-  $observations.Add((New-RawClassificationObservation -Code 'resources' -Available $vmAvailable -Valid $resourcesValid -Evidence @{ exact = $resourcesValid }))
+  $resourcesValid = $vmAvailable -and $vmPresent -and $processors -eq $expectedProcessorCount -and $memory -eq $expectedMemoryStartupBytes
+  $observations.Add((New-RawClassificationObservation -Code 'resources' -Available $vmAvailable -Valid $resourcesValid -Evidence ([ordered]@{ exact = $resourcesValid })))
 
   $networkAvailable = Get-RawFactBoolean -Fact $network -Name 'available'
   $networkCount = 0L
   if ($networkAvailable) { $networkCount = Get-RawFactInt64 -Fact $network -Name 'count' -Minimum 0 }
   $networkValid = $networkAvailable -and $networkCount -eq 0
-  $observations.Add((New-RawClassificationObservation -Code 'network_adapters' -Available $networkAvailable -Valid $networkValid -Evidence @{ zero = $networkValid }))
+  $observations.Add((New-RawClassificationObservation -Code 'network_adapters' -Available $networkAvailable -Valid $networkValid -Evidence ([ordered]@{ zero = $networkValid })))
 
   $outputAvailable = Get-RawFactBoolean -Fact $output -Name 'available'
   $outputValid = $false
@@ -315,7 +369,7 @@ function Convert-StoppedCellRawFactsToObservations {
     $outputValid = (Get-RawFactBoolean -Fact $output -Name 'parent_ordinary') -and
       (Get-RawFactBoolean -Fact $output -Name 'target_absent')
   }
-  $observations.Add((New-RawClassificationObservation -Code 'evidence_output' -Available $outputAvailable -Valid $outputValid -Evidence @{ parent_ordinary_and_target_absent = $outputValid }))
+  $observations.Add((New-RawClassificationObservation -Code 'evidence_output' -Available $outputAvailable -Valid $outputValid -Evidence ([ordered]@{ parent_ordinary_and_target_absent = $outputValid })))
   return @($observations)
 }
 
@@ -340,7 +394,9 @@ function Convert-FixtureToRawFacts {
   try {
     $bytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($Path))
     $fixture = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -ErrorAction Stop
-    if ($fixture.schema_version -ne 1 -or $fixture.contract -cne $fixtureContract -or
+    $fixtureSchemaVersion = Get-ObjectProperty -InputObject $fixture -Name 'schema_version'
+    if ($fixtureSchemaVersion -isnot [long] -or [long]$fixtureSchemaVersion -ne 1L -or
+        $fixture.contract -cne $fixtureContract -or
         [string]$fixture.fixture_id -cnotmatch '^[a-z0-9][a-z0-9-]{2,63}$' -or
         $null -eq $fixture.PSObject.Properties['raw_facts']) { return $null }
     foreach ($prohibited in @('observations', 'disposition', 'blockers', 'readiness', 'eligibility')) {
@@ -354,7 +410,8 @@ function Convert-FixtureToRawFacts {
 function Get-LiveRawFacts {
   $raw = [ordered]@{
     expected = [ordered]@{ vm_id = $ExpectedVmId.ToString(); vm_name = $ExpectedVmName; disk_path = $ExpectedDiskPath; disk_parent_path = $ExpectedDiskParentPath; processor_count = $ExpectedProcessorCount; memory_startup_bytes = $ExpectedMemoryStartupBytes; secure_boot_template = $ExpectedSecureBootTemplate }
-    vm = [ordered]@{ available = $false }
+    vm = [ordered]@{ available = $false; present = $false }
+    inventory = [ordered]@{ available = $false; complete = $false }
     firmware = [ordered]@{ available = $false }
     disks = [ordered]@{ available = $false }
     network_adapters = [ordered]@{ available = $false }
@@ -362,10 +419,18 @@ function Get-LiveRawFacts {
   }
   $vm = $null
   try {
-    $matches = @(Get-VM -Id $ExpectedVmId -ErrorAction Stop)
+    $allVms = @(Get-VM -ErrorAction Stop)
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($candidateVm in $allVms) {
+      $entries.Add([ordered]@{ id = [string]$candidateVm.Id; name = [string]$candidateVm.Name; state = [string]$candidateVm.State })
+    }
+    $raw.inventory = [ordered]@{ available = $true; complete = $true; entries = @($entries) }
+    $matches = @($allVms | Where-Object { [Guid]$_.Id -eq $ExpectedVmId })
     if ($matches.Count -eq 1) {
       $vm = $matches[0]
-      $raw.vm = [ordered]@{ available = $true; id = [string]$vm.Id; name = [string]$vm.Name; state = [string]$vm.State; generation = [int]$vm.Generation; processor_count = [int]$vm.ProcessorCount; memory_startup_bytes = [long]$vm.MemoryStartup }
+      $raw.vm = [ordered]@{ available = $true; present = $true; id = [string]$vm.Id; name = [string]$vm.Name; state = [string]$vm.State; generation = [int]$vm.Generation; processor_count = [int]$vm.ProcessorCount; memory_startup_bytes = [long]$vm.MemoryStartup }
+    } else {
+      $raw.vm = [ordered]@{ available = $true; present = $false }
     }
   } catch {}
   if ($null -ne $vm) {

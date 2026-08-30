@@ -37,7 +37,9 @@ Secure Boot `On` with the exact `MicrosoftWindows` template before its first sta
 The image manifest's generation or Secure Boot statements are not substitutes
 for this read-back.
 
-The stopped cell must also prove exact VM ID and admitted name, one expected
+The stopped cell must also prove that the complete host VM inventory contains
+only the exact stopped VM ID and admitted name, with no foreign, ambiguous, or
+non-Off VM. It must prove one expected
 differencing disk whose parent is the exact immutable parentless base, expected
 CPU and startup memory, and zero network adapters. Use the read-only helper
 described in [the R5 preflight contract](windows-hyperv-r5-preflight.md); any

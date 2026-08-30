@@ -68,7 +68,7 @@ exact-dev passes. Otherwise it returns `WAITING_OWNER_INPUT`, not `BLOCKED`.
 ### Owner lane
 
 G05 may run in parallel with G02/G03. G07 and G08 are separate attended goals.
-G07 cannot auto-transition to G08 because `PREFLIGHT_PASS` creates no mutation
+G07 cannot auto-transition to G08 because `PREFLIGHT_ELIGIBLE` creates no mutation
 authority. The owner must review G07 and explicitly launch G08.
 
 ### Process D — independent closeout
@@ -536,7 +536,7 @@ separate real-run Goal may be proposed.
 ### Success
 
 ```text
-DISPOSITION=G07_PREFLIGHT_PASS_OWNER_DECISION_REQUIRED_FOR_G08
+DISPOSITION=G07_PREFLIGHT_ELIGIBLE_OWNER_DECISION_REQUIRED_FOR_G08
 ```
 
 G07 must stop even on PASS. It cannot auto-transition to G08.
