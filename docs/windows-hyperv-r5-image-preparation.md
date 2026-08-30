@@ -15,7 +15,7 @@ tokens, account identifiers, command lines, and credentials outside the
 repository and outside this template.
 
 The completed packet must bind one exact candidate SHA and version, package and
-binary digests, Windows edition/build/architecture, a sanitized image-source
+binary digests, Windows Server 2022 edition/build and x86_64 architecture, a sanitized image-source
 reference and digest, and a fixed detached parentless VHDX digest. It also
 records non-authorizing immutability, receipt-freshness, and exclusive-window
 evidence. `authority` remains `none`, `acceptance` remains `false`,
@@ -34,6 +34,17 @@ Any absent field, stale receipt, unsafe parent, changed snapshot, missing
 digest, or incomplete exclusivity evidence is an evidence gap. It must remain
 blocked for separate owner action, never be repaired, inferred, or relabelled
 as real-platform acceptance by this tooling.
+
+The state root, runtime root, image, package, binary, and completed provenance
+file are separate operational roles. Each must be placed under an already
+existing ordinary non-reparse local NTFS boundary and independently satisfy
+the path-derived backing and capacity-plus-rollback policy. Sanitized evidence
+output is a separate role and cannot authorize operational storage.
+
+The future guest local profile may be referenced only through sanitized owner
+attestation. Its password is supplied to VMCell only as one bounded stdin line;
+no credential, product key, token, account identifier, or private path may be
+placed in Git, argv, environment, VMCell state, receipts, or logs.
 
 ## Status
 

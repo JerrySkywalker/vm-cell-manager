@@ -1,7 +1,7 @@
 # VMCell owner-attended Windows Hyper-V acceptance plan
 
-Status: **OWNER APPROVED IMPLEMENTATION BASELINE**  
-Contract: `vmcell.owner-attended-hyperv-acceptance-plan.v1`  
+Status: **OWNER APPROVED IMPLEMENTATION BASELINE**
+Contract: `vmcell.owner-attended-hyperv-acceptance-plan.v1`
 Authorizing: **false until a later exact owner goal**
 
 ## 1. Boundary

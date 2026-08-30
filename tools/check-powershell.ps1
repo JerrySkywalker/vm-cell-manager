@@ -44,6 +44,7 @@ $files += @(
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\windows-whpx-preflight.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-whpx-preflight.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\windows-hyperv-preflight.ps1')),
+  (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\windows-hyperv-stopped-cell-qualification.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-hyperv-preflight.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-windows-validation-workflow.ps1')),
   (Get-Item -LiteralPath (Join-Path $repositoryRoot 'tools\test-linux-validation-workflow.ps1')),

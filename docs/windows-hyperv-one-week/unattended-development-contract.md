@@ -1,7 +1,7 @@
 # VMCell unattended development contract
 
-Status: **OWNER APPROVED IMPLEMENTATION BASELINE**  
-Contract: `vmcell.unattended-development-contract.v1`  
+Status: **OWNER APPROVED IMPLEMENTATION BASELINE**
+Contract: `vmcell.unattended-development-contract.v1`
 Authorizing real-platform work: **false**
 
 ## 1. Intent

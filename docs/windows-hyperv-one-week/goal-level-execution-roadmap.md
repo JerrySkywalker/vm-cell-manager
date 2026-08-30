@@ -1,8 +1,8 @@
 # VMCell one-week Windows Hyper-V goal-level execution roadmap
 
-Status: **OWNER APPROVED IMPLEMENTATION BASELINE**  
-Contract: `vmcell.one-week-goal-roadmap.v1`  
-Authorizing: **false**  
+Status: **OWNER APPROVED IMPLEMENTATION BASELINE**
+Contract: `vmcell.one-week-goal-roadmap.v1`
+Authorizing: **false**
 Parent plan: `vmcell.one-week-windows-hyperv-plan.v1`
 
 ## 1. Purpose

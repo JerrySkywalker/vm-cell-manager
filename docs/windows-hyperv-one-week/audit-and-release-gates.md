@@ -1,7 +1,7 @@
 # VMCell one-week audit and release gates
 
-Status: **OWNER APPROVED IMPLEMENTATION BASELINE**  
-Contract: `vmcell.one-week-audit-release-gates.v1`  
+Status: **OWNER APPROVED IMPLEMENTATION BASELINE**
+Contract: `vmcell.one-week-audit-release-gates.v1`
 Authorizing: **false**
 
 ## 1. Purpose

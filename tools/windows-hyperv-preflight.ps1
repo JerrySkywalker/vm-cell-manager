@@ -22,6 +22,40 @@ param(
   [Parameter(Mandatory, ParameterSetName = 'Live')]
   [string]$StateRoot,
 
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [string]$RuntimeRoot,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [string]$ReceiptPath,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$StateRequiredFreeBytes,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$RuntimeRequiredFreeBytes,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$ImageRequiredFreeBytes,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$PackageRequiredFreeBytes,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$BinaryRequiredFreeBytes,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$ProvenanceRequiredFreeBytes,
+
+  [Parameter(Mandatory, ParameterSetName = 'Live')]
+  [ValidateRange(1, [long]::MaxValue)]
+  [long]$RollbackMarginBytes,
+
   [ValidateRange(1, 168)]
   [int]$MaximumReceiptAgeHours = 24
 )
@@ -44,8 +78,13 @@ $observationCodes = @(
   'switch_inventory',
   'virtualization_writers',
   'runner_codex_activity',
-  'c_storage_boundary',
-  'v_storage_boundary',
+  'state_root_storage',
+  'runtime_root_storage',
+  'image_storage',
+  'package_storage',
+  'binary_storage',
+  'provenance_storage',
+  'evidence_output',
   'immutable_vhdx_presence',
   'vhdx_immutability',
   'vhdx_attachment',
@@ -198,6 +237,171 @@ function Get-ObjectProperty {
   return $property.Value
 }
 
+function Test-OperationalStorageFacts {
+  param([Parameter(Mandatory)][object]$Facts)
+
+  $available = Get-ObjectProperty -InputObject $Facts -Name 'evidence_available'
+  if ($available -isnot [bool] -or -not [bool]$available) {
+    return [pscustomobject]@{ status = 'unavailable'; evidence = @{ complete = $false } }
+  }
+
+  $exists = Get-ObjectProperty -InputObject $Facts -Name 'exists'
+  $ordinary = Get-ObjectProperty -InputObject $Facts -Name 'ordinary_ancestry'
+  $driveType = [string](Get-ObjectProperty -InputObject $Facts -Name 'drive_type')
+  $fileSystem = [string](Get-ObjectProperty -InputObject $Facts -Name 'file_system')
+  $busType = [string](Get-ObjectProperty -InputObject $Facts -Name 'bus_type')
+  $boundary = [string](Get-ObjectProperty -InputObject $Facts -Name 'boundary')
+  $freeBytes = Get-ObjectProperty -InputObject $Facts -Name 'free_bytes'
+  $requiredBytes = Get-ObjectProperty -InputObject $Facts -Name 'required_bytes'
+  $rollbackBytes = Get-ObjectProperty -InputObject $Facts -Name 'rollback_margin_bytes'
+  if ($exists -isnot [bool] -or $ordinary -isnot [bool] -or
+      $freeBytes -isnot [ValueType] -or $requiredBytes -isnot [ValueType] -or
+      $rollbackBytes -isnot [ValueType]) {
+    return [pscustomobject]@{ status = 'unavailable'; evidence = @{ complete = $false } }
+  }
+
+  try {
+    $free = [uint64]$freeBytes
+    $required = [uint64]$requiredBytes
+    $rollback = [uint64]$rollbackBytes
+    if ($required -eq 0 -or $rollback -eq 0 -or $required -gt ([uint64]::MaxValue - $rollback)) {
+      throw 'capacity values are invalid'
+    }
+    $capacity = $free -ge ($required + $rollback)
+  } catch {
+    return [pscustomobject]@{ status = 'unavailable'; evidence = @{ complete = $false } }
+  }
+
+  $admittedBusTypes = @('ATA', 'SATA', 'SAS', 'SCSI', 'RAID', 'NVMe', 'SCM')
+  $admittedBacking = $driveType -ceq 'Fixed' -and
+    $admittedBusTypes -ccontains $busType -and
+    $boundary -ceq 'ordinary-local-disk'
+  $suitable = [bool]$exists -and [bool]$ordinary -and $admittedBacking -and
+    $fileSystem -ceq 'NTFS' -and $capacity
+  return [pscustomobject]@{
+    status = if ($suitable) { 'pass' } else { 'fail' }
+    evidence = @{
+      present = [bool]$exists
+      ordinary = [bool]$ordinary
+      fixed = $driveType -ceq 'Fixed'
+      local_backing = $admittedBacking
+      ntfs = $fileSystem -ceq 'NTFS'
+      capacity_and_rollback = $capacity
+    }
+  }
+}
+
+function Get-LiveOperationalStorageFacts {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][bool]$RequireDirectory,
+    [Parameter(Mandatory)][long]$RequiredFreeBytes,
+    [Parameter(Mandatory)][long]$RollbackBytes,
+    [Parameter(Mandatory)][string]$Description
+  )
+
+  $item = Get-OrdinaryPathItem -Path $Path -RequireDirectory $RequireDirectory -Description $Description
+  $volumes = @(Get-Volume -Path $item.FullName -ErrorAction Stop)
+  if ($volumes.Count -ne 1) { throw "$Description volume evidence is ambiguous" }
+  $partitions = @($volumes[0] | Get-Partition -ErrorAction Stop)
+  if ($partitions.Count -ne 1) { throw "$Description partition evidence is ambiguous" }
+  $disks = @(Get-Disk -Number $partitions[0].DiskNumber -ErrorAction Stop)
+  if ($disks.Count -ne 1) { throw "$Description disk evidence is ambiguous" }
+  $disk = $disks[0]
+  $busType = [string]$disk.BusType
+  $boundary = if ($busType -ceq 'File Backed Virtual') {
+    'file-backed-virtual'
+  } elseif ([string]$volumes[0].DriveType -cne 'Fixed') {
+    'non-fixed'
+  } elseif ($busType -in @('USB', 'SD', 'MMC')) {
+    'removable'
+  } elseif ($busType -in @('Unknown', 'Virtual', 'Spaces')) {
+    'ambiguous'
+  } else {
+    'ordinary-local-disk'
+  }
+  return [pscustomobject]@{
+    evidence_available = $true
+    exists = $true
+    ordinary_ancestry = $true
+    drive_type = [string]$volumes[0].DriveType
+    file_system = [string]$volumes[0].FileSystem
+    bus_type = $busType
+    boundary = $boundary
+    free_bytes = [uint64]$volumes[0].SizeRemaining
+    required_bytes = [uint64]$RequiredFreeBytes
+    rollback_margin_bytes = [uint64]$RollbackBytes
+  }
+}
+
+function Test-EvidenceOutputFacts {
+  param([Parameter(Mandatory)][object]$Facts)
+
+  $available = Get-ObjectProperty -InputObject $Facts -Name 'evidence_available'
+  if ($available -isnot [bool] -or -not [bool]$available) {
+    return [pscustomobject]@{ status = 'unavailable'; evidence = @{ complete = $false } }
+  }
+  $parentExists = Get-ObjectProperty -InputObject $Facts -Name 'parent_exists'
+  $parentDirectory = Get-ObjectProperty -InputObject $Facts -Name 'parent_is_directory'
+  $ordinary = Get-ObjectProperty -InputObject $Facts -Name 'ordinary_ancestry'
+  $targetExists = Get-ObjectProperty -InputObject $Facts -Name 'target_exists'
+  if ($parentExists -isnot [bool] -or $parentDirectory -isnot [bool] -or
+      $ordinary -isnot [bool] -or $targetExists -isnot [bool]) {
+    return [pscustomobject]@{ status = 'unavailable'; evidence = @{ complete = $false } }
+  }
+  $suitable = [bool]$parentExists -and [bool]$parentDirectory -and
+    [bool]$ordinary -and -not [bool]$targetExists
+  return [pscustomobject]@{
+    status = if ($suitable) { 'pass' } else { 'fail' }
+    evidence = @{
+      parent_exists = [bool]$parentExists
+      parent_directory = [bool]$parentDirectory
+      ordinary = [bool]$ordinary
+      target_absent = -not [bool]$targetExists
+      operational_storage_authority = $false
+    }
+  }
+}
+
+function Get-LiveEvidenceOutputFacts {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $fullPath = [IO.Path]::GetFullPath($Path)
+  $parentPath = [IO.Path]::GetDirectoryName($fullPath)
+  if ([string]::IsNullOrWhiteSpace($parentPath) -or
+      [string]::IsNullOrWhiteSpace([IO.Path]::GetFileName($fullPath))) {
+    throw 'receipt path must name a file beneath an existing parent'
+  }
+  $parent = Get-OrdinaryPathItem -Path $parentPath -RequireDirectory $true -Description 'receipt parent'
+  return [pscustomobject]@{
+    evidence_available = $true
+    parent_exists = $true
+    parent_is_directory = [bool]$parent.PSIsContainer
+    ordinary_ancestry = $true
+    target_exists = Test-Path -LiteralPath $fullPath
+  }
+}
+
+function Write-SanitizedReceiptCreateNew {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Json
+  )
+
+  $facts = Get-LiveEvidenceOutputFacts -Path $Path
+  $qualification = Test-EvidenceOutputFacts -Facts $facts
+  if ($qualification.status -cne 'pass') { throw 'receipt output contract is not satisfied' }
+  $fullPath = [IO.Path]::GetFullPath($Path)
+  $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Json + [Environment]::NewLine)
+  $stream = [IO.File]::Open($fullPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try {
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 function Test-LiveProvenance {
   param([Parameter(Mandatory)][object]$Provenance)
 
@@ -318,6 +522,7 @@ function New-InvalidFixtureResult {
       runner_mutation = $false
       registry_mutation = $false
       github_observation = $false
+      receipt_write = $false
     }
   }
 }
@@ -327,7 +532,8 @@ function New-PreflightResult {
     [Parameter(Mandatory)][ValidateSet('fixture', 'live-read-only')][string]$EvidenceSource,
     [Parameter(Mandatory)][object[]]$Observations,
     [Parameter(Mandatory)][string]$EvidenceSourceDigest,
-    [Parameter(Mandatory)][bool]$HostObservation
+    [Parameter(Mandatory)][bool]$HostObservation,
+    [bool]$ReceiptWrite = $false
   )
 
   $blockers = [System.Collections.Generic.List[string]]::new()
@@ -376,6 +582,7 @@ function New-PreflightResult {
       runner_mutation = $false
       registry_mutation = $false
       github_observation = $false
+      receipt_write = $ReceiptWrite
     }
   }
 }
@@ -433,8 +640,8 @@ function Invoke-LiveObservation {
   try {
     $value = & $Probe
     $status = [string](Get-ObjectProperty -InputObject $value -Name 'status')
-    if ($status -cnotin @('pass', 'fail')) {
-      throw 'probe did not return pass or fail'
+    if ($status -cnotin @('pass', 'fail', 'unavailable')) {
+      throw 'probe did not return a supported status'
     }
     $evidence = Get-ObjectProperty -InputObject $value -Name 'evidence'
     $evidenceJson = $evidence | ConvertTo-Json -Compress -Depth 8
@@ -511,20 +718,23 @@ function Get-LiveObservations {
     $processes = @(Get-Process -ErrorAction Stop | Where-Object { $names -ccontains $_.ProcessName })
     [pscustomobject]@{ status = if ($processes.Count -eq 0) { 'pass' } else { 'fail' }; evidence = @{ count = $processes.Count } }
   }))
-  $result.Add((Invoke-LiveObservation -Code 'c_storage_boundary' -Probe {
-    $state = Get-OrdinaryPathItem -Path $StateRoot -RequireDirectory $true -Description 'state root'
-    $volume = Get-Volume -DriveLetter C -ErrorAction Stop
-    $stateRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($state.FullName))
-    $suitable = $state.PSIsContainer -and $stateRoot -ceq 'C:\' -and
-      [string]$volume.FileSystem -ceq 'NTFS'
-    [pscustomobject]@{ status = if ($suitable) { 'pass' } else { 'fail' }; evidence = @{ suitable = $suitable } }
-  }))
-  $result.Add((Invoke-LiveObservation -Code 'v_storage_boundary' -Probe {
-    $volume = Get-Volume -DriveLetter V -ErrorAction Stop
-    $partition = Get-Partition -DriveLetter V -ErrorAction Stop
-    $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction Stop
-    $suitable = [string]$volume.FileSystem -ceq 'NTFS' -and [string]$disk.BusType -cne 'File Backed Virtual'
-    [pscustomobject]@{ status = if ($suitable) { 'pass' } else { 'fail' }; evidence = @{ suitable = $suitable } }
+  $storageRoles = @(
+    @{ code = 'state_root_storage'; path = $StateRoot; directory = $true; required = $StateRequiredFreeBytes; description = 'state root' },
+    @{ code = 'runtime_root_storage'; path = $RuntimeRoot; directory = $true; required = $RuntimeRequiredFreeBytes; description = 'runtime root' },
+    @{ code = 'image_storage'; path = $VhdxPath; directory = $false; required = $ImageRequiredFreeBytes; description = 'image path' },
+    @{ code = 'package_storage'; path = $CandidatePackagePath; directory = $false; required = $PackageRequiredFreeBytes; description = 'candidate package path' },
+    @{ code = 'binary_storage'; path = $CandidateBinaryPath; directory = $false; required = $BinaryRequiredFreeBytes; description = 'candidate binary path' },
+    @{ code = 'provenance_storage'; path = $ProvenancePath; directory = $false; required = $ProvenanceRequiredFreeBytes; description = 'provenance path' }
+  )
+  foreach ($role in $storageRoles) {
+    $result.Add((Invoke-LiveObservation -Code $role.code -Probe {
+      $facts = Get-LiveOperationalStorageFacts -Path $role.path -RequireDirectory $role.directory `
+        -RequiredFreeBytes $role.required -RollbackBytes $RollbackMarginBytes -Description $role.description
+      Test-OperationalStorageFacts -Facts $facts
+    }))
+  }
+  $result.Add((Invoke-LiveObservation -Code 'evidence_output' -Probe {
+    Test-EvidenceOutputFacts -Facts (Get-LiveEvidenceOutputFacts -Path $ReceiptPath)
   }))
   $result.Add((Invoke-LiveObservation -Code 'immutable_vhdx_presence' -Probe {
     $vhdItem = Get-OrdinaryPathItem -Path $VhdxPath -RequireDirectory $false -Description 'VHDX path'
@@ -615,8 +825,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Fixture') {
   }
 } else {
   $liveObservations = Get-LiveObservations
-  New-PreflightResult -EvidenceSource 'live-read-only' -Observations $liveObservations `
+  $receiptWrite = @($liveObservations | Where-Object { $_.code -ceq 'evidence_output' })[0].status -ceq 'pass'
+  $liveResult = New-PreflightResult -EvidenceSource 'live-read-only' -Observations $liveObservations `
     -EvidenceSourceDigest (Get-ObservationDigest -Observations $liveObservations) `
-    -HostObservation $true |
-    ConvertTo-Json -Compress -Depth 12
+    -HostObservation $true -ReceiptWrite $receiptWrite
+  $liveJson = $liveResult | ConvertTo-Json -Compress -Depth 12
+  if ($receiptWrite) {
+    Write-SanitizedReceiptCreateNew -Path $ReceiptPath -Json $liveJson
+  }
+  $liveJson
 }

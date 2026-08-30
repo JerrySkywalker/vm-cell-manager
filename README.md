@@ -209,6 +209,9 @@ and an exact-owned running VM rechecked by its provider identity. Windows uses
 PowerShell Direct; M3 adds credentialless Linux QGA. Real QEMU/KVM and WHPX
 acceptance remain separate pre-v1 host gates. HVF is a post-v1, non-blocking
 direction rather than an active gate.
+The exact frozen `0.4.1` Windows Server 2022 owner-preview boundary is documented
+in the [Windows Hyper-V v0.4.1 owner-preview guide](docs/windows-hyperv-v041-owner-preview.md);
+its fixture and Hosted CI evidence is not real Hyper-V acceptance.
 
 The optional [user configuration](docs/user-configuration.md) is bounded,
 versioned, and non-authorizing. CLI values win. Configuration may supply safe

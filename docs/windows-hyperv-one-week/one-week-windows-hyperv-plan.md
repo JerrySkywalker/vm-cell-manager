@@ -1,8 +1,8 @@
 # VMCell one-week Windows Hyper-V owner-preview plan
 
-Status: **OWNER APPROVED IMPLEMENTATION BASELINE**  
-Contract: `vmcell.one-week-windows-hyperv-plan.v1`  
-Authorizing: **false**  
+Status: **OWNER APPROVED IMPLEMENTATION BASELINE**
+Contract: `vmcell.one-week-windows-hyperv-plan.v1`
+Authorizing: **false**
 Real-platform acceptance: **NOT_STARTED**
 
 ## 1. Purpose

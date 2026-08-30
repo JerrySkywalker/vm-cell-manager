@@ -1,7 +1,7 @@
 # VMCell one-week owner checklist
 
-Status: **OWNER APPROVED IMPLEMENTATION BASELINE**  
-Contract: `vmcell.one-week-owner-checklist.v1`  
+Status: **OWNER APPROVED IMPLEMENTATION BASELINE**
+Contract: `vmcell.one-week-owner-checklist.v1`
 This checklist is not execution authority.
 
 ## A. Approve the target
