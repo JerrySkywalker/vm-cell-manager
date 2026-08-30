@@ -1,0 +1,384 @@
+{
+  "contract": "vmcell.one-week-windows-hyperv-work-breakdown.v1",
+  "schema_version": 1,
+  "status": "OWNER_APPROVED_IMPLEMENTATION_BASELINE",
+  "authorizing": false,
+  "real_platform_acceptance": "NOT_STARTED",
+  "support_status": "untested",
+  "target_outcome": "OWNER_LOCAL_PREVIEW_PASS",
+  "planning_baseline": {
+    "dev_before_pr77": "03cf6d425aeaca9fddd909bd3c330dd669f78549",
+    "pr77_head": "958688452a6b8e7534fdeeaad2eefff242b2acf9",
+    "frozen_release_ref": "release/v0.4.1",
+    "frozen_release_sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+    "frozen_windows_binary_sha256": "249db6841161d634449142584ad7924b26cbe7b31a41eca9b813dd2eb8acec1b",
+    "package_version": "0.4.1",
+    "fresh_revalidation_required": true
+  },
+  "global_invariants": {
+    "active_hosts": [
+      "windows_x86_64"
+    ],
+    "deferred_nonblocking": [
+      "apple",
+      "macos",
+      "hvf",
+      "linux",
+      "kvm",
+      "qemu",
+      "whpx",
+      "windows_11_vtpm",
+      "jobspec_overlay",
+      "public_release",
+      "support_promotion"
+    ],
+    "production_binary_changes_before_first_real_run": 0,
+    "maximum_tooling_correction_cycles": 2,
+    "maximum_production_correction_cycles": 1,
+    "unknown_effect_policy": "STOP_PRESERVE_EVIDENCE_NO_REPLAY",
+    "credentials_channel": "BOUNDED_STDIN_ONLY",
+    "raw_evidence_in_git": false,
+    "live_provider_access_in_generic_ci": false
+  },
+  "usable_definition": [
+    "exact_candidate_package_binary_identity",
+    "path_derived_host_and_storage_admission",
+    "immutable_parentless_detached_readonly_vhdx_with_provenance",
+    "generation2_secure_boot_networkless_stopped_cell_proof",
+    "powershell_direct_readiness",
+    "stdout_stderr_zero_and_nonzero_exit",
+    "copy_in_copy_out_and_artifact_hash",
+    "three_sequential_fresh_identity_runs",
+    "bounded_failure_recovery_and_reconciliation",
+    "idempotent_exact_owned_cleanup",
+    "unchanged_base_hash_and_foreign_state",
+    "sanitized_non_promoting_receipt"
+  ],
+  "phases": [
+    {
+      "id": "P0",
+      "name": "PR77_CLOSEOUT_AND_FRESH_BASELINE",
+      "mode": "UNATTENDED_REPOSITORY_WORK",
+      "estimated_hours": "1-3",
+      "dependencies": [],
+      "required_inputs": [
+        "owner_approval_of_this_plan",
+        "live_origin_refs",
+        "pr77_exact_head_and_diff",
+        "exact_head_hosted_windows_and_linux_ci"
+      ],
+      "authorized_actions": [
+        "read_only_repository_and_github_audit",
+        "normal_pr77_merge_if_all_gates_pass",
+        "exact_merged_dev_ci_verification",
+        "create_isolated_tooling_branch_worktree_target_and_external_checkpoint"
+      ],
+      "forbidden_actions": [
+        "force_push",
+        "protection_bypass",
+        "review_dismissal",
+        "main_or_release_write",
+        "provider_or_host_mutation"
+      ],
+      "success_evidence": [
+        "pr77_final_head",
+        "merge_sha",
+        "exact_dev_windows_ci",
+        "exact_dev_linux_ci",
+        "unchanged_main_and_release_ref"
+      ],
+      "stop_conditions": [
+        "pr77_unexpected_commit_or_diff",
+        "required_source_correctness_failure",
+        "review_requests_changes",
+        "incompatible_dev_divergence",
+        "protected_workflow_denial"
+      ],
+      "checkpoint": "P0.json"
+    },
+    {
+      "id": "P1",
+      "name": "QUALIFICATION_TOOLING_AND_DOCUMENTATION_PR",
+      "mode": "UNATTENDED_REPOSITORY_WORK",
+      "estimated_hours": "8-12",
+      "dependencies": [
+        "P0"
+      ],
+      "required_inputs": [
+        "exact_merged_dev_sha",
+        "repository_instructions",
+        "canonical_validation_commands"
+      ],
+      "authorized_actions": [
+        "modify_preflight_tooling_fixtures_static_tests_and_docs",
+        "add_path_derived_state_runtime_image_package_binary_provenance_and_evidence_checks",
+        "add_capacity_evidence",
+        "add_post_create_pre_start_readonly_firmware_checks",
+        "run_local_validation",
+        "push_one_work_branch",
+        "open_one_pr_to_dev",
+        "perform_up_to_two_bounded_source_corrections",
+        "merge_after_exact_head_green_and_independent_audit",
+        "verify_exact_merged_dev_ci"
+      ],
+      "forbidden_actions": [
+        "production_rust_path_change",
+        "cargo_lock_change",
+        "version_change",
+        "support_promotion",
+        "live_hyperv_access",
+        "elevation",
+        "image_mutation",
+        "runner_or_network_repair"
+      ],
+      "success_evidence": [
+        "p0_p1_p2_zero",
+        "all_required_local_gates_pass",
+        "fixture_mode_isolation_pass",
+        "forbidden_mutation_ast_pass",
+        "exact_head_hosted_windows_pass",
+        "exact_head_hosted_linux_pass",
+        "independent_audit_pass",
+        "exact_dev_ci_pass",
+        "cargo_lock_unchanged"
+      ],
+      "stop_conditions": [
+        "production_binary_change_required",
+        "p0_or_p1_finding",
+        "unresolved_p2_finding",
+        "more_than_two_correction_cycles",
+        "credential_or_private_host_disclosure",
+        "live_provider_access_in_ci"
+      ],
+      "checkpoint": "P1.json"
+    },
+    {
+      "id": "O1",
+      "name": "OWNER_IMAGE_PREPARATION",
+      "mode": "OWNER_ATTENDED_EXTERNAL_WORK",
+      "estimated_hours": "2-6",
+      "dependencies": [],
+      "parallel_with": [
+        "P0",
+        "P1"
+      ],
+      "required_inputs": [
+        "legitimate_owner_controlled_windows_server_2022_media_or_image",
+        "owner_license_decision",
+        "private_local_ntfs_capacity",
+        "owner_chosen_guest_local_profile"
+      ],
+      "authorized_actions": [
+        "owner_attended_external_image_preparation_under_separate_goal",
+        "complete_sanitized_provenance",
+        "detach_mark_readonly_and_hash_final_vhdx"
+      ],
+      "forbidden_actions": [
+        "automatic_media_download_by_vmcell",
+        "credentials_or_product_keys_in_git_argv_environment_or_receipts",
+        "reuse_of_daily_vhdx_or_foreign_vm_disk",
+        "claim_that_manifest_alone_proves_generation2_boot"
+      ],
+      "success_evidence": [
+        "windows_server_2022_x86_64",
+        "fixed_vhdx",
+        "parentless",
+        "detached",
+        "readonly",
+        "ordinary_non_reparse",
+        "exact_size_and_sha256",
+        "completed_sanitized_provenance",
+        "credentials_embedded_owner_attestation"
+      ],
+      "stop_conditions": [
+        "license_or_media_ambiguity",
+        "embedded_secret_suspected",
+        "image_attached_or_parented",
+        "insufficient_storage_capacity",
+        "foreign_disk_identity"
+      ],
+      "checkpoint": "O1-owner-receipt.json"
+    },
+    {
+      "id": "P2",
+      "name": "OFFLINE_BINDING_AND_LIVE_READONLY_ADMISSION",
+      "mode": "OWNER_ATTENDED_READ_ONLY_HOST_WORK",
+      "estimated_hours": "1-2",
+      "dependencies": [
+        "P1",
+        "O1"
+      ],
+      "required_inputs": [
+        "exact_merged_tooling",
+        "frozen_candidate_package_and_binary",
+        "completed_image_and_provenance",
+        "owner_attended_elevated_read_context",
+        "exclusive_window_evidence"
+      ],
+      "authorized_actions": [
+        "offline_hash_and_schema_validation",
+        "one_live_non_authorizing_observational_preflight",
+        "sanitized_receipt_generation"
+      ],
+      "forbidden_actions": [
+        "hyperv_mutation",
+        "service_or_runner_mutation",
+        "host_feature_mutation",
+        "network_mutation",
+        "image_mutation",
+        "automatic_repair",
+        "real_acceptance_claim"
+      ],
+      "success_evidence": [
+        "preflight_disposition_preflight_pass_ceiling_only",
+        "all_observations_proven_not_inferred",
+        "fresh_receipt_and_digest",
+        "raw_evidence_not_published"
+      ],
+      "stop_conditions": [
+        "access_denied_or_unavailable_observation",
+        "identity_or_hash_mismatch",
+        "storage_or_capacity_failure",
+        "foreign_state_or_writer_activity",
+        "stale_receipt",
+        "unexpected_mutation"
+      ],
+      "checkpoint": "P2.json"
+    },
+    {
+      "id": "R1",
+      "name": "REAL_HYPERV_POWERSHELL_DIRECT_ACCEPTANCE",
+      "mode": "OWNER_ATTENDED_AUTHORIZED_REAL_RUN",
+      "estimated_hours": "6-10",
+      "dependencies": [
+        "P2"
+      ],
+      "required_inputs": [
+        "new_explicit_owner_authorization",
+        "exact_candidate_and_preflight_receipt",
+        "bounded_window",
+        "exclusive_host_and_provider_writer_state",
+        "guest_credentials_available_interactively"
+      ],
+      "authorized_actions": [
+        "register_exact_image",
+        "create_one_exact_owned_stopped_networkless_cell",
+        "observe_generation2_secure_boot_disk_parent_and_networkless_state",
+        "start_exact_owned_cell",
+        "powershell_direct_probe_exec_copy_and_artifact",
+        "three_sequential_fresh_identity_runs",
+        "one_bounded_failure_recovery_case",
+        "reconcile_and_remove_exact_owned_resources"
+      ],
+      "forbidden_actions": [
+        "foreign_vm_or_switch_mutation",
+        "host_feature_or_service_repair",
+        "network_or_firewall_change",
+        "credential_persistence",
+        "blind_replay",
+        "ambiguous_object_adoption_or_deletion",
+        "support_promotion_or_release"
+      ],
+      "success_evidence": [
+        "all_usable_definition_items",
+        "unchanged_base_hash",
+        "unchanged_foreign_inventory",
+        "exact_no_residue_cleanup",
+        "sanitized_real_run_receipt"
+      ],
+      "stop_conditions": [
+        "unknown_effect",
+        "ownership_or_expected_state_mismatch",
+        "generation_secure_boot_disk_or_network_mismatch",
+        "guest_authentication_or_session_ambiguity",
+        "cleanup_ambiguity",
+        "foreign_state_change"
+      ],
+      "checkpoint": "R1.json"
+    },
+    {
+      "id": "P3",
+      "name": "INDEPENDENT_CLOSEOUT",
+      "mode": "READ_ONLY_AUDIT",
+      "estimated_hours": "2-4",
+      "dependencies": [
+        "R1"
+      ],
+      "required_inputs": [
+        "complete_r1_evidence",
+        "pre_and_post_state_digests",
+        "cleanup_proof"
+      ],
+      "authorized_actions": [
+        "independent_evidence_review",
+        "sanitized_owner_preview_receipt",
+        "future_support_recommendation_without_mutation"
+      ],
+      "forbidden_actions": [
+        "rewrite_or_repair_evidence",
+        "retroactive_authority",
+        "automatic_support_promotion",
+        "release_or_tag_publication"
+      ],
+      "success_evidence": [
+        "owner_local_preview_pass_or_precise_nonpass",
+        "p0_p1_p2_zero_for_claimed_result",
+        "mutation_flags_and_limitations_recorded"
+      ],
+      "stop_conditions": [
+        "missing_or_mismatched_evidence",
+        "unresolved_safety_finding",
+        "receipt_disclosure"
+      ],
+      "checkpoint": "P3.json"
+    },
+    {
+      "id": "F1",
+      "name": "SINGLE_PRODUCTION_DEFECT_CONTINGENCY",
+      "mode": "CONDITIONAL_REPOSITORY_WORK",
+      "estimated_hours": "UP_TO_TWO_DAYS",
+      "dependencies": [
+        "R1_NONPASS_WITH_ONE_BOUNDED_PRODUCTION_DEFECT"
+      ],
+      "required_inputs": [
+        "preserved_defect_evidence",
+        "owner_authorization_for_one_correction",
+        "new_candidate_identity_plan"
+      ],
+      "authorized_actions": [
+        "one_bounded_production_correction_pr",
+        "full_local_and_hosted_qualification",
+        "new_candidate_version_hash_and_receipt",
+        "rerun_only_authorized_acceptance_scope"
+      ],
+      "forbidden_actions": [
+        "relabel_frozen_v0_4_1",
+        "more_than_one_production_correction_cycle",
+        "rushed_pass",
+        "release_publication"
+      ],
+      "success_evidence": [
+        "new_candidate_exact_head_green",
+        "independent_audit",
+        "corrected_real_run_evidence"
+      ],
+      "stop_conditions": [
+        "second_production_defect",
+        "unknown_effect",
+        "timebox_exhausted",
+        "new_candidate_not_fully_qualified"
+      ],
+      "checkpoint": "F1.json"
+    }
+  ],
+  "allowed_terminal_dispositions": [
+    "OWNER_LOCAL_PREVIEW_PASS",
+    "PARTIAL_RESUMABLE",
+    "BLOCKED_BASELINE_DRIFT",
+    "BLOCKED_TOOLING_CORRECTNESS",
+    "BLOCKED_OWNER_IMAGE",
+    "BLOCKED_PREFLIGHT",
+    "BLOCKED_REAL_RUN_SAFETY",
+    "BLOCKED_PROTECTED_WORKFLOW"
+  ]
+}

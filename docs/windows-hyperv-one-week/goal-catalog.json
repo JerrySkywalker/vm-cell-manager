@@ -1,0 +1,557 @@
+{
+  "contract": "vmcell.one-week-goal-catalog.v1",
+  "schema_version": 1,
+  "status": "OWNER_APPROVED_IMPLEMENTATION_BASELINE",
+  "authorizing": false,
+  "parent_contracts": [
+    "vmcell.one-week-windows-hyperv-plan.v1",
+    "vmcell.one-week-windows-hyperv-work-breakdown.v1",
+    "vmcell.unattended-development-contract.v1",
+    "vmcell.owner-attended-hyperv-acceptance-plan.v1",
+    "vmcell.one-week-audit-release-gates.v1",
+    "vmcell.one-week-owner-checklist.v1"
+  ],
+  "target": "OWNER_LOCAL_PREVIEW_PASS",
+  "required_goal_ids": [
+    "G01",
+    "G02",
+    "G03",
+    "G04",
+    "G05",
+    "G06",
+    "G07",
+    "G08",
+    "G09"
+  ],
+  "conditional_goal_ids": [
+    "G10",
+    "G11"
+  ],
+  "global_rules": {
+    "fresh_live_admission_per_goal": true,
+    "self_contained_prompt_required": true,
+    "checkpoint_after_each_phase": true,
+    "unexecuted_check_is_pass": false,
+    "generic_ci_live_provider_access": false,
+    "credentials_channel": "BOUNDED_STDIN_ONLY",
+    "raw_evidence_in_git": false,
+    "tooling_correction_limit": 2,
+    "production_correction_limit": 1,
+    "ci_wait_limit_hours": 8,
+    "support_promotion": false,
+    "public_release": false,
+    "apple_required": false,
+    "docker_required": false
+  },
+  "recommended_paths": {
+    "g02_branch": "agent/v041-win-hyperv-owner-preview-qualification",
+    "g02_worktree": "V:\\src\\vm-cell-manager-winpreview-g02",
+    "g02_cargo_target": "V:\\build\\vmcell\\winpreview-g02",
+    "checkpoint_parent": "V:\\artifacts\\vmcell\\development-runs",
+    "operational_root_pattern": "C:\\vmcell-r5\\<role>",
+    "sanitized_evidence_pattern": "V:\\artifacts\\vmcell\\v0.4.1\\winpreview\\<run-guid>"
+  },
+  "processes": [
+    {
+      "id": "PROCESS_A",
+      "role": "AUTHOR",
+      "fresh_process": true,
+      "goals": [
+        "G01",
+        "G02"
+      ],
+      "automatic_transition": "G01_TO_G02_IF_EXACT_DEV_GREEN",
+      "maximum_hours": 24,
+      "forced_stop_after": "G02_GREEN_PR_FOR_INDEPENDENT_G03"
+    },
+    {
+      "id": "PROCESS_B",
+      "role": "INDEPENDENT_AUDITOR",
+      "fresh_process": true,
+      "non_resumed": true,
+      "non_forked": true,
+      "preferred_model": "gpt-5.6-sol",
+      "reasoning_effort": "xhigh",
+      "goals": [
+        "G03"
+      ]
+    },
+    {
+      "id": "PROCESS_C",
+      "role": "AUTHOR_CLOSEOUT",
+      "fresh_process": false,
+      "may_adopt_g02_worktree": true,
+      "goals": [
+        "G04",
+        "G06"
+      ],
+      "automatic_transition": "G04_TO_G06_IF_G05_PACKET_READY"
+    },
+    {
+      "id": "OWNER_LANE",
+      "role": "OWNER_ATTENDED",
+      "goals": [
+        "G05",
+        "G07",
+        "G08",
+        "G11"
+      ],
+      "automatic_transition_forbidden": [
+        "G07_TO_G08"
+      ]
+    },
+    {
+      "id": "PROCESS_D",
+      "role": "INDEPENDENT_CLOSEOUT_AUDITOR",
+      "fresh_process": true,
+      "non_resumed": true,
+      "non_forked": true,
+      "preferred_model": "gpt-5.6-sol",
+      "reasoning_effort": "xhigh",
+      "goals": [
+        "G09"
+      ]
+    }
+  ],
+  "goals": [
+    {
+      "id": "G01",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G01-PR77-CLOSEOUT",
+      "name": "PR77_CLOSEOUT",
+      "mode": "UNATTENDED_REPOSITORY_GITHUB",
+      "owner_present": false,
+      "timebox_hours": {
+        "minimum": 1,
+        "maximum": 2
+      },
+      "elapsed_cap_hours": 8,
+      "dependencies": [],
+      "inputs": [
+        "owner_approved_plan_bundle",
+        "live_origin_refs",
+        "pr77_current_head_diff_reviews",
+        "required_exact_head_hosted_ci"
+      ],
+      "authorized": [
+        "read_only_repo_and_github_audit",
+        "normal_pr77_merge_to_dev",
+        "exact_merged_dev_ci_verification",
+        "external_sanitized_checkpoint",
+        "create_g02_isolated_work_state"
+      ],
+      "prohibited": [
+        "pr77_source_edit",
+        "force_push_or_protection_bypass",
+        "issue_mutation",
+        "main_or_release_write",
+        "host_provider_image_service_runner_network_mutation"
+      ],
+      "success": "G01_COMPLETE_EXACT_DEV_GREEN_CONTINUE_G02",
+      "valid_stops": [
+        "unexpected_pr_head_diff_or_review",
+        "incompatible_dev_divergence",
+        "required_source_correctness_failure",
+        "protected_workflow_rejection",
+        "exact_merged_dev_ci_failure"
+      ],
+      "next": "G02"
+    },
+    {
+      "id": "G02",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G02-QUALIFICATION-TOOLING",
+      "name": "QUALIFICATION_TOOLING_AND_DOCS",
+      "mode": "UNATTENDED_REPOSITORY_AUTHOR",
+      "owner_present": false,
+      "timebox_hours": {
+        "minimum": 8,
+        "maximum": 12
+      },
+      "elapsed_cap_hours": 20,
+      "dependencies": [
+        "G01"
+      ],
+      "work_branch": "agent/v041-win-hyperv-owner-preview-qualification",
+      "inputs": [
+        "exact_pr77_merge_dev",
+        "approved_eight_document_draft_bundle",
+        "repository_instructions",
+        "canonical_validation_contract"
+      ],
+      "authorized": [
+        "preflight_and_readonly_qualification_powershell",
+        "fixtures_static_ast_tests",
+        "narrow_fixture_only_ci",
+        "approved_planning_and_owner_preview_docs",
+        "one_pr_to_dev",
+        "up_to_two_bounded_author_corrections"
+      ],
+      "required_features": [
+        "path_derived_role_aware_storage",
+        "explicit_state_and_runtime_roots",
+        "separate_evidence_output_role",
+        "capacity_and_rollback_evidence",
+        "non_overwriting_ordinary_receipt_parent",
+        "post_create_pre_start_generation2_secure_boot_disk_network_checks",
+        "deterministic_fixtures_and_isolation",
+        "exact_v041_owner_preview_guide"
+      ],
+      "prohibited": [
+        "production_rust_execution_change",
+        "cargo_lock_or_version_change",
+        "support_promotion",
+        "live_provider_access",
+        "elevation_or_host_mutation",
+        "image_mutation",
+        "rule_weakening"
+      ],
+      "success": "G02_COMPLETE_PR_OPEN_GREEN_AWAITING_G03",
+      "valid_stops": [
+        "baseline_or_candidate_drift",
+        "production_binary_change_required",
+        "p0_or_p1_finding",
+        "unresolved_p2",
+        "credential_or_private_host_disclosure",
+        "live_provider_access_in_ci",
+        "correction_budget_exhausted"
+      ],
+      "next": "G03"
+    },
+    {
+      "id": "G03",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G03-INDEPENDENT-TOOLING-AUDIT",
+      "name": "INDEPENDENT_TOOLING_AUDIT",
+      "mode": "FRESH_INDEPENDENT_READ_ONLY",
+      "owner_present": false,
+      "timebox_hours": {
+        "minimum": 4,
+        "maximum": 6
+      },
+      "elapsed_cap_hours": 8,
+      "dependencies": [
+        "G02"
+      ],
+      "preferred_model": "gpt-5.6-sol",
+      "reasoning_effort": "xhigh",
+      "github_writes": false,
+      "repository_writes": false,
+      "outcomes": [
+        "PASS_MERGE_ADMISSIBLE",
+        "FAIL_CORRECTIONS_REQUIRED",
+        "BLOCKED_AUDIT_ENVIRONMENT",
+        "BLOCKED_HEAD_DRIFT"
+      ],
+      "success": "PASS_MERGE_ADMISSIBLE",
+      "next_on_pass": "G04",
+      "next_on_correction": "G04_REENTRY_CORRECTION"
+    },
+    {
+      "id": "G04",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G04-TOOLING-MERGE",
+      "name": "TOOLING_CORRECTION_MERGE_EXACT_DEV",
+      "mode": "UNATTENDED_AUTHOR_CLOSEOUT",
+      "owner_present": false,
+      "timebox_hours": {
+        "minimum": 2,
+        "maximum": 8
+      },
+      "elapsed_cap_hours": 12,
+      "dependencies": [
+        "G03_PASS_OR_CORRECTION_REPORT"
+      ],
+      "correction_loop": {
+        "maximum_cycles": 2,
+        "independent_reaudit_after_each_changed_head": true,
+        "p0_p1_self_merge_forbidden": true
+      },
+      "authorized": [
+        "bounded_correction_on_g02_branch",
+        "full_regate_and_exact_head_ci",
+        "normal_merge_after_independent_pass",
+        "exact_merged_dev_ci",
+        "task_local_cleanup_after_green"
+      ],
+      "success": "G04_COMPLETE_TOOLING_MERGED_EXACT_DEV_GREEN",
+      "next_if_g05_ready": "G06",
+      "next_if_g05_not_ready": "WAITING_OWNER_INPUT_NOT_BLOCKED"
+    },
+    {
+      "id": "G05",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G05-SERVER2022-IMAGE",
+      "name": "SERVER2022_IMAGE_PREPARATION",
+      "mode": "OWNER_ATTENDED_EXTERNAL_IMAGE_PREPARATION",
+      "owner_present": true,
+      "timebox_hours": {
+        "minimum": 2,
+        "maximum": 6
+      },
+      "elapsed_cap_hours": 6,
+      "dependencies": [],
+      "parallel_with": [
+        "G02",
+        "G03"
+      ],
+      "required_output": [
+        "windows_server_2022_x86_64",
+        "fixed_generation2_compatible_vhdx",
+        "secure_boot_compatible",
+        "local_guest_profile",
+        "detached_parentless_readonly_ordinary_non_reparse",
+        "exact_size_sha256",
+        "sanitized_provenance",
+        "owner_license_and_embedded_credential_attestations",
+        "capacity_evidence"
+      ],
+      "prohibited": [
+        "unattended_license_or_activation",
+        "daily_or_foreign_attached_vhdx",
+        "credential_product_key_token_or_private_path_disclosure",
+        "generation_acceptance_before_real_stopped_vm_observation"
+      ],
+      "success": "G05_IMAGE_PACKET_READY_NOT_ADMITTED",
+      "next": "G06_AFTER_G04"
+    },
+    {
+      "id": "G06",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G06-OFFLINE-BINDING",
+      "name": "OFFLINE_BINDING",
+      "mode": "UNATTENDED_READ_ONLY_BINDING",
+      "owner_present": false,
+      "timebox_hours": {
+        "minimum": 2,
+        "maximum": 4
+      },
+      "elapsed_cap_hours": 4,
+      "dependencies": [
+        "G04",
+        "G05"
+      ],
+      "authorized": [
+        "exact_dev_and_ci_verification",
+        "candidate_package_binary_image_provenance_hashing",
+        "schema_and_attestation_validation",
+        "capacity_floor_calculation",
+        "sanitized_g07_and_proposed_g08_packet_generation"
+      ],
+      "prohibited": [
+        "live_preflight_or_hyperv_query",
+        "elevation",
+        "image_or_host_mutation",
+        "broad_parent_creation",
+        "real_run_authority"
+      ],
+      "success": "G06_OFFLINE_PACKET_READY_FOR_OWNER_G07",
+      "next": "G07"
+    },
+    {
+      "id": "G07",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G07-LIVE-PREFLIGHT",
+      "name": "LIVE_READONLY_PREFLIGHT",
+      "mode": "OWNER_ATTENDED_ELEVATED_READ_ONLY",
+      "owner_present": true,
+      "timebox_hours": {
+        "minimum": 1,
+        "maximum": 2
+      },
+      "elapsed_cap_hours": 2,
+      "dependencies": [
+        "G06"
+      ],
+      "live_invocation_limit": 1,
+      "primary_codex_elevated_preference": false,
+      "owner_manual_uac": true,
+      "mutations": {
+        "host": false,
+        "hyperv": false,
+        "vm": false,
+        "image": false,
+        "service_runner": false,
+        "network": false,
+        "receipt_only": true
+      },
+      "success": "G07_PREFLIGHT_PASS_OWNER_DECISION_REQUIRED_FOR_G08",
+      "automatic_transition_to_g08": false,
+      "next": "OWNER_DECISION_THEN_G08"
+    },
+    {
+      "id": "G08",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G08-REAL-ACCEPTANCE",
+      "name": "REAL_HYPERV_ACCEPTANCE",
+      "mode": "OWNER_ATTENDED_AUTHORIZED_REAL_PLATFORM",
+      "owner_present": true,
+      "timebox_hours": {
+        "minimum": 6,
+        "maximum": 10
+      },
+      "elapsed_cap_hours": 10,
+      "dependencies": [
+        "G07_PREFLIGHT_PASS",
+        "NEW_EXPLICIT_OWNER_AUTHORIZATION"
+      ],
+      "stages": [
+        "R0_FINAL_PRESTATE",
+        "R1_IMAGE_REGISTRATION",
+        "R2_STOPPED_CELL_GENERATION_FIRMWARE_DISK_NETWORK_PROOF",
+        "R3_FIRST_START_POWERSHELL_DIRECT_READINESS",
+        "R4_MINIMUM_COMMAND_STREAMS_EXIT",
+        "R5_COPY_ARTIFACT_THREE_RUNS_NONZERO",
+        "R6_BOUNDED_RECOVERY_NO_REPLAY_RECONCILE",
+        "R7_EXACT_OWNED_IDEMPOTENT_CLEANUP",
+        "R8_NO_RESIDUE_BASE_AND_FOREIGN_POSTSTATE"
+      ],
+      "mutation_ceiling": [
+        "one_exact_owned_vm_at_a_time",
+        "disposable_differencing_overlay",
+        "exact_owned_start_stop_remove"
+      ],
+      "always_forbidden": [
+        "foreign_or_ambiguous_object_mutation",
+        "switch_network_firewall_change",
+        "feature_service_runner_acl_change",
+        "base_image_mutation",
+        "credential_persistence",
+        "blind_replay",
+        "support_promotion_or_release"
+      ],
+      "success": "G08_REAL_RUN_COMPLETE_AWAITING_G09_AUDIT",
+      "next": "G09"
+    },
+    {
+      "id": "G09",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G09-INDEPENDENT-CLOSEOUT",
+      "name": "INDEPENDENT_CLOSEOUT",
+      "mode": "FRESH_INDEPENDENT_READ_ONLY",
+      "owner_present": false,
+      "timebox_hours": {
+        "minimum": 4,
+        "maximum": 6
+      },
+      "elapsed_cap_hours": 6,
+      "dependencies": [
+        "G08"
+      ],
+      "preferred_model": "gpt-5.6-sol",
+      "reasoning_effort": "xhigh",
+      "repository_writes": false,
+      "github_writes": false,
+      "provider_access": false,
+      "outcomes": [
+        "OWNER_LOCAL_PREVIEW_PASS",
+        "PARTIAL_RESUMABLE",
+        "FAIL_CORRECTIONS_REQUIRED",
+        "FAIL_SAFETY_OR_CORRECTNESS",
+        "BLOCKED_AUDIT_ENVIRONMENT"
+      ],
+      "success": "OWNER_LOCAL_PREVIEW_PASS",
+      "support_promotion": false,
+      "public_release": false
+    },
+    {
+      "id": "G10",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G10-PRODUCTION-CORRECTION",
+      "name": "SINGLE_PRODUCTION_CORRECTION",
+      "mode": "UNATTENDED_REPOSITORY_AUTHOR",
+      "owner_present": false,
+      "conditional": true,
+      "timebox_hours": {
+        "minimum": 8,
+        "maximum": 12
+      },
+      "elapsed_cap_hours": 20,
+      "dependencies": [
+        "ONE_PROVEN_BOUNDED_PRODUCTION_DEFECT",
+        "OWNER_CORRECTION_AUTHORIZATION"
+      ],
+      "rules": [
+        "do_not_relabel_frozen_v041",
+        "one_correction_pr",
+        "minimal_fix_and_regression",
+        "full_local_hosted_and_independent_qualification",
+        "new_candidate_version_sha_package_binary_receipt",
+        "no_second_production_correction"
+      ],
+      "success": "G10_NEW_CANDIDATE_GREEN_READY_FOR_G11",
+      "next": "G11"
+    },
+    {
+      "id": "G11",
+      "goal_id": "VMCELL-WIN-HYPERV-ONE-WEEK-G11-CORRECTED-RERUN",
+      "name": "CORRECTED_CANDIDATE_RERUN",
+      "mode": "OWNER_ATTENDED_AUTHORIZED_REAL_PLATFORM",
+      "owner_present": true,
+      "conditional": true,
+      "timebox_hours": {
+        "minimum": 4,
+        "maximum": 8
+      },
+      "elapsed_cap_hours": 8,
+      "dependencies": [
+        "G10"
+      ],
+      "required_sequence": [
+        "new_offline_binding",
+        "new_live_preflight",
+        "new_owner_authorization",
+        "rerun_failed_and_downstream_real_slices",
+        "repeat_cleanup_base_hash_foreign_poststate",
+        "repeat_g09_independent_closeout"
+      ],
+      "old_candidate_authority_reuse": false
+    }
+  ],
+  "day_plan": [
+    {
+      "day": 1,
+      "primary": [
+        "G01",
+        "G02_START"
+      ],
+      "parallel": [
+        "G05_START_IF_OWNER_AVAILABLE"
+      ]
+    },
+    {
+      "day": 2,
+      "primary": [
+        "G02_COMPLETE"
+      ],
+      "parallel": [
+        "G05_COMPLETE"
+      ]
+    },
+    {
+      "day": 3,
+      "primary": [
+        "G03",
+        "G04",
+        "G06"
+      ]
+    },
+    {
+      "day": 4,
+      "primary": [
+        "G07",
+        "OWNER_DECISION",
+        "G08"
+      ]
+    },
+    {
+      "day": 5,
+      "primary": [
+        "G09"
+      ]
+    },
+    {
+      "day": 6,
+      "conditional": [
+        "G10"
+      ]
+    },
+    {
+      "day": 7,
+      "conditional": [
+        "G11",
+        "G09_REPEAT"
+      ]
+    }
+  ]
+}
