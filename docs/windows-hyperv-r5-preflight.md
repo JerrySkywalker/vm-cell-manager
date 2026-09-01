@@ -71,6 +71,31 @@ changed, or unsafe receipt or path becomes an evidence gap and can never
 produce `PREFLIGHT_ELIGIBLE`. The live result digest is derived from its ordered
 sanitized observations, not wall-clock time.
 
+### Raw JSON provenance boundary
+
+Fixture and Live inputs use the same raw UTF-8 JSON boundary before PowerShell
+materializes an object. It rejects malformed input; scalar, array, and null
+roots; and duplicate or case-conflicting member names at every object depth.
+The fixture receipt returns only `fixture.schema_invalid` for a raw-input
+failure. Provenance unknown members return a stable
+`provenance.unknown_property_count.N` blocker: neither form reflects a member
+name, member value, JSON fragment, private path, or parser exception.
+
+The closed-world provenance packet is the following semantic group set:
+`schema_version`, `contract`, `authority`, `acceptance`, `authorizing`,
+`admission_result`, `admission_status`, `real_platform_acceptance`,
+`support_status`, `admitted_for_candidate_sha`, `candidate`, `package`,
+`candidate_binary`, `windows`, `hyperv`, `image_source`, `vhdx`, `creation`,
+`immutability`, `admission_receipt`, `exclusive_window`, and
+`license_evaluation`. In particular, `image_source.reference` must be a
+positive `SRC-` source reference and `creation.created_by_evidence_id` must be
+a positive `EVID-` creator reference. Both are Unicode-normalized and
+surrounding-whitespace-normalized before a token-boundary placeholder policy
+rejects `REQUIRED`, `REQUIRED_OWNER`, `TODO`, `TBD`, `CHANGE_ME`, `SAMPLE`,
+`EXAMPLE`, `DUMMY`, `UNKNOWN`, and `NOT_EXECUTED` variants. The policy does not
+use a substring match, so syntactically valid opaque evidence identifiers such
+as `EVID-SAMPLER-CREATOR-20260902` remain valid.
+
 ## Provenance template
 
 Start with
@@ -94,12 +119,15 @@ The non-executing packet instructions are in
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-preflight.ps1` runs a schema-derived deterministic
-corpus: every required provenance field is removed and assigned every wrong JSON
-type, string fields receive empty/whitespace and placeholder variants, and
-identity, Windows, Hyper-V, VHDX, timestamp, owner-attestation, redaction,
-template-agreement, and fixture-isolation cases are executed. Its AST scan rejects
-feature, membership, service, VM, switch, VHD, disk/partition, ACL, network,
+`tools/test-windows-hyperv-preflight.ps1` uses the test-owned
+`provenance-contract-matrix.json`, not the production required-field collection,
+as its deterministic golden corpus. It compares the independent 63-field matrix
+separately with the template, production raw parser and semantic validator,
+fixture, Rust template test, and this documentation. It also exercises raw
+duplicate/case-conflict input, malformed/scalar roots, placeholder metamorphs
+and safe near misses, sanitized unknown-property receipts, restored path and
+observation regressions, and fixture isolation. Its AST scan rejects feature,
+membership, service, VM, switch, VHD, disk/partition, ACL, network,
 process-termination, shutdown, restart, runner, and service mutation command
 families in the production tool.
 

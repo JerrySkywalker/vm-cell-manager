@@ -161,6 +161,67 @@ function Get-OrdinaryProvenanceFile {
   return Get-OrdinaryPathItem -Path $Path -RequireDirectory $false -Description 'provenance path'
 }
 
+function Test-RawJsonObjectMembers {
+  param([Parameter(Mandatory)][System.Text.Json.JsonElement]$Element)
+
+  try {
+    switch ($Element.ValueKind) {
+      ([System.Text.Json.JsonValueKind]::Object) {
+        $members = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($property in $Element.EnumerateObject()) {
+          if (-not $members.Add($property.Name)) {
+            return $false
+          }
+          if (-not (Test-RawJsonObjectMembers -Element $property.Value)) {
+            return $false
+          }
+        }
+      }
+      ([System.Text.Json.JsonValueKind]::Array) {
+        foreach ($item in $Element.EnumerateArray()) {
+          if (-not (Test-RawJsonObjectMembers -Element $item)) {
+            return $false
+          }
+        }
+      }
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function ConvertFrom-RawJsonObject {
+  param([Parameter(Mandatory)][byte[]]$Bytes)
+
+  $document = $null
+  try {
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes)
+    $document = [System.Text.Json.JsonDocument]::Parse($text)
+    if ($document.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+      return [ordered]@{ valid = $false; code = 'json.root_invalid'; value = $null }
+    }
+    if (-not (Test-RawJsonObjectMembers -Element $document.RootElement)) {
+      return [ordered]@{ valid = $false; code = 'json.duplicate_or_ambiguous_member'; value = $null }
+    }
+    $convertFromJsonParameters = @{ ErrorAction = 'Stop' }
+    if ($PSVersionTable.PSVersion -ge [Version]'7.5') {
+      $convertFromJsonParameters.DateKind = 'String'
+    }
+    $value = $text | ConvertFrom-Json @convertFromJsonParameters
+    if (-not (Test-JsonObject -Value $value)) {
+      return [ordered]@{ valid = $false; code = 'json.root_invalid'; value = $null }
+    }
+    return [ordered]@{ valid = $true; code = ''; value = $value }
+  } catch {
+    return [ordered]@{ valid = $false; code = 'json.malformed'; value = $null }
+  } finally {
+    if ($null -ne $document) {
+      $document.Dispose()
+    }
+  }
+}
+
 function Get-SafeProvenanceSnapshot {
   param([Parameter(Mandatory)][string]$Path)
 
@@ -176,16 +237,13 @@ function Get-SafeProvenanceSnapshot {
     throw 'provenance evidence changed while it was read'
   }
 
-  try {
-    $convertFromJsonParameters = @{ ErrorAction = 'Stop' }
-    if ($PSVersionTable.PSVersion -ge [Version]'7.5') {
-      $convertFromJsonParameters.DateKind = 'String'
-    }
-    $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json @convertFromJsonParameters
-  } catch {
-    throw 'provenance evidence is not valid UTF-8 JSON'
+  $parsed = ConvertFrom-RawJsonObject -Bytes $bytes
+  return [pscustomobject]@{
+    valid = [bool]$parsed.valid
+    code = [string]$parsed.code
+    value = $parsed.value
+    sha256 = $afterHash
   }
-  return [pscustomobject]@{ value = $value; sha256 = $afterHash }
 }
 
 function Test-Sha256 {
@@ -213,7 +271,8 @@ function New-ProvenanceField {
     [string[]]$AllowedValues = @(),
     [ValidateSet('', 'sha256', 'sha40', 'opaque', 'source_reference', 'archive_name', 'timestamp', 'windows_server_2022_build')][string]$ValueKind = '',
     [bool]$Positive = $false,
-    [bool]$AllowUnknownRequiresOwnerAttestation = $false
+    [bool]$AllowUnknownRequiresOwnerAttestation = $false,
+    [ValidateSet('none', 'token_boundary')][string]$PlaceholderPolicy = 'none'
   )
 
   return [pscustomobject]@{
@@ -225,6 +284,7 @@ function New-ProvenanceField {
     value_kind = $ValueKind
     positive = $Positive
     allow_unknown_requires_owner_attestation = $AllowUnknownRequiresOwnerAttestation
+    placeholder_policy = $PlaceholderPolicy
   }
 }
 
@@ -244,7 +304,7 @@ function Get-HyperVImageProvenanceSchema {
     (New-ProvenanceField -Path 'candidate.version' -JsonType string -ExactValue '0.4.1'),
     (New-ProvenanceField -Path 'candidate.frozen_release_ref' -JsonType string -ExactValue 'release/v0.4.1'),
     (New-ProvenanceField -Path 'candidate.frozen_release_sha' -JsonType string -ExactValue '0e7fcf37f4310562d318f9d5c709ddf8e8ca1637'),
-    (New-ProvenanceField -Path 'package.archive_name' -JsonType string -ValueKind archive_name),
+    (New-ProvenanceField -Path 'package.archive_name' -JsonType string -ValueKind archive_name -PlaceholderPolicy token_boundary),
     (New-ProvenanceField -Path 'package.archive_sha256' -JsonType string -ValueKind sha256),
     (New-ProvenanceField -Path 'package.checksum_manifest_sha256' -JsonType string -ValueKind sha256),
     (New-ProvenanceField -Path 'package.sha256' -JsonType string -ValueKind sha256),
@@ -261,8 +321,8 @@ function Get-HyperVImageProvenanceSchema {
     (New-ProvenanceField -Path 'hyperv.secure_boot_template' -JsonType string -ExactValue 'MicrosoftWindows'),
     (New-ProvenanceField -Path 'hyperv.powershell_direct' -JsonType string -ExactValue 'EXPECTED'),
     (New-ProvenanceField -Path 'hyperv.qemu_guest_agent' -JsonType string -ExactValue 'NOT_APPLICABLE'),
-    (New-ProvenanceField -Path 'image_source.reference' -JsonType string -ValueKind source_reference),
-    (New-ProvenanceField -Path 'image_source.evidence_id' -JsonType string -ValueKind opaque),
+    (New-ProvenanceField -Path 'image_source.reference' -JsonType string -ValueKind source_reference -PlaceholderPolicy token_boundary),
+    (New-ProvenanceField -Path 'image_source.evidence_id' -JsonType string -ValueKind opaque -PlaceholderPolicy token_boundary),
     (New-ProvenanceField -Path 'image_source.source_sha256' -JsonType string -ValueKind sha256),
     (New-ProvenanceField -Path 'image_source.acquisition_method' -JsonType string -AllowedValues @('OWNER_SUPPLIED_MEDIA', 'OWNER_BUILD_PIPELINE', 'OWNER_PREPARED_IMAGE')),
     (New-ProvenanceField -Path 'image_source.build_method' -JsonType string -AllowedValues @('SYSPREP_GENERALIZED', 'BASELINE_IMAGE', 'OWNER_ATTESTED_BUILD')),
@@ -274,17 +334,17 @@ function Get-HyperVImageProvenanceSchema {
     (New-ProvenanceField -Path 'vhdx.attached' -JsonType boolean -ExactValue $false),
     (New-ProvenanceField -Path 'vhdx.detached' -JsonType boolean -ExactValue $true),
     (New-ProvenanceField -Path 'vhdx.immutable_owner_policy' -JsonType string -ExactValue 'OWNER_ATTESTED_READ_ONLY'),
-    (New-ProvenanceField -Path 'vhdx.ordinary_non_reparse_evidence_id' -JsonType string -ValueKind opaque),
+    (New-ProvenanceField -Path 'vhdx.ordinary_non_reparse_evidence_id' -JsonType string -ValueKind opaque -PlaceholderPolicy token_boundary),
     (New-ProvenanceField -Path 'vhdx.backing_chain' -JsonType string -ExactValue 'NONE'),
     (New-ProvenanceField -Path 'vhdx.preparation_timestamp_utc' -JsonType string -ValueKind timestamp),
-    (New-ProvenanceField -Path 'vhdx.preparation_evidence_id' -JsonType string -ValueKind opaque),
+    (New-ProvenanceField -Path 'vhdx.preparation_evidence_id' -JsonType string -ValueKind opaque -PlaceholderPolicy token_boundary),
     (New-ProvenanceField -Path 'vhdx.secrets_present' -JsonType boolean -ExactValue $false),
     (New-ProvenanceField -Path 'vhdx.credentials_embedded' -JsonType string -AllowedValues @('OWNER_ATTESTED_NONE', 'UNKNOWN_REQUIRES_OWNER_ATTESTATION') -AllowUnknownRequiresOwnerAttestation $true),
     (New-ProvenanceField -Path 'creation.created_at_utc' -JsonType string -ValueKind timestamp),
-    (New-ProvenanceField -Path 'creation.created_by_evidence_id' -JsonType string -ValueKind opaque),
+    (New-ProvenanceField -Path 'creation.created_by_evidence_id' -JsonType string -ValueKind opaque -PlaceholderPolicy token_boundary),
     (New-ProvenanceField -Path 'immutability.owner_policy' -JsonType string -ExactValue 'OWNER_ATTESTED_READ_ONLY'),
     (New-ProvenanceField -Path 'immutability.verification_evidence_sha256' -JsonType string -ValueKind sha256),
-    (New-ProvenanceField -Path 'admission_receipt.receipt_id' -JsonType string -ValueKind opaque),
+    (New-ProvenanceField -Path 'admission_receipt.receipt_id' -JsonType string -ValueKind opaque -PlaceholderPolicy token_boundary),
     (New-ProvenanceField -Path 'admission_receipt.issued_at_utc' -JsonType string -ValueKind timestamp),
     (New-ProvenanceField -Path 'admission_receipt.sha256' -JsonType string -ValueKind sha256),
     (New-ProvenanceField -Path 'exclusive_window.eligible' -JsonType boolean -ExactValue $true),
@@ -292,7 +352,7 @@ function Get-HyperVImageProvenanceSchema {
     (New-ProvenanceField -Path 'exclusive_window.ends_at_utc' -JsonType string -ValueKind timestamp),
     (New-ProvenanceField -Path 'exclusive_window.evidence_sha256' -JsonType string -ValueKind sha256),
     (New-ProvenanceField -Path 'license_evaluation.review_status' -JsonType string -ExactValue 'HUMAN_REVIEW_REQUIRED'),
-    (New-ProvenanceField -Path 'license_evaluation.evidence_id' -JsonType string -ValueKind opaque)
+    (New-ProvenanceField -Path 'license_evaluation.evidence_id' -JsonType string -ValueKind opaque -PlaceholderPolicy token_boundary)
   )
 }
 
@@ -336,14 +396,32 @@ function Get-JsonPathValue {
 function Test-ProvenancePlaceholder {
   param(
     [Parameter(Mandatory)][string]$Value,
-    [Parameter(Mandatory)][bool]$AllowUnknownRequiresOwnerAttestation
+    [Parameter(Mandatory)][bool]$AllowUnknownRequiresOwnerAttestation,
+    [Parameter(Mandatory)][ValidateSet('none', 'token_boundary')][string]$Policy
   )
 
-  $normalized = $Value.Trim()
+  if ($Policy -eq 'none') {
+    return $false
+  }
+  $normalized = $Value.Normalize([Text.NormalizationForm]::FormKC).Trim()
   if ($AllowUnknownRequiresOwnerAttestation -and $normalized -ceq 'UNKNOWN_REQUIRES_OWNER_ATTESTATION') {
     return $false
   }
-  return $normalized -cmatch '^(?i:REQUIRED_|TODO|TBD|FIXME|UNKNOWN)'
+  $tokens = @([regex]::Matches($normalized, '[A-Za-z0-9]+') | ForEach-Object {
+      $_.Value.ToUpperInvariant()
+    })
+  foreach ($marker in @('REQUIRED', 'TODO', 'TBD', 'FIXME', 'UNKNOWN', 'SAMPLE', 'EXAMPLE', 'DUMMY')) {
+    if ($tokens -ccontains $marker) {
+      return $true
+    }
+  }
+  for ($index = 0; $index -lt $tokens.Count - 1; $index++) {
+    if (($tokens[$index] -ceq 'NOT' -and $tokens[$index + 1] -ceq 'EXECUTED') -or
+        ($tokens[$index] -ceq 'CHANGE' -and $tokens[$index + 1] -ceq 'ME')) {
+      return $true
+    }
+  }
+  return $false
 }
 
 function Test-ProvenanceTimestamp {
@@ -367,6 +445,7 @@ function Test-HyperVImageProvenance {
   $blockers = [System.Collections.Generic.List[string]]::new()
   $actions = [System.Collections.Generic.List[string]]::new()
   $parentFields = @{}
+  $unknownPropertyCount = 0
   foreach ($field in $schema) {
     $segments = $field.path.Split('.')
     for ($index = 0; $index -lt $segments.Count; $index++) {
@@ -392,10 +471,12 @@ function Test-HyperVImageProvenance {
     }
     foreach ($property in $entry.value.PSObject.Properties.Name) {
       if ($parentFields[$parent] -cnotcontains $property) {
-        $propertyPath = if ($parent.Length -eq 0) { $property } else { "$parent.$property" }
-        $blockers.Add("provenance.unknown_property.$propertyPath")
+        $unknownPropertyCount += 1
       }
     }
+  }
+  if ($unknownPropertyCount -gt 0) {
+    $blockers.Add("provenance.unknown_property_count.$unknownPropertyCount")
   }
   foreach ($field in $schema) {
     $entry = Get-JsonPathValue -InputObject $Provenance -Path $field.path
@@ -422,7 +503,9 @@ function Test-HyperVImageProvenance {
         $blockers.Add("provenance.empty_value.$($field.path)")
         continue
       }
-      if (Test-ProvenancePlaceholder -Value $value -AllowUnknownRequiresOwnerAttestation $field.allow_unknown_requires_owner_attestation) {
+      if (Test-ProvenancePlaceholder -Value $value `
+          -AllowUnknownRequiresOwnerAttestation $field.allow_unknown_requires_owner_attestation `
+          -Policy $field.placeholder_policy) {
         $blockers.Add("provenance.placeholder_value.$($field.path)")
         continue
       }
@@ -532,6 +615,18 @@ function Test-LiveProvenance {
   )
 
   return Test-HyperVImageProvenance -Provenance $Provenance -ExpectedIdentity $ExpectedIdentity
+}
+
+function New-RawProvenanceValidationFailure {
+  param([Parameter(Mandatory)][ValidateSet('json.malformed', 'json.root_invalid', 'json.duplicate_or_ambiguous_member')][string]$Code)
+
+  return [ordered]@{
+    valid = $false
+    required_field_count = @(Get-HyperVImageProvenanceSchema).Count
+    blockers = @("provenance.raw_$($Code.Replace('.', '_'))")
+    owner_actions = @('replace_invalid_provenance_with_complete_sanitized_evidence')
+    requires_owner_attestation = $false
+  }
 }
 
 function New-Observation {
@@ -680,34 +775,67 @@ function New-PreflightResult {
   }
 }
 
+function Test-ClosedWorldObject {
+  param(
+    [AllowNull()][object]$Value,
+    [Parameter(Mandatory)][string[]]$AllowedProperties
+  )
+
+  if (-not (Test-JsonObject -Value $Value)) {
+    return $false
+  }
+  foreach ($property in $Value.PSObject.Properties.Name) {
+    if ($AllowedProperties -cnotcontains $property) {
+      return $false
+    }
+  }
+  return $true
+}
+
 function Convert-FixtureToObservations {
   param([Parameter(Mandatory)][string]$Path)
 
   try {
     $bytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($Path))
-    $text = [Text.Encoding]::UTF8.GetString($bytes)
-    $convertFromJsonParameters = @{ ErrorAction = 'Stop' }
-    if ($PSVersionTable.PSVersion -ge [Version]'7.5') {
-      $convertFromJsonParameters.DateKind = 'String'
-    }
-    $fixture = $text | ConvertFrom-Json @convertFromJsonParameters
   } catch {
     return $null
   }
-  if ($fixture.schema_version -ne 1 -or $fixture.contract -cne $fixtureContract) {
+  $parsed = ConvertFrom-RawJsonObject -Bytes $bytes
+  if (-not [bool]$parsed.valid) {
+    return $null
+  }
+  $fixture = $parsed.value
+  if (-not (Test-ClosedWorldObject -Value $fixture -AllowedProperties @(
+        'schema_version', 'contract', 'fixture_id', 'expected_identity', 'provenance', 'observations'
+      ))) {
+    return $null
+  }
+  if ((Get-ObjectProperty -InputObject $fixture -Name 'schema_version') -ne 1 -or
+      (Get-ObjectProperty -InputObject $fixture -Name 'contract') -cne $fixtureContract) {
     return $null
   }
   $fixtureId = Get-ObjectProperty -InputObject $fixture -Name 'fixture_id'
   if ([string]$fixtureId -cnotmatch '^[a-z0-9][a-z0-9-]{2,63}$') {
     return $null
   }
-  $rows = @($fixture.observations)
+  $expectedIdentity = Get-ObjectProperty -InputObject $fixture -Name 'expected_identity'
+  if (-not (Test-ClosedWorldObject -Value $expectedIdentity -AllowedProperties @(
+        'candidate_sha', 'candidate_version', 'frozen_release_ref', 'frozen_release_sha',
+        'package_archive_sha256', 'package_checksum_manifest_sha256', 'package_sha256',
+        'candidate_binary_sha256', 'vhdx_sha256', 'vhdx_size_bytes', 'vhdx_canonical_path_sha256'
+      ))) {
+    return $null
+  }
+  $rows = @(Get-ObjectProperty -InputObject $fixture -Name 'observations')
   if ($rows.Count -ne $observationCodes.Count) {
     return $null
   }
   $observations = [System.Collections.Generic.List[object]]::new()
   $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
   foreach ($row in $rows) {
+    if (-not (Test-ClosedWorldObject -Value $row -AllowedProperties @('code', 'status', 'evidence_sha256'))) {
+      return $null
+    }
     $code = [string](Get-ObjectProperty -InputObject $row -Name 'code')
     $status = [string](Get-ObjectProperty -InputObject $row -Name 'status')
     $digest = [string](Get-ObjectProperty -InputObject $row -Name 'evidence_sha256')
@@ -724,7 +852,7 @@ function Convert-FixtureToObservations {
   }
   $provenanceValidation = Test-HyperVImageProvenance `
     -Provenance (Get-ObjectProperty -InputObject $fixture -Name 'provenance') `
-    -ExpectedIdentity (Get-ObjectProperty -InputObject $fixture -Name 'expected_identity')
+    -ExpectedIdentity $expectedIdentity
   if (-not [bool]$provenanceValidation.valid -or [bool]$provenanceValidation.requires_owner_attestation) {
     $provenanceObservation = @($observations | Where-Object { $_.code -ceq 'image_provenance' })[0]
     $provenanceObservation.status = 'fail'
@@ -783,8 +911,12 @@ function Get-LiveObservations {
   $provenanceValidation = $null
   try {
     $provenanceSnapshot = Get-SafeProvenanceSnapshot -Path $ProvenancePath
-    $expectedIdentity = Get-LiveExpectedProvenanceIdentity
-    $provenanceValidation = Test-LiveProvenance -Provenance $provenanceSnapshot.value -ExpectedIdentity $expectedIdentity
+    if (-not [bool]$provenanceSnapshot.valid) {
+      $provenanceValidation = New-RawProvenanceValidationFailure -Code $provenanceSnapshot.code
+    } else {
+      $expectedIdentity = Get-LiveExpectedProvenanceIdentity
+      $provenanceValidation = Test-LiveProvenance -Provenance $provenanceSnapshot.value -ExpectedIdentity $expectedIdentity
+    }
   } catch {}
 
   $result = [System.Collections.Generic.List[object]]::new()

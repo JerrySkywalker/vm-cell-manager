@@ -5,6 +5,8 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $PSScriptRoot 'windows-hyperv-preflight.ps1'
 $fixturePath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-preflight\eligible.json'
 $templatePath = Join-Path $repositoryRoot 'docs\receipts\windows-hyperv-image-provenance-template.json'
+$matrixPath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-preflight\provenance-contract-matrix.json'
+$documentationPath = Join-Path $repositoryRoot 'docs\windows-hyperv-r5-preflight.md'
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('vmcell-hyperv-r1-provenance-' + [Guid]::NewGuid().ToString('N'))
 
 function Assert-True {
@@ -80,6 +82,96 @@ function Remove-JsonPathValue {
   [void]$current.PSObject.Properties.Remove($segments[-1])
 }
 
+function Get-JsonPathEntry {
+  param([Parameter(Mandatory)][object]$Object, [Parameter(Mandatory)][string]$Path)
+
+  $current = $Object
+  foreach ($segment in $Path.Split('.')) {
+    if ($null -eq $current -or $current -isnot [pscustomobject]) {
+      return [pscustomobject]@{ exists = $false; value = $null }
+    }
+    $property = $current.PSObject.Properties[$segment]
+    if ($null -eq $property) {
+      return [pscustomobject]@{ exists = $false; value = $null }
+    }
+    $current = $property.Value
+  }
+  return [pscustomobject]@{ exists = $true; value = $current }
+}
+
+function Get-IndependentGoldenMatrix {
+  $matrix = Read-ContractJson -Path $matrixPath
+  Assert-True -Condition ($matrix.schema_version -eq 1 -and
+    $matrix.contract -ceq 'vmcell.hyperv-r1-provenance-golden.v1') 'golden matrix identity drifted'
+  $fields = @($matrix.fields)
+  Assert-True -Condition ($fields.Count -eq 63) 'golden matrix field count drifted'
+  $paths = @($fields | ForEach-Object { [string]$_.path })
+  Assert-True -Condition (@($paths | Sort-Object -Unique).Count -eq $fields.Count) 'golden matrix has duplicate paths'
+  foreach ($field in $fields) {
+    Assert-True -Condition ($field.path -match '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$') 'golden matrix path is invalid'
+    Assert-True -Condition ($field.json_type -cin @('string', 'integer', 'boolean')) 'golden matrix type is invalid'
+    Assert-True -Condition (-not [string]::IsNullOrWhiteSpace([string]$field.semantic)) 'golden matrix semantic is missing'
+    Assert-True -Condition ($field.placeholder_policy -cin @('none', 'token_boundary')) 'golden matrix placeholder policy is invalid'
+  }
+  return $matrix
+}
+
+function Assert-TemplateMatchesGoldenMatrix {
+  param([Parameter(Mandatory)][object]$Template, [Parameter(Mandatory)][object[]]$Fields)
+
+  foreach ($field in $Fields) {
+    $entry = Get-JsonPathEntry -Object $Template -Path $field.path
+    Assert-True -Condition $entry.exists "template omitted golden field: $($field.path)"
+    $typeMatches = switch ($field.json_type) {
+      'string' { $entry.value -is [string] }
+      'integer' { $entry.value -is [int64] -or $entry.value -is [int32] }
+      'boolean' { $entry.value -is [bool] }
+    }
+    Assert-True -Condition $typeMatches "template type drifted: $($field.path)"
+  }
+}
+
+function Assert-ProductionSchemaMatchesGoldenMatrix {
+  param([Parameter(Mandatory)][object[]]$Fields)
+
+  $productionFields = @(Get-HyperVImageProvenanceSchema)
+  Assert-True -Condition ($productionFields.Count -eq $Fields.Count) 'production schema field count differs from golden matrix'
+  foreach ($field in $Fields) {
+    $production = @($productionFields | Where-Object { $_.path -ceq $field.path })
+    Assert-True -Condition ($production.Count -eq 1) "production schema omitted golden field: $($field.path)"
+    Assert-True -Condition ($production[0].json_type -ceq $field.json_type) "production schema type drifted: $($field.path)"
+    Assert-True -Condition ($production[0].placeholder_policy -ceq $field.placeholder_policy) "production placeholder policy drifted: $($field.path)"
+  }
+}
+
+function Assert-RustTemplateTestMatchesGoldenMatrix {
+  param([Parameter(Mandatory)][object[]]$Fields)
+
+  $rust = Get-Content -LiteralPath (Join-Path $repositoryRoot 'tests\acceptance_receipt_templates.rs') -Raw
+  foreach ($field in $Fields) {
+    $pointer = '/' + $field.path.Replace('.', '/')
+    Assert-True -Condition $rust.Contains($pointer, [StringComparison]::Ordinal) "Rust template test omitted golden field: $($field.path)"
+  }
+}
+
+function Assert-DocumentationMatchesGoldenMatrix {
+  param([Parameter(Mandatory)][object[]]$Fields)
+
+  $documentation = Get-Content -LiteralPath $documentationPath -Raw
+  Assert-True -Condition $documentation.Contains('Raw JSON provenance boundary', [StringComparison]::Ordinal) 'documentation omitted raw JSON boundary'
+  Assert-True -Condition $documentation.Contains('image_source.reference', [StringComparison]::Ordinal) 'documentation omitted source reference binding'
+  Assert-True -Condition $documentation.Contains('creation.created_by_evidence_id', [StringComparison]::Ordinal) 'documentation omitted creator evidence binding'
+  foreach ($root in @($Fields | ForEach-Object { $_.path.Split('.')[0] } | Sort-Object -Unique)) {
+    Assert-True -Condition $documentation.Contains($root, [StringComparison]::Ordinal) "documentation omitted golden semantic group: $root"
+  }
+}
+
+function Write-RawFixture {
+  param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text)
+
+  [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
+}
+
 function Get-WrongJsonValues {
   param([Parameter(Mandatory)][string]$JsonType)
 
@@ -117,11 +209,12 @@ function Assert-StaticProductionSafety {
   $forbidden = @(
     'Enable-WindowsOptionalFeature', 'Disable-WindowsOptionalFeature', 'Install-WindowsFeature',
     'Uninstall-WindowsFeature', 'Add-WindowsCapability', 'Remove-WindowsCapability',
+    'Add-LocalGroupMember', 'Remove-LocalGroupMember',
     'Start-Service', 'Stop-Service', 'Restart-Service', 'Set-Service', 'New-Service', 'Remove-Service',
     'New-VM', 'Set-VM', 'Remove-VM', 'Start-VM', 'Stop-VM', 'Import-VM', 'Export-VM',
     'Checkpoint-VM', 'Restore-VM', 'Suspend-VM', 'Resume-VM', 'Add-VMHardDiskDrive',
     'Remove-VMHardDiskDrive', 'Add-VMNetworkAdapter', 'Remove-VMNetworkAdapter', 'Set-VMProcessor',
-    'Set-VMMemory', 'New-VMSwitch', 'Set-VMSwitch', 'Remove-VMSwitch', 'New-VHD', 'Set-VHD',
+    'Set-VMMemory', 'New-VMSwitch', 'Set-VMSwitch', 'Remove-VMSwitch', 'Add-VMSwitchExtension', 'Remove-VMSwitchExtension', 'New-VHD', 'Set-VHD',
     'Remove-VHD', 'Resize-VHD', 'Mount-VHD', 'Dismount-VHD', 'Convert-VHD', 'Merge-VHD',
     'Initialize-Disk', 'Clear-Disk', 'Set-Disk', 'Format-Volume', 'Set-Volume', 'Dismount-Volume',
     'New-Partition', 'Set-Partition', 'Remove-Partition', 'Set-Acl', 'Clear-Acl', 'icacls.exe',
@@ -135,6 +228,111 @@ function Assert-StaticProductionSafety {
   }
 }
 
+function Assert-PathSafetyAndDeterminism {
+  $source = [IO.File]::ReadAllText($scriptPath)
+  foreach ($required in @(
+      'function Get-SafeProvenanceSnapshot',
+      'function ConvertFrom-RawJsonObject',
+      'function Test-RawJsonObjectMembers',
+      '[System.Text.Json.JsonDocument]::Parse',
+      '[StringComparer]::OrdinalIgnoreCase',
+      'function Assert-NotReparsePoint',
+      'function Get-PathItemWithoutFollowingReparse',
+      'function Assert-OrdinaryPathAncestry',
+      'function Get-OrdinaryPathItem',
+      'function Get-OrdinaryProvenanceFile',
+      '[IO.FileAttributes]::ReparsePoint',
+      '$ancestor = $ancestor.Directory',
+      '$ancestor = $ancestor.Parent',
+      '$beforeHash = Get-Sha256File',
+      '$afterHash = Get-Sha256File',
+      '$verifiedItem = Get-OrdinaryProvenanceFile',
+      'provenance evidence changed while it was read',
+      'function Test-ClosedWorldObject',
+      'provenance.unknown_property_count.$unknownPropertyCount',
+      'Get-ObservationDigest -Observations $orderedObservations'
+    )) {
+    Assert-True -Condition $source.Contains($required, [StringComparison]::Ordinal) `
+      -Message "R1 preflight omitted required safety binding: $required"
+  }
+  Assert-True -Condition ($source -notmatch [regex]::Escape(
+      'EvidenceSourceDigest (Get-Sha256Text -Text ([DateTimeOffset]::UtcNow.ToString(''O'')))'
+    )) -Message 'live result digest must not be derived from wall-clock time'
+}
+
+function Assert-PathAncestryBehavior {
+  $ordinaryDirectory = Join-Path $temporaryRoot 'ordinary\nested\state-root'
+  New-Item -ItemType Directory -Path $ordinaryDirectory -Force | Out-Null
+  $ordinaryFile = Join-Path $ordinaryDirectory 'evidence.json'
+  [IO.File]::WriteAllText($ordinaryFile, '{}', [Text.UTF8Encoding]::new($false))
+
+  Get-OrdinaryPathItem -Path $ordinaryDirectory -RequireDirectory $true -Description 'ordinary nested directory' | Out-Null
+  Get-OrdinaryPathItem -Path $ordinaryFile -RequireDirectory $false -Description 'ordinary nested file' | Out-Null
+  $rootTraversalCompleted = $false
+  try {
+    Get-OrdinaryPathItem -Path $ordinaryDirectory -RequireDirectory $true -Description 'filesystem root traversal' | Out-Null
+    $rootTraversalCompleted = $true
+  } catch {
+    throw 'ordinary ancestry did not reach the filesystem root'
+  }
+  Assert-True -Condition $rootTraversalCompleted -Message 'filesystem root traversal did not complete'
+
+  $reparseTarget = Join-Path $temporaryRoot 'reparse-target'
+  New-Item -ItemType Directory -Path (Join-Path $reparseTarget 'nested') -Force | Out-Null
+  $reparseFile = Join-Path $reparseTarget 'nested\evidence.json'
+  [IO.File]::WriteAllText($reparseFile, '{}', [Text.UTF8Encoding]::new($false))
+  $reparsePath = Join-Path $temporaryRoot 'reparse-boundary'
+  try {
+    New-Item -ItemType Junction -Path $reparsePath -Target $reparseTarget -ErrorAction Stop | Out-Null
+  } catch {
+    throw 'test_environment_blocker.reparse_fixture_unavailable'
+  }
+  $reparseItem = Get-Item -LiteralPath $reparsePath -Force
+  Assert-True -Condition ([bool]($reparseItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) `
+    -Message 'test_environment_blocker.reparse_fixture_not_created'
+
+  foreach ($case in @(
+      @{ path = $reparsePath; directory = $true; description = 'reparse item' },
+      @{ path = (Join-Path $reparsePath 'nested'); directory = $true; description = 'direct reparse parent' },
+      @{ path = (Join-Path $reparsePath 'nested\evidence.json'); directory = $false; description = 'reparse grandparent' }
+    )) {
+    $rejected = $false
+    try {
+      Get-OrdinaryPathItem -Path $case.path -RequireDirectory $case.directory -Description $case.description | Out-Null
+    } catch {
+      $rejected = $true
+    }
+    Assert-True -Condition $rejected -Message "$($case.description) was accepted"
+  }
+  return 6
+}
+
+function Write-CaseFixture {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Code,
+    [Parameter(Mandatory)][string]$Status
+  )
+
+  $fixture = Read-ContractJson -Path $fixturePath
+  $row = @($fixture.observations | Where-Object { $_.code -ceq $Code })[0]
+  if ($null -eq $row) { throw "test fixture did not contain observation $Code" }
+  $row.status = $Status
+  Write-Fixture -Path $Path -Fixture $fixture
+}
+
+function Assert-RestoredBaselineCoverage {
+  $testSource = [IO.File]::ReadAllText($PSCommandPath)
+  foreach ($marker in @(
+      'function Assert-PathSafetyAndDeterminism', 'function Assert-PathAncestryBehavior',
+      'Add-LocalGroupMember', 'Remove-LocalGroupMember', 'Add-VMSwitchExtension',
+      'Remove-VMSwitchExtension', '$observationCases = @(', 'malformed or scalar root did not return structured blocker'
+    )) {
+    Assert-True -Condition $testSource.Contains($marker, [StringComparison]::Ordinal) "restored baseline marker missing: $marker"
+  }
+  Assert-True -Condition ([regex]::Matches($testSource, "@\{ name = '").Count -ge 26) 'restored observation case count regressed'
+}
+
 function Assert-FixtureIsolation {
   param([Parameter(Mandatory)][string]$Path)
 
@@ -146,7 +344,11 @@ function Assert-FixtureIsolation {
 foreach (`$name in @(
   'Get-WindowsOptionalFeature', 'Get-LocalGroupMember', 'Get-CimInstance', 'Get-Module',
   'Get-Command', 'Get-Service', 'Get-VM', 'Get-VMSwitch', 'Get-Process', 'Get-Volume',
-  'Get-Partition', 'Get-Disk', 'Get-VHD', 'git'
+  'Get-Partition', 'Get-Disk', 'Get-VHD', 'Get-ItemProperty', 'Get-ChildItem',
+  'Get-NetAdapter', 'Get-NetIPAddress', 'Get-NetRoute', 'Get-NetFirewallProfile',
+  'Get-StoragePool', 'Get-PhysicalDisk', 'Get-VirtualDisk', 'Get-Credential', 'Get-Secret',
+  'Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Process', 'git', 'gh', 'curl.exe',
+  'cmd.exe', 'powershell.exe'
 )) {
   Set-Item -Path "function:`$name" -Value { throw "fixture mode isolation breach: `$args" }
 }
@@ -161,16 +363,134 @@ foreach (`$name in @(
     -Message 'fixture isolation result drifted'
 }
 
+function Assert-RawParserAndSanitization {
+  param(
+    [Parameter(Mandatory)][string]$FixtureText,
+    [Parameter(Mandatory)][object]$SanitizedErrorBehavior
+  )
+
+  $duplicateCases = @(
+    @{ name = 'root-exact'; text = $FixtureText.Replace('"schema_version": 1,', '"schema_version": 1, "schema_version": 1,') },
+    @{ name = 'root-case-conflict'; text = $FixtureText.Replace('"schema_version": 1,', '"schema_version": 1, "Schema_Version": 1,') },
+    @{ name = 'candidate'; text = $FixtureText.Replace('"sha": "8fab858000111e35ab01789f2cbb6645dda3e6e7",', '"sha": "8fab858000111e35ab01789f2cbb6645dda3e6e7", "SHA": "8fab858000111e35ab01789f2cbb6645dda3e6e7",') },
+    @{ name = 'hash'; text = $FixtureText.Replace('"archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",', '"archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ARCHIVE_SHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",') },
+    @{ name = 'support'; text = $FixtureText.Replace('"support_status": "untested",', '"support_status": "untested", "SUPPORT_STATUS": "untested",') },
+    @{ name = 'authority'; text = $FixtureText.Replace('"authority": "none",', '"authority": "none", "AUTHORITY": "none",') },
+    @{ name = 'generation'; text = $FixtureText.Replace('"generation": 2,', '"generation": 2, "GENERATION": 2,') },
+    @{ name = 'security'; text = $FixtureText.Replace('"secure_boot_enabled": true,', '"secure_boot_enabled": true, "SECURE_BOOT_ENABLED": true,') },
+    @{ name = 'source-reference'; text = $FixtureText.Replace('"reference": "SRC-WS2022-EVAL-20260901",', '"reference": "SRC-WS2022-EVAL-20260901", "REFERENCE": "SRC-WS2022-EVAL-20260901",') },
+    @{ name = 'creation-evidence'; text = $FixtureText.Replace('"created_by_evidence_id": "EVID-CREATOR-20260901"', '"created_by_evidence_id": "EVID-CREATOR-20260901", "CREATED_BY_EVIDENCE_ID": "EVID-CREATOR-20260901"') },
+    @{ name = 'array-depth'; text = '{"outer":[{"member":1,"MEMBER":2}]}' }
+  )
+  foreach ($case in $duplicateCases) {
+    $path = Join-Path $temporaryRoot ("duplicate-" + $case.name + '.json')
+    Write-RawFixture -Path $path -Text $case.text
+    $raw = ConvertFrom-RawJsonObject -Bytes ([IO.File]::ReadAllBytes($path))
+    Assert-True -Condition (-not $raw.valid -and $raw.code -ceq 'json.duplicate_or_ambiguous_member') "raw duplicate was accepted: $($case.name)"
+    $result = Invoke-Fixture -Path $path
+    Assert-True -Condition ($result.disposition -ceq 'BLOCKED' -and @($result.blockers) -ccontains $SanitizedErrorBehavior.duplicate_or_case_conflict) "duplicate fixture did not return structured blocker: $($case.name)"
+  }
+
+  foreach ($text in @('{', '{"schema_version": 1', '7', '"scalar"', 'true', 'null', '[]')) {
+    $path = Join-Path $temporaryRoot ('invalid-root-' + ([Guid]::NewGuid().ToString('N')) + '.json')
+    Write-RawFixture -Path $path -Text $text
+    $result = Invoke-Fixture -Path $path
+    Assert-True -Condition ($result.disposition -ceq 'BLOCKED' -and @($result.blockers) -ccontains $SanitizedErrorBehavior.malformed_or_invalid_root) 'malformed or scalar root did not return structured blocker'
+    $serialized = $result | ConvertTo-Json -Compress -Depth 16
+    Assert-True -Condition (-not $serialized.Contains('PropertyNotFoundException', [StringComparison]::Ordinal)) 'scalar root leaked parser exception'
+  }
+
+  $fixture = Read-ContractJson -Path $fixturePath
+  $unknownNames = @(
+    ('AUDIT_' + 'SECRET' + '_TOKEN'),
+    ('AUDIT_' + 'PRIVATE' + '_PATH'),
+    ('AUDIT_CONTROL_' + [char]1),
+    ('AUDIT_' + ('X' * 320))
+  )
+  foreach ($name in $unknownNames) {
+    $unknownFixture = Copy-ContractObject -Value $fixture
+    $unknownFixture.provenance | Add-Member -NotePropertyName $name -NotePropertyValue 'synthetic'
+    $path = Join-Path $temporaryRoot ('unknown-' + ([Guid]::NewGuid().ToString('N')) + '.json')
+    Write-Fixture -Path $path -Fixture $unknownFixture
+    $result = Invoke-Fixture -Path $path
+    $serialized = $result | ConvertTo-Json -Compress -Depth 16
+    $expectedUnknownBlocker = ([string]$SanitizedErrorBehavior.unknown_property).Replace('N', '1')
+    Assert-True -Condition ($result.disposition -ceq 'BLOCKED' -and @($result.blockers) -ccontains $expectedUnknownBlocker) 'unknown property did not return sanitized blocker code'
+    Assert-True -Condition (-not $serialized.Contains($name, [StringComparison]::Ordinal) -and
+      -not $serialized.Contains('synthetic', [StringComparison]::Ordinal)) 'unknown property receipt reflected attacker input'
+  }
+  return [pscustomobject]@{ duplicate_cases = $duplicateCases.Count; scalar_malformed_cases = 7; unknown_property_cases = $unknownNames.Count }
+}
+
+function Assert-PlaceholderPolicy {
+  param([Parameter(Mandatory)][object]$Fixture)
+
+  $markers = @('required_owner', 'TODO', 'tBd', 'CHANGE-ME', 'sample', 'EXAMPLE', 'dummy', 'unknown', 'NOT_EXECUTED', 'fixme')
+  $cases = 0
+  foreach ($definition in @(
+      @{ path = 'image_source.reference'; prefix = 'SRC'; suffix = 'MEDIA-20260902' },
+      @{ path = 'creation.created_by_evidence_id'; prefix = 'EVID'; suffix = 'CREATOR-20260902' }
+    )) {
+    foreach ($marker in $markers + @("`u{FF34}`u{FF2F}`u{FF24}`u{FF2F}")) {
+      $candidate = Copy-ContractObject -Value $Fixture.provenance
+      Set-JsonPathValue -Object $candidate -Path $definition.path -Value "$($definition.prefix)-$marker-$($definition.suffix)"
+      $validation = Test-HyperVImageProvenance -Provenance $candidate -ExpectedIdentity $Fixture.expected_identity
+      Assert-True -Condition (-not $validation.valid -and @($validation.blockers) -ccontains "provenance.placeholder_value.$($definition.path)") `
+        "placeholder marker was admitted: $($definition.path)"
+      $cases += 1
+    }
+  }
+  foreach ($nearMiss in @(
+      @{ path = 'image_source.reference'; value = 'SRC-EXAMPLE123-MEDIA-20260902' },
+      @{ path = 'image_source.reference'; value = 'SRC-CHANGELOG-MEDIA-20260902' },
+      @{ path = 'creation.created_by_evidence_id'; value = 'EVID-SAMPLER-CREATOR-20260902' },
+      @{ path = 'creation.created_by_evidence_id'; value = 'EVID-TODOLIST-CREATOR-20260902' }
+    )) {
+    $candidate = Copy-ContractObject -Value $Fixture.provenance
+    Set-JsonPathValue -Object $candidate -Path $nearMiss.path -Value $nearMiss.value
+    $validation = Test-HyperVImageProvenance -Provenance $candidate -ExpectedIdentity $Fixture.expected_identity
+    Assert-True -Condition $validation.valid "safe near-miss evidence was over-rejected: $($nearMiss.value)"
+  }
+  $sourceFixture = Copy-ContractObject -Value $Fixture
+  $sourceFixture.provenance.image_source.reference = 'SRC-NOT_EXECUTED'
+  $sourcePath = Join-Path $temporaryRoot 'placeholder-source.json'
+  Write-Fixture -Path $sourcePath -Fixture $sourceFixture
+  $sourceResult = Invoke-Fixture -Path $sourcePath
+  Assert-True -Condition ($sourceResult.disposition -ceq 'BLOCKED' -and @($sourceResult.blockers) -ccontains 'provenance.placeholder_value.image_source.reference') 'fixture source placeholder was admitted'
+  $creatorFixture = Copy-ContractObject -Value $Fixture
+  $creatorFixture.provenance.creation.created_by_evidence_id = 'EVID-SAMPLE-CREATOR'
+  $creatorPath = Join-Path $temporaryRoot 'placeholder-creator.json'
+  Write-Fixture -Path $creatorPath -Fixture $creatorFixture
+  $creatorResult = Invoke-Fixture -Path $creatorPath
+  Assert-True -Condition ($creatorResult.disposition -ceq 'BLOCKED' -and @($creatorResult.blockers) -ccontains 'provenance.placeholder_value.creation.created_by_evidence_id') 'fixture creator placeholder was admitted'
+  return [pscustomobject]@{ placeholder_cases = $cases + 2; safe_near_miss_cases = 4 }
+}
+
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 try {
   $executedCases = 0
   $negativeCases = 0
   $placeholderCases = 0
+  $safeNearMissCases = 0
+  $duplicateMemberCases = 0
+  $scalarMalformedCases = 0
+  $matrix = Get-IndependentGoldenMatrix
+  $matrixFields = @($matrix.fields)
   Assert-StaticProductionSafety
+  $executedCases += 1
+  Assert-RestoredBaselineCoverage
   $executedCases += 1
 
   . $scriptPath -FixturePath $fixturePath | Out-Null
+  Assert-PathSafetyAndDeterminism
+  $executedCases += 1
   $fixture = Read-ContractJson -Path $fixturePath
+  $template = Read-ContractJson -Path $templatePath
+  Assert-TemplateMatchesGoldenMatrix -Template $template -Fields $matrixFields
+  Assert-ProductionSchemaMatchesGoldenMatrix -Fields $matrixFields
+  Assert-RustTemplateTestMatchesGoldenMatrix -Fields $matrixFields
+  Assert-DocumentationMatchesGoldenMatrix -Fields $matrixFields
+  $executedCases += 5
   $eligible = Invoke-Fixture -Path $fixturePath
   Assert-True -Condition ($eligible.contract -ceq 'vmcell.hyperv-r5-preflight.v2') 'fixture result contract drifted'
   Assert-True -Condition ($eligible.authority -ceq 'none' -and $eligible.acceptance -eq $false -and $eligible.authorizing -eq $false) `
@@ -182,10 +502,9 @@ try {
   Assert-True -Condition (@($eligible.observations).Count -eq 25) 'fixture result did not preserve every observation'
   $executedCases += 1
 
-  $schema = @(Get-HyperVImageProvenanceSchema)
   $directEligible = Test-HyperVImageProvenance -Provenance $fixture.provenance -ExpectedIdentity $fixture.expected_identity
-  Assert-True -Condition ($directEligible.valid -and $directEligible.required_field_count -eq $schema.Count) 'validator and eligible fixture disagree'
-  foreach ($field in $schema) {
+  Assert-True -Condition ($directEligible.valid -and $directEligible.required_field_count -eq $matrixFields.Count) 'validator and eligible fixture disagree'
+  foreach ($field in $matrixFields) {
     $missing = Copy-ContractObject -Value $fixture.provenance
     Remove-JsonPathValue -Object $missing -Path $field.path
     $validation = Test-HyperVImageProvenance -Provenance $missing -ExpectedIdentity $fixture.expected_identity
@@ -203,6 +522,16 @@ try {
     Set-JsonPathValue -Object $nullValue -Path $field.path -Value $null
     $validation = Test-HyperVImageProvenance -Provenance $nullValue -ExpectedIdentity $fixture.expected_identity
     Assert-True -Condition (-not $validation.valid) "null JSON value was admitted: $($field.path)"
+    $negativeCases += 1
+    $semantic = Copy-ContractObject -Value $fixture.provenance
+    $semanticInvalidValue = switch ($field.json_type) {
+      'string' { '!' }
+      'integer' { [Int64]0 }
+      'boolean' { -not [bool](Get-JsonPathEntry -Object $semantic -Path $field.path).value }
+    }
+    Set-JsonPathValue -Object $semantic -Path $field.path -Value $semanticInvalidValue
+    $validation = Test-HyperVImageProvenance -Provenance $semantic -ExpectedIdentity $fixture.expected_identity
+    Assert-True -Condition (-not $validation.valid) "golden semantic constraint was admitted: $($field.path)"
     $negativeCases += 1
     if ($field.json_type -eq 'string') {
       foreach ($value in @('', '   ')) {
@@ -247,6 +576,54 @@ try {
     $negativeCases += 1
   }
 
+  $observationCases = @(
+    @{ name = 'non-elevated-token'; code = 'elevation'; status = 'fail' },
+    @{ name = 'hyperv-feature-unavailable'; code = 'hyperv_feature'; status = 'unavailable' },
+    @{ name = 'hyperv-feature-disabled'; code = 'hyperv_feature'; status = 'fail' },
+    @{ name = 'hyperv-module-missing'; code = 'hyperv_module'; status = 'fail' },
+    @{ name = 'hyperv-read-access-denied'; code = 'hyperv_read_access'; status = 'unavailable' },
+    @{ name = 'vmms-stopped'; code = 'vmms_state'; status = 'fail' },
+    @{ name = 'foreign-or-running-vm'; code = 'vm_inventory'; status = 'fail' },
+    @{ name = 'unexpected-switch'; code = 'switch_inventory'; status = 'fail' },
+    @{ name = 'active-virtualization-writer'; code = 'virtualization_writers'; status = 'fail' },
+    @{ name = 'active-runner-or-codex'; code = 'runner_codex_activity'; status = 'fail' },
+    @{ name = 'unsuitable-c-boundary'; code = 'c_storage_boundary'; status = 'fail' },
+    @{ name = 'refs-v-rejected'; code = 'v_storage_boundary'; status = 'fail' },
+    @{ name = 'file-backed-virtual-v-rejected'; code = 'v_storage_boundary'; status = 'fail' },
+    @{ name = 'missing-vhdx'; code = 'immutable_vhdx_presence'; status = 'fail' },
+    @{ name = 'mutable-vhdx'; code = 'vhdx_immutability'; status = 'fail' },
+    @{ name = 'attached-vhdx'; code = 'vhdx_attachment'; status = 'fail' },
+    @{ name = 'differencing-vhdx'; code = 'vhdx_immutability'; status = 'fail' },
+    @{ name = 'parented-vhdx'; code = 'vhdx_parent'; status = 'fail' },
+    @{ name = 'missing-provenance'; code = 'image_provenance'; status = 'unavailable' },
+    @{ name = 'mismatched-provenance'; code = 'image_provenance'; status = 'fail' },
+    @{ name = 'candidate-hash-mismatch'; code = 'candidate_hash'; status = 'fail' },
+    @{ name = 'package-hash-mismatch'; code = 'package_hash'; status = 'fail' },
+    @{ name = 'binary-hash-mismatch'; code = 'binary_hash'; status = 'fail' },
+    @{ name = 'vhdx-hash-mismatch'; code = 'vhdx_hash'; status = 'fail' },
+    @{ name = 'stale-receipt'; code = 'admission_receipt'; status = 'fail' },
+    @{ name = 'exclusive-window-unavailable'; code = 'exclusive_window'; status = 'unavailable' }
+  )
+  foreach ($case in $observationCases) {
+    $casePath = Join-Path $temporaryRoot ($case.name + '.json')
+    Write-CaseFixture -Path $casePath -Code $case.code -Status $case.status
+    $result = Invoke-Fixture -Path $casePath
+    $expected = if ($case.status -ceq 'unavailable') { "evidence_gap.$($case.code)" } else { "precondition_failed.$($case.code)" }
+    Assert-True -Condition ($result.disposition -ceq 'BLOCKED' -and @($result.blockers) -ccontains $expected) `
+      "restored baseline observation case failed: $($case.name)"
+    $executedCases += 1
+  }
+
+  $rawStats = Assert-RawParserAndSanitization -FixtureText (Get-Content -LiteralPath $fixturePath -Raw) `
+    -SanitizedErrorBehavior $matrix.sanitized_error_behavior
+  $duplicateMemberCases = [int]$rawStats.duplicate_cases
+  $scalarMalformedCases = [int]$rawStats.scalar_malformed_cases
+  $executedCases += $duplicateMemberCases + $scalarMalformedCases + [int]$rawStats.unknown_property_cases
+  $placeholderStats = Assert-PlaceholderPolicy -Fixture $fixture
+  $placeholderCases += [int]$placeholderStats.placeholder_cases
+  $safeNearMissCases = [int]$placeholderStats.safe_near_miss_cases
+  $executedCases += [int]$placeholderStats.placeholder_cases + $safeNearMissCases
+
   $ownerAttestation = Copy-ContractObject -Value $fixture.provenance
   Set-JsonPathValue -Object $ownerAttestation -Path 'vhdx.credentials_embedded' -Value 'UNKNOWN_REQUIRES_OWNER_ATTESTATION'
   $ownerAttestationValidation = Test-HyperVImageProvenance -Provenance $ownerAttestation -ExpectedIdentity $fixture.expected_identity
@@ -283,8 +660,9 @@ try {
 
   Assert-FixtureIsolation -Path $fixturePath
   $executedCases += 1
+  $executedCases += Assert-PathAncestryBehavior
 } finally {
   Remove-Item -LiteralPath $temporaryRoot -Force -Recurse -ErrorAction SilentlyContinue
 }
 
-Write-Host "Windows Hyper-V R1 provenance contract tests passed (fields=$($schema.Count); negative_cases=$negativeCases; placeholder_cases=$placeholderCases; fixture_cases=$executedCases)"
+Write-Host "Windows Hyper-V R1 provenance contract tests passed (fields=$($matrixFields.Count); negative_cases=$negativeCases; placeholder_cases=$placeholderCases; safe_near_miss_cases=$safeNearMissCases; duplicate_member_cases=$duplicateMemberCases; scalar_malformed_cases=$scalarMalformedCases; fixture_cases=$executedCases)"

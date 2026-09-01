@@ -155,6 +155,7 @@ fn windows_hyperv_image_provenance_template_is_complete_and_non_authorizing() {
         required_string(&value, "/candidate/sha"),
         "REQUIRED_EXACT_40_HEX_SHA"
     );
+    assert_eq!(required_string(&value, "/candidate/version"), "0.4.1");
     assert_eq!(
         required_string(&value, "/candidate/frozen_release_ref"),
         "release/v0.4.1"
@@ -178,11 +179,20 @@ fn windows_hyperv_image_provenance_template_is_complete_and_non_authorizing() {
         required_string(&value, "/vhdx/immutable_owner_policy"),
         "OWNER_ATTESTED_READ_ONLY"
     );
+    assert_eq!(required(&value, "/vhdx/size_bytes"), 0);
     assert_eq!(required_string(&value, "/vhdx/backing_chain"), "NONE");
     assert_eq!(required(&value, "/vhdx/secrets_present"), false);
     assert_eq!(
         required_string(&value, "/vhdx/credentials_embedded"),
         "UNKNOWN_REQUIRES_OWNER_ATTESTATION"
+    );
+    assert_eq!(
+        required_string(&value, "/immutability/owner_policy"),
+        "OWNER_ATTESTED_READ_ONLY"
+    );
+    assert_eq!(
+        required_string(&value, "/license_evaluation/review_status"),
+        "HUMAN_REVIEW_REQUIRED"
     );
     assert_eq!(required(&value, "/exclusive_window/eligible"), false);
     assert_eq!(required(&value, "/hyperv/generation"), 2);
