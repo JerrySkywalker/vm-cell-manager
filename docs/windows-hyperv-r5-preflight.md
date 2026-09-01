@@ -5,8 +5,9 @@ the v0.4.1 Windows Hyper-V / Windows guest / PowerShell Direct R5 packet. It is
 not an authorization mechanism, does not claim functional acceptance, and does
 not change the support matrix.
 
-Every result has `authority: "none"`, `acceptance: false`, and
-`real_platform_acceptance: "not_started"`. `PREFLIGHT_ELIGIBLE` only means that
+Every result has `authority: "none"`, `acceptance: false`, `authorizing: false`,
+`support_status: "untested"`, and `real_platform_acceptance: "not_started"`.
+`PREFLIGHT_ELIGIBLE` only means that
 the supplied or observed preconditions were complete and suitable for a
 separate owner decision. It never grants permission to create, attach, start,
 stop, modify, or remove anything.
@@ -33,6 +34,7 @@ outside the repository.
 pwsh -NoProfile -File .\tools\windows-hyperv-preflight.ps1 `
   -CandidateSha REQUIRED_EXACT_40_HEX_SHA `
   -CandidatePackagePath REQUIRED_PACKAGE_PATH `
+  -CandidateChecksumManifestPath REQUIRED_CHECKSUM_MANIFEST_PATH `
   -CandidateBinaryPath REQUIRED_BINARY_PATH `
   -VhdxPath REQUIRED_VHDX_PATH `
   -ProvenancePath REQUIRED_PROVENANCE_PATH `
@@ -73,20 +75,30 @@ sanitized observations, not wall-clock time.
 
 Start with
 [`windows-hyperv-image-provenance-template.json`](receipts/windows-hyperv-image-provenance-template.json).
-The template deliberately contains placeholders, not evidence. A completed
-owner packet must bind the exact v0.4.1 candidate SHA and version, package and binary hashes,
-Windows edition/build, source, VHDX digest, generation and security properties,
-parent/attachment state, creation time, immutability declaration, receipt, and
-exclusive-window evidence before live observation can evaluate it.
+The v2 template deliberately contains placeholders, not admitted evidence. The
+shared fixture/Live validator rejects a missing, null, wrong-type, empty,
+whitespace, `REQUIRED_`, `TODO`, `TBD`, `FIXME`, or unsupported `UNKNOWN` value;
+it also rejects unknown JSON properties and candidate/package/binary/VHDX identity
+mismatches. A completed owner packet binds the exact candidate, frozen release,
+archive, checksum manifest, binary, VHDX digest/size, and canonical-path digest;
+Windows Server 2022/Generation 2/Secure Boot/PowerShell Direct expectations; and
+sanitized source, preparation, immutability, license, and receipt evidence.
+
+The packet contains no public raw path. `credentials_embedded` is a typed owner
+attestation, not an automated `false` claim. The documented
+`UNKNOWN_REQUIRES_OWNER_ATTESTATION` enum is syntactically permitted but keeps
+the result blocked with a typed owner action. Template values therefore cannot
+pass through unchanged or promote an admission result.
 The non-executing packet instructions are in
 [`windows-hyperv-r5-image-preparation.md`](windows-hyperv-r5-image-preparation.md).
 
 ## Safety checks and CI
 
-`tools/test-windows-hyperv-preflight.ps1` runs 39 deterministic checks. It
-includes the eligible fixture; evidence gaps and failed predicates for every
-R5 boundary; malformed input, deterministic rendering, path/secret-like input
-redaction, and a guarded fixture-isolation process. Its AST deny list rejects
+`tools/test-windows-hyperv-preflight.ps1` runs a schema-derived deterministic
+corpus: every required provenance field is removed and assigned every wrong JSON
+type, string fields receive empty/whitespace and placeholder variants, and
+identity, Windows, Hyper-V, VHDX, timestamp, owner-attestation, redaction,
+template-agreement, and fixture-isolation cases are executed. Its AST scan rejects
 feature, membership, service, VM, switch, VHD, disk/partition, ACL, network,
 process-termination, shutdown, restart, runner, and service mutation command
 families in the production tool.
@@ -94,3 +106,8 @@ families in the production tool.
 Windows CI invokes only that fixture/static/template contract. It does not run
 the live mode, invoke Hyper-V, request elevation, create a VM, manipulate a
 service or host feature, or produce real-platform acceptance evidence.
+
+This R1 contract deliberately excludes the R2 static-policy redesign, R3
+stopped-cell/storage policy, and R4 broader documentation/CI alignment. It does
+not qualify the frozen release, begin real-platform acceptance, or promote
+support.

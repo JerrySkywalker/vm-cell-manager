@@ -91,20 +91,25 @@ fn assert_hyperv_provenance_template_is_sanitized(value: &Value) {
                     .filter(char::is_ascii_alphanumeric)
                     .flat_map(char::to_lowercase)
                     .collect();
+                let permitted_credential_attestation = normalized == "credentialsembedded"
+                    && value == "UNKNOWN_REQUIRES_OWNER_ATTESTATION";
+                let permitted_secret_absence = normalized == "secretspresent" && value == false;
                 assert!(
-                    ![
-                        "password",
-                        "credential",
-                        "secret",
-                        "token",
-                        "productkey",
-                        "account",
-                        "isopath",
-                        "command",
-                        "argv",
-                    ]
-                    .iter()
-                    .any(|forbidden| normalized.contains(forbidden)),
+                    permitted_credential_attestation
+                        || permitted_secret_absence
+                        || ![
+                            "password",
+                            "credential",
+                            "secret",
+                            "token",
+                            "productkey",
+                            "account",
+                            "isopath",
+                            "command",
+                            "argv",
+                        ]
+                        .iter()
+                        .any(|forbidden| normalized.contains(forbidden)),
                     "Hyper-V provenance template models a disclosure field: {key}"
                 );
                 assert_hyperv_provenance_template_is_sanitized(value);
@@ -130,10 +135,10 @@ fn windows_hyperv_image_provenance_template_is_complete_and_non_authorizing() {
         WINDOWS_HYPERV_IMAGE_PROVENANCE_TEMPLATE,
     );
 
-    assert_eq!(required(&value, "/schema_version"), 1);
+    assert_eq!(required(&value, "/schema_version"), 2);
     assert_eq!(
         required_string(&value, "/contract"),
-        "vmcell.hyperv-r5-image-provenance.v1"
+        "vmcell.hyperv-r5-image-provenance.v2"
     );
     assert_eq!(required_string(&value, "/authority"), "none");
     assert_eq!(required(&value, "/acceptance"), false);
@@ -143,43 +148,85 @@ fn windows_hyperv_image_provenance_template_is_complete_and_non_authorizing() {
         "not_started"
     );
     assert_eq!(required_string(&value, "/support_status"), "untested");
+    assert_eq!(required_string(&value, "/admission_result"), "NOT_PROMOTED");
+    assert_eq!(required_string(&value, "/admission_status"), "NOT_STARTED");
+    required_placeholder(&value, "/admitted_for_candidate_sha");
     assert_eq!(
         required_string(&value, "/candidate/sha"),
         "REQUIRED_EXACT_40_HEX_SHA"
     );
+    assert_eq!(
+        required_string(&value, "/candidate/frozen_release_ref"),
+        "release/v0.4.1"
+    );
+    assert_eq!(
+        required_string(&value, "/candidate/frozen_release_sha"),
+        "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"
+    );
+    assert_eq!(
+        required_string(&value, "/windows/product"),
+        "Windows Server 2022"
+    );
+    assert_eq!(required_string(&value, "/windows/edition"), "Standard");
+    assert_eq!(required_string(&value, "/windows/version"), "21H2");
     assert_eq!(required_string(&value, "/windows/architecture"), "x86_64");
-    assert_eq!(required_string(&value, "/vhdx/vhd_type"), "fixed");
-    assert!(required(&value, "/vhdx/parent_path").is_null());
+    assert_eq!(required_string(&value, "/vhdx/format"), "VHDX");
+    assert_eq!(required(&value, "/vhdx/parentless"), true);
     assert_eq!(required(&value, "/vhdx/attached"), false);
+    assert_eq!(required(&value, "/vhdx/detached"), true);
+    assert_eq!(
+        required_string(&value, "/vhdx/immutable_owner_policy"),
+        "OWNER_ATTESTED_READ_ONLY"
+    );
+    assert_eq!(required_string(&value, "/vhdx/backing_chain"), "NONE");
+    assert_eq!(required(&value, "/vhdx/secrets_present"), false);
+    assert_eq!(
+        required_string(&value, "/vhdx/credentials_embedded"),
+        "UNKNOWN_REQUIRES_OWNER_ATTESTATION"
+    );
+    assert_eq!(required(&value, "/exclusive_window/eligible"), false);
+    assert_eq!(required(&value, "/hyperv/generation"), 2);
+    assert_eq!(required(&value, "/hyperv/secure_boot_enabled"), true);
+    assert_eq!(
+        required_string(&value, "/hyperv/secure_boot_template"),
+        "MicrosoftWindows"
+    );
+    assert_eq!(
+        required_string(&value, "/hyperv/powershell_direct"),
+        "EXPECTED"
+    );
+    assert_eq!(
+        required_string(&value, "/hyperv/qemu_guest_agent"),
+        "NOT_APPLICABLE"
+    );
     for field in [
-        "/candidate/version",
         "/package/archive_name",
         "/package/archive_sha256",
         "/package/checksum_manifest_sha256",
         "/package/sha256",
         "/candidate_binary/name",
-        "/candidate_binary/version",
         "/candidate_binary/sha256",
-        "/windows/edition",
         "/windows/build",
-        "/image_source/kind",
         "/image_source/reference",
+        "/image_source/evidence_id",
         "/image_source/source_sha256",
+        "/image_source/acquisition_method",
+        "/image_source/build_method",
         "/vhdx/sha256",
-        "/vhdx/generation",
-        "/vhdx/secure_boot",
-        "/vhdx/virtualization_based_security",
+        "/vhdx/canonical_path_sha256",
+        "/vhdx/ordinary_non_reparse_evidence_id",
+        "/vhdx/preparation_timestamp_utc",
+        "/vhdx/preparation_evidence_id",
         "/creation/created_at_utc",
         "/creation/created_by_evidence_id",
-        "/immutability/declared",
         "/immutability/verification_evidence_sha256",
         "/admission_receipt/receipt_id",
         "/admission_receipt/issued_at_utc",
         "/admission_receipt/sha256",
-        "/exclusive_window/eligible",
         "/exclusive_window/starts_at_utc",
         "/exclusive_window/ends_at_utc",
         "/exclusive_window/evidence_sha256",
+        "/license_evaluation/evidence_id",
     ] {
         required_placeholder(&value, field);
     }

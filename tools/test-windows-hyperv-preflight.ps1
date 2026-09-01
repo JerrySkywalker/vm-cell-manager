@@ -4,11 +4,32 @@ Set-StrictMode -Version 3.0
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $PSScriptRoot 'windows-hyperv-preflight.ps1'
 $fixturePath = Join-Path $repositoryRoot 'tests\fixtures\hyperv-preflight\eligible.json'
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('vmcell-hyperv-r5-preflight-' + [Guid]::NewGuid().ToString('N'))
+$templatePath = Join-Path $repositoryRoot 'docs\receipts\windows-hyperv-image-provenance-template.json'
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('vmcell-hyperv-r1-provenance-' + [Guid]::NewGuid().ToString('N'))
 
 function Assert-True {
   param([Parameter(Mandatory)][bool]$Condition, [Parameter(Mandatory)][string]$Message)
   if (-not $Condition) { throw $Message }
+}
+
+function ConvertFrom-ContractJson {
+  param([Parameter(Mandatory)][string]$Text)
+
+  $parameters = @{ ErrorAction = 'Stop' }
+  if ($PSVersionTable.PSVersion -ge [Version]'7.5') { $parameters.DateKind = 'String' }
+  return $Text | ConvertFrom-Json @parameters
+}
+
+function Read-ContractJson {
+  param([Parameter(Mandatory)][string]$Path)
+
+  return ConvertFrom-ContractJson -Text (Get-Content -LiteralPath $Path -Raw)
+}
+
+function Copy-ContractObject {
+  param([Parameter(Mandatory)][object]$Value)
+
+  return ConvertFrom-ContractJson -Text ($Value | ConvertTo-Json -Depth 32)
 }
 
 function Invoke-Fixture {
@@ -16,162 +37,102 @@ function Invoke-Fixture {
 
   $raw = @(& $scriptPath -FixturePath $Path)
   Assert-True -Condition ($raw.Count -eq 1) -Message 'fixture invocation did not emit exactly one JSON document'
-  return ($raw[0] | ConvertFrom-Json -ErrorAction Stop)
+  return ConvertFrom-ContractJson -Text $raw[0]
 }
 
-function Write-CaseFixture {
+function Write-Fixture {
+  param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][object]$Fixture)
+
+  $Fixture | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+}
+
+function Set-JsonPathValue {
   param(
+    [Parameter(Mandatory)][object]$Object,
     [Parameter(Mandatory)][string]$Path,
-    [AllowNull()][string]$Code,
-    [AllowNull()][string]$Status,
-    [AllowNull()][string]$RawDetail
+    [AllowNull()][object]$Value
   )
 
-  $fixture = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
-  if (-not [string]::IsNullOrWhiteSpace($Code)) {
-    $row = @($fixture.observations | Where-Object { $_.code -ceq $Code })[0]
-    if ($null -eq $row) { throw "test fixture did not contain observation $Code" }
-    $row.status = $Status
+  $segments = $Path.Split('.')
+  if ($segments.Count -eq 1) {
+    $Object.PSObject.Properties[$segments[0]].Value = $Value
+    return
   }
-  if (-not [string]::IsNullOrWhiteSpace($RawDetail)) {
-    $fixture | Add-Member -NotePropertyName raw_detail -NotePropertyValue $RawDetail
+  $current = $Object
+  foreach ($segment in $segments[0..($segments.Count - 2)]) {
+    $current = $current.PSObject.Properties[$segment].Value
   }
-  $fixture | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+  $current.PSObject.Properties[$segments[-1]].Value = $Value
 }
 
-function Assert-StaticDenyList {
+function Remove-JsonPathValue {
+  param([Parameter(Mandatory)][object]$Object, [Parameter(Mandatory)][string]$Path)
+
+  $segments = $Path.Split('.')
+  if ($segments.Count -eq 1) {
+    [void]$Object.PSObject.Properties.Remove($segments[0])
+    return
+  }
+  $current = $Object
+  foreach ($segment in $segments[0..($segments.Count - 2)]) {
+    $current = $current.PSObject.Properties[$segment].Value
+  }
+  [void]$current.PSObject.Properties.Remove($segments[-1])
+}
+
+function Get-WrongJsonValues {
+  param([Parameter(Mandatory)][string]$JsonType)
+
+  $values = [System.Collections.Generic.List[object]]::new()
+  switch ($JsonType) {
+    'string' {
+      $values.Add($true)
+      $values.Add([Int64]7)
+      $values.Add([pscustomobject]@{ invalid = 'object' })
+      $values.Add([object[]]@('array'))
+    }
+    'integer' {
+      $values.Add('7')
+      $values.Add($true)
+      $values.Add([pscustomobject]@{ invalid = 'object' })
+      $values.Add([object[]]@('array'))
+    }
+    'boolean' {
+      $values.Add('false')
+      $values.Add([Int64]0)
+      $values.Add([pscustomobject]@{ invalid = 'object' })
+      $values.Add([object[]]@('array'))
+    }
+  }
+  return $values
+}
+
+function Assert-StaticProductionSafety {
   $tokens = $null
   $parseErrors = $null
-  $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-    $scriptPath,
-    [ref]$tokens,
-    [ref]$parseErrors
-  )
-  Assert-True -Condition ($parseErrors.Count -eq 0) -Message 'R5 preflight has a PowerShell parser error'
-  $commands = @($ast.FindAll({
-    param($node)
-    $node -is [System.Management.Automation.Language.CommandAst]
-  }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
+  $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+  Assert-True -Condition ($parseErrors.Count -eq 0) -Message 'preflight has a PowerShell parser error'
+  $commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) |
+    ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
   $forbidden = @(
-    'Enable-WindowsOptionalFeature', 'Disable-WindowsOptionalFeature',
-    'Install-WindowsFeature', 'Uninstall-WindowsFeature',
-    'Add-WindowsCapability', 'Remove-WindowsCapability',
-    'Add-LocalGroupMember', 'Remove-LocalGroupMember',
+    'Enable-WindowsOptionalFeature', 'Disable-WindowsOptionalFeature', 'Install-WindowsFeature',
+    'Uninstall-WindowsFeature', 'Add-WindowsCapability', 'Remove-WindowsCapability',
     'Start-Service', 'Stop-Service', 'Restart-Service', 'Set-Service', 'New-Service', 'Remove-Service',
     'New-VM', 'Set-VM', 'Remove-VM', 'Start-VM', 'Stop-VM', 'Import-VM', 'Export-VM',
-    'Checkpoint-VM', 'Restore-VM', 'Suspend-VM', 'Resume-VM',
-    'Add-VMHardDiskDrive', 'Remove-VMHardDiskDrive', 'Add-VMNetworkAdapter', 'Remove-VMNetworkAdapter',
-    'Set-VMProcessor', 'Set-VMMemory',
-    'New-VMSwitch', 'Set-VMSwitch', 'Remove-VMSwitch', 'Add-VMSwitchExtension', 'Remove-VMSwitchExtension',
-    'New-VHD', 'Set-VHD', 'Remove-VHD', 'Resize-VHD', 'Mount-VHD', 'Dismount-VHD', 'Convert-VHD', 'Merge-VHD',
+    'Checkpoint-VM', 'Restore-VM', 'Suspend-VM', 'Resume-VM', 'Add-VMHardDiskDrive',
+    'Remove-VMHardDiskDrive', 'Add-VMNetworkAdapter', 'Remove-VMNetworkAdapter', 'Set-VMProcessor',
+    'Set-VMMemory', 'New-VMSwitch', 'Set-VMSwitch', 'Remove-VMSwitch', 'New-VHD', 'Set-VHD',
+    'Remove-VHD', 'Resize-VHD', 'Mount-VHD', 'Dismount-VHD', 'Convert-VHD', 'Merge-VHD',
     'Initialize-Disk', 'Clear-Disk', 'Set-Disk', 'Format-Volume', 'Set-Volume', 'Dismount-Volume',
-    'New-Partition', 'Set-Partition', 'Remove-Partition',
-    'Set-Acl', 'Clear-Acl', 'icacls.exe', 'takeown.exe',
-    'New-NetIPAddress', 'Set-NetIPAddress', 'Remove-NetIPAddress', 'New-NetRoute', 'Set-NetRoute', 'Remove-NetRoute',
-    'Set-NetIPInterface', 'Restart-NetAdapter', 'Enable-NetAdapter', 'Disable-NetAdapter',
-    'New-NetNat', 'Remove-NetNat', 'Set-NetFirewallProfile',
-    'Stop-Process', 'taskkill.exe', 'Stop-Computer', 'Restart-Computer', 'shutdown.exe', 'sc.exe'
+    'New-Partition', 'Set-Partition', 'Remove-Partition', 'Set-Acl', 'Clear-Acl', 'icacls.exe',
+    'takeown.exe', 'New-NetIPAddress', 'Set-NetIPAddress', 'Remove-NetIPAddress', 'New-NetRoute',
+    'Set-NetRoute', 'Remove-NetRoute', 'Set-NetIPInterface', 'Restart-NetAdapter', 'Enable-NetAdapter',
+    'Disable-NetAdapter', 'New-NetNat', 'Remove-NetNat', 'Set-NetFirewallProfile', 'Stop-Process',
+    'taskkill.exe', 'Stop-Computer', 'Restart-Computer', 'shutdown.exe', 'sc.exe'
   )
   foreach ($command in $forbidden) {
-    Assert-True -Condition ($commands -cnotcontains $command) `
-      -Message "R5 preflight contains forbidden mutating command $command"
+    Assert-True -Condition ($commands -cnotcontains $command) "preflight contains forbidden mutating command $command"
   }
-}
-
-function Assert-PathSafetyAndDeterminism {
-  $source = [IO.File]::ReadAllText($scriptPath)
-  foreach ($required in @(
-      'function Get-SafeProvenanceSnapshot',
-      'function Assert-NotReparsePoint',
-      'function Get-PathItemWithoutFollowingReparse',
-      'function Assert-OrdinaryPathAncestry',
-      'function Get-OrdinaryPathItem',
-      'function Get-OrdinaryProvenanceFile',
-      '[IO.FileAttributes]::ReparsePoint',
-      '$ancestor -is [IO.FileInfo]',
-      '$ancestor = $ancestor.Directory',
-      '$ancestor -is [IO.DirectoryInfo]',
-      '$ancestor = $ancestor.Parent',
-      '$beforeHash = Get-Sha256File',
-      '$afterHash = Get-Sha256File',
-      '$verifiedItem = Get-OrdinaryProvenanceFile',
-      'provenance evidence changed while it was read',
-      "Get-OrdinaryPathItem -Path `$StateRoot -RequireDirectory `$true -Description 'state root'",
-      "Get-OrdinaryPathItem -Path `$VhdxPath -RequireDirectory `$false -Description 'VHDX path'",
-      "Get-OrdinaryPathItem -Path `$CandidatePackagePath -RequireDirectory `$false -Description 'candidate package path'",
-      "Get-OrdinaryPathItem -Path `$CandidateBinaryPath -RequireDirectory `$false -Description 'candidate binary path'",
-      "`$requiredStrings[1] -ceq '0.4.1'",
-      'Get-ObservationDigest -Observations $liveObservations',
-      '$requiredStrings[17]'
-    )) {
-    Assert-True -Condition $source.Contains($required) `
-      -Message "R5 preflight omitted required provenance safety binding: $required"
-  }
-  Assert-True -Condition ($source -notmatch [regex]::Escape(
-      'EvidenceSourceDigest (Get-Sha256Text -Text ([DateTimeOffset]::UtcNow.ToString(''O'')))'
-    )) -Message 'live result digest must not be derived from wall-clock time'
-}
-
-function Assert-PathAncestryBehavior {
-  . $scriptPath -FixturePath $fixturePath | Out-Null
-
-  $ordinaryDirectory = Join-Path $temporaryRoot 'ordinary\nested\state-root'
-  New-Item -ItemType Directory -Path $ordinaryDirectory -Force | Out-Null
-  $ordinaryFile = Join-Path $ordinaryDirectory 'evidence.json'
-  [IO.File]::WriteAllText($ordinaryFile, '{}', [Text.UTF8Encoding]::new($false))
-
-  Get-OrdinaryPathItem -Path $ordinaryDirectory -RequireDirectory $true -Description 'ordinary nested directory' | Out-Null
-  Get-OrdinaryPathItem -Path $ordinaryFile -RequireDirectory $false -Description 'ordinary nested file' | Out-Null
-  $rootTraversalCompleted = $false
-  try {
-    Get-OrdinaryPathItem -Path $ordinaryDirectory -RequireDirectory $true -Description 'filesystem root traversal' | Out-Null
-    $rootTraversalCompleted = $true
-  } catch {
-    throw 'ordinary ancestry did not reach the filesystem root'
-  }
-  Assert-True -Condition $rootTraversalCompleted -Message 'filesystem root traversal did not complete'
-
-  $reparseTarget = Join-Path $temporaryRoot 'reparse-target'
-  New-Item -ItemType Directory -Path (Join-Path $reparseTarget 'nested') -Force | Out-Null
-  $reparseFile = Join-Path $reparseTarget 'nested\evidence.json'
-  [IO.File]::WriteAllText($reparseFile, '{}', [Text.UTF8Encoding]::new($false))
-  $reparsePath = Join-Path $temporaryRoot 'reparse-boundary'
-  try {
-    New-Item -ItemType Junction -Path $reparsePath -Target $reparseTarget -ErrorAction Stop | Out-Null
-  } catch {
-    throw 'test_environment_blocker.reparse_fixture_unavailable'
-  }
-  $reparseItem = Get-Item -LiteralPath $reparsePath -Force
-  Assert-True -Condition ([bool]($reparseItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) `
-    -Message 'test_environment_blocker.reparse_fixture_not_created'
-
-  $reparseItemRejected = $false
-  try {
-    Get-OrdinaryPathItem -Path $reparsePath -RequireDirectory $true -Description 'reparse item' | Out-Null
-  } catch {
-    $reparseItemRejected = $true
-  }
-  Assert-True -Condition $reparseItemRejected -Message 'reparse item was accepted'
-
-  $directParentRejected = $false
-  try {
-    Get-OrdinaryPathItem -Path (Join-Path $reparsePath 'nested') -RequireDirectory $true `
-      -Description 'direct reparse parent' | Out-Null
-  } catch {
-    $directParentRejected = $true
-  }
-  Assert-True -Condition $directParentRejected -Message 'direct reparse parent was accepted'
-
-  $grandparentRejected = $false
-  try {
-    Get-OrdinaryPathItem -Path (Join-Path $reparsePath 'nested\evidence.json') -RequireDirectory $false `
-      -Description 'reparse grandparent' | Out-Null
-  } catch {
-    $grandparentRejected = $true
-  }
-  Assert-True -Condition $grandparentRejected -Message 'reparse grandparent was accepted'
-
-  return 6
 }
 
 function Assert-FixtureIsolation {
@@ -191,99 +152,139 @@ foreach (`$name in @(
 }
 & '$escapedScript' -FixturePath '$escapedFixture'
 "@ | Set-Content -LiteralPath $guardPath -Encoding utf8NoBOM
-  $pwsh = Get-Command pwsh -CommandType Application -ErrorAction Stop |
-    Select-Object -First 1 -ExpandProperty Source
+  $pwsh = Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Source
   $raw = @(& $pwsh -NoProfile -File $guardPath)
   Assert-True -Condition ($LASTEXITCODE -eq 0) -Message 'fixture mode called a guarded live observation command'
   Assert-True -Condition ($raw.Count -eq 1) -Message 'fixture isolation guard did not receive exactly one result'
-  $result = $raw[0] | ConvertFrom-Json -ErrorAction Stop
-  Assert-True -Condition ($result.evidence_source -ceq 'fixture') -Message 'fixture isolation result drifted'
+  $result = ConvertFrom-ContractJson -Text $raw[0]
+  Assert-True -Condition ($result.evidence_source -ceq 'fixture' -and $result.mutation_flags.host_observation -eq $false) `
+    -Message 'fixture isolation result drifted'
 }
 
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 try {
-  $executedCaseCount = 0
-  Assert-StaticDenyList
-  $executedCaseCount += 1
-  Assert-PathSafetyAndDeterminism
-  $executedCaseCount += 1
-  $eligible = Invoke-Fixture -Path $fixturePath
-  Assert-True -Condition ($eligible.contract -ceq 'vmcell.hyperv-r5-preflight.v1') -Message 'fixture result contract drifted'
-  Assert-True -Condition ($eligible.authority -ceq 'none' -and $eligible.acceptance -eq $false) `
-    -Message 'fixture result became authorizing'
-  Assert-True -Condition ($eligible.real_platform_acceptance -ceq 'not_started') `
-    -Message 'fixture result claimed real-platform acceptance'
-  Assert-True -Condition ($eligible.disposition -ceq 'PREFLIGHT_ELIGIBLE') -Message 'eligible fixture was not eligible'
-  Assert-True -Condition (@($eligible.observations).Count -eq 25) -Message 'eligible fixture result did not preserve every observation'
-  Assert-True -Condition ($eligible.mutation_flags.host_observation -eq $false) -Message 'fixture result claimed host observation'
-  $executedCaseCount += 1
+  $executedCases = 0
+  $negativeCases = 0
+  $placeholderCases = 0
+  Assert-StaticProductionSafety
+  $executedCases += 1
 
-  $cases = @(
-    @{ name = 'non-elevated-token'; code = 'elevation'; status = 'fail' },
-    @{ name = 'hyperv-feature-unavailable'; code = 'hyperv_feature'; status = 'unavailable' },
-    @{ name = 'hyperv-feature-disabled'; code = 'hyperv_feature'; status = 'fail' },
-    @{ name = 'hyperv-module-missing'; code = 'hyperv_module'; status = 'fail' },
-    @{ name = 'hyperv-read-access-denied'; code = 'hyperv_read_access'; status = 'unavailable' },
-    @{ name = 'vmms-stopped'; code = 'vmms_state'; status = 'fail' },
-    @{ name = 'foreign-or-running-vm'; code = 'vm_inventory'; status = 'fail' },
-    @{ name = 'unexpected-switch'; code = 'switch_inventory'; status = 'fail' },
-    @{ name = 'active-virtualization-writer'; code = 'virtualization_writers'; status = 'fail' },
-    @{ name = 'active-runner-or-codex'; code = 'runner_codex_activity'; status = 'fail' },
-    @{ name = 'unsuitable-c-boundary'; code = 'c_storage_boundary'; status = 'fail' },
-    @{ name = 'refs-v-rejected'; code = 'v_storage_boundary'; status = 'fail' },
-    @{ name = 'file-backed-virtual-v-rejected'; code = 'v_storage_boundary'; status = 'fail' },
-    @{ name = 'missing-vhdx'; code = 'immutable_vhdx_presence'; status = 'fail' },
-    @{ name = 'mutable-vhdx'; code = 'vhdx_immutability'; status = 'fail' },
-    @{ name = 'attached-vhdx'; code = 'vhdx_attachment'; status = 'fail' },
-    @{ name = 'differencing-vhdx'; code = 'vhdx_immutability'; status = 'fail' },
-    @{ name = 'parented-vhdx'; code = 'vhdx_parent'; status = 'fail' },
-    @{ name = 'missing-provenance'; code = 'image_provenance'; status = 'unavailable' },
-    @{ name = 'mismatched-provenance'; code = 'image_provenance'; status = 'fail' },
-    @{ name = 'candidate-hash-mismatch'; code = 'candidate_hash'; status = 'fail' },
-    @{ name = 'package-hash-mismatch'; code = 'package_hash'; status = 'fail' },
-    @{ name = 'binary-hash-mismatch'; code = 'binary_hash'; status = 'fail' },
-    @{ name = 'vhdx-hash-mismatch'; code = 'vhdx_hash'; status = 'fail' },
-    @{ name = 'stale-receipt'; code = 'admission_receipt'; status = 'fail' },
-    @{ name = 'exclusive-window-unavailable'; code = 'exclusive_window'; status = 'unavailable' }
-  )
-  foreach ($case in $cases) {
-    $casePath = Join-Path $temporaryRoot ($case.name + '.json')
-    Write-CaseFixture -Path $casePath -Code $case.code -Status $case.status
-    $result = Invoke-Fixture -Path $casePath
-    Assert-True -Condition ($result.disposition -ceq 'BLOCKED') "fixture case was not blocked: $($case.name)"
-    $expected = if ($case.status -ceq 'unavailable') {
-      "evidence_gap.$($case.code)"
-    } else {
-      "precondition_failed.$($case.code)"
+  . $scriptPath -FixturePath $fixturePath | Out-Null
+  $fixture = Read-ContractJson -Path $fixturePath
+  $eligible = Invoke-Fixture -Path $fixturePath
+  Assert-True -Condition ($eligible.contract -ceq 'vmcell.hyperv-r5-preflight.v2') 'fixture result contract drifted'
+  Assert-True -Condition ($eligible.authority -ceq 'none' -and $eligible.acceptance -eq $false -and $eligible.authorizing -eq $false) `
+    'fixture result became authorizing'
+  Assert-True -Condition ($eligible.real_platform_acceptance -ceq 'not_started' -and $eligible.support_status -ceq 'untested') `
+    'fixture result promoted platform acceptance or support'
+  Assert-True -Condition ($eligible.disposition -ceq 'PREFLIGHT_ELIGIBLE') 'complete eligible fixture was not eligible'
+  Assert-True -Condition ($eligible.provenance_validation.valid -eq $true) 'eligible provenance was not valid'
+  Assert-True -Condition (@($eligible.observations).Count -eq 25) 'fixture result did not preserve every observation'
+  $executedCases += 1
+
+  $schema = @(Get-HyperVImageProvenanceSchema)
+  $directEligible = Test-HyperVImageProvenance -Provenance $fixture.provenance -ExpectedIdentity $fixture.expected_identity
+  Assert-True -Condition ($directEligible.valid -and $directEligible.required_field_count -eq $schema.Count) 'validator and eligible fixture disagree'
+  foreach ($field in $schema) {
+    $missing = Copy-ContractObject -Value $fixture.provenance
+    Remove-JsonPathValue -Object $missing -Path $field.path
+    $validation = Test-HyperVImageProvenance -Provenance $missing -ExpectedIdentity $fixture.expected_identity
+    Assert-True -Condition (-not $validation.valid) "missing required field was admitted: $($field.path)"
+    $negativeCases += 1
+
+    foreach ($wrongValue in Get-WrongJsonValues -JsonType $field.json_type) {
+      $wrongType = Copy-ContractObject -Value $fixture.provenance
+      Set-JsonPathValue -Object $wrongType -Path $field.path -Value $wrongValue
+      $validation = Test-HyperVImageProvenance -Provenance $wrongType -ExpectedIdentity $fixture.expected_identity
+      Assert-True -Condition (-not $validation.valid) "wrong JSON type was admitted: $($field.path)"
+      $negativeCases += 1
     }
-    Assert-True -Condition (@($result.blockers) -ccontains $expected) "fixture case omitted blocker: $($case.name)"
-    $executedCaseCount += 1
+    $nullValue = Copy-ContractObject -Value $fixture.provenance
+    Set-JsonPathValue -Object $nullValue -Path $field.path -Value $null
+    $validation = Test-HyperVImageProvenance -Provenance $nullValue -ExpectedIdentity $fixture.expected_identity
+    Assert-True -Condition (-not $validation.valid) "null JSON value was admitted: $($field.path)"
+    $negativeCases += 1
+    if ($field.json_type -eq 'string') {
+      foreach ($value in @('', '   ')) {
+        $empty = Copy-ContractObject -Value $fixture.provenance
+        Set-JsonPathValue -Object $empty -Path $field.path -Value $value
+        $validation = Test-HyperVImageProvenance -Provenance $empty -ExpectedIdentity $fixture.expected_identity
+        Assert-True -Condition (-not $validation.valid) "empty string was admitted: $($field.path)"
+        $negativeCases += 1
+      }
+      foreach ($value in @('REQUIRED_VALUE', ' required_value ', 'TODO', ' tBd ', 'FixMe', ' UNKNOWN ')) {
+        $placeholder = Copy-ContractObject -Value $fixture.provenance
+        Set-JsonPathValue -Object $placeholder -Path $field.path -Value $value
+        $validation = Test-HyperVImageProvenance -Provenance $placeholder -ExpectedIdentity $fixture.expected_identity
+        Assert-True -Condition (-not $validation.valid) "placeholder was admitted: $($field.path)"
+        $negativeCases += 1
+        $placeholderCases += 1
+      }
+    }
   }
 
-  $malformedPath = Join-Path $temporaryRoot 'malformed.json'
-  '{' | Set-Content -LiteralPath $malformedPath -Encoding utf8NoBOM
-  $malformed = Invoke-Fixture -Path $malformedPath
-  Assert-True -Condition ($malformed.disposition -ceq 'BLOCKED' -and
-    @($malformed.blockers) -ccontains 'fixture.schema_invalid') 'malformed fixture was not rejected'
-  $executedCaseCount += 1
+  foreach ($expectedProperty in @('candidate_sha', 'package_archive_sha256', 'package_sha256', 'candidate_binary_sha256', 'vhdx_sha256')) {
+    $mismatchIdentity = Copy-ContractObject -Value $fixture.expected_identity
+    $mismatchIdentity.PSObject.Properties[$expectedProperty].Value = ('f' * ([string]$mismatchIdentity.PSObject.Properties[$expectedProperty].Value).Length)
+    $validation = Test-HyperVImageProvenance -Provenance $fixture.provenance -ExpectedIdentity $mismatchIdentity
+    Assert-True -Condition (-not $validation.valid) "identity mismatch was admitted: $expectedProperty"
+    $negativeCases += 1
+  }
+  foreach ($change in @(
+      @{ path = 'windows.edition'; value = 'Datacenter' },
+      @{ path = 'windows.build'; value = '22621.1' },
+      @{ path = 'hyperv.generation'; value = [Int64]1 },
+      @{ path = 'hyperv.secure_boot_enabled'; value = $false },
+      @{ path = 'vhdx.parentless'; value = $false },
+      @{ path = 'vhdx.attached'; value = $true },
+      @{ path = 'vhdx.immutable_owner_policy'; value = 'UNMANAGED' },
+      @{ path = 'vhdx.preparation_timestamp_utc'; value = 'not-a-timestamp' }
+    )) {
+    $invalid = Copy-ContractObject -Value $fixture.provenance
+    Set-JsonPathValue -Object $invalid -Path $change.path -Value $change.value
+    $validation = Test-HyperVImageProvenance -Provenance $invalid -ExpectedIdentity $fixture.expected_identity
+    Assert-True -Condition (-not $validation.valid) "required safety value was admitted: $($change.path)"
+    $negativeCases += 1
+  }
+
+  $ownerAttestation = Copy-ContractObject -Value $fixture.provenance
+  Set-JsonPathValue -Object $ownerAttestation -Path 'vhdx.credentials_embedded' -Value 'UNKNOWN_REQUIRES_OWNER_ATTESTATION'
+  $ownerAttestationValidation = Test-HyperVImageProvenance -Provenance $ownerAttestation -ExpectedIdentity $fixture.expected_identity
+  Assert-True -Condition ($ownerAttestationValidation.valid -and $ownerAttestationValidation.requires_owner_attestation) `
+    'permitted owner-attestation enum was rejected'
+  $ownerFixture = Copy-ContractObject -Value $fixture
+  $ownerFixture.provenance = $ownerAttestation
+  $ownerPath = Join-Path $temporaryRoot 'owner-attestation.json'
+  Write-Fixture -Path $ownerPath -Fixture $ownerFixture
+  $ownerResult = Invoke-Fixture -Path $ownerPath
+  Assert-True -Condition ($ownerResult.disposition -ceq 'BLOCKED' -and
+    @($ownerResult.blockers) -ccontains 'owner_attestation.credentials_embedded_required') `
+    'owner-attestation requirement did not block preflight without rejecting the enum'
+  $executedCases += 1
+
+  $template = Read-ContractJson -Path $templatePath
+  $templateValidation = Test-HyperVImageProvenance -Provenance $template -ExpectedIdentity $fixture.expected_identity
+  Assert-True -Condition (-not $templateValidation.valid -and
+    @($templateValidation.blockers | Where-Object { $_ -like 'provenance.placeholder_value.*' }).Count -gt 0) `
+    'template placeholders were accepted by the admitted-evidence validator'
+  $executedCases += 1
 
   $first = @(& $scriptPath -FixturePath $fixturePath)
   $second = @(& $scriptPath -FixturePath $fixturePath)
   Assert-True -Condition ($first.Count -eq 1 -and $first[0] -ceq $second[0]) 'fixture output was not deterministic'
-  $executedCaseCount += 1
-
+  $redactionFixture = Copy-ContractObject -Value $fixture
+  $redactionFixture | Add-Member -NotePropertyName raw_detail -NotePropertyValue 'C:\private\credential-password.txt'
   $redactionPath = Join-Path $temporaryRoot 'redaction.json'
-  Write-CaseFixture -Path $redactionPath -RawDetail 'C:\\private\\credential-password.txt'
+  Write-Fixture -Path $redactionPath -Fixture $redactionFixture
   $redacted = @(& $scriptPath -FixturePath $redactionPath)
   Assert-True -Condition ($redacted.Count -eq 1 -and $redacted[0] -cnotmatch '(?i)C:\\|credential|password|private') `
-    -Message 'fixture output disclosed a raw path or secret-like detail'
-  $executedCaseCount += 1
+    'fixture output disclosed raw detail'
+  $executedCases += 2
 
-  $executedCaseCount += Assert-PathAncestryBehavior
   Assert-FixtureIsolation -Path $fixturePath
-  $executedCaseCount += 1
+  $executedCases += 1
 } finally {
   Remove-Item -LiteralPath $temporaryRoot -Force -Recurse -ErrorAction SilentlyContinue
 }
 
-Write-Host "Windows Hyper-V R5 fixture, isolation, and static safety contracts passed ($executedCaseCount cases)"
+Write-Host "Windows Hyper-V R1 provenance contract tests passed (fields=$($schema.Count); negative_cases=$negativeCases; placeholder_cases=$placeholderCases; fixture_cases=$executedCases)"

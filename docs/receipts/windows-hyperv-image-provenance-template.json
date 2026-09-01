@@ -1,51 +1,74 @@
 {
-  "schema_version": 1,
-  "contract": "vmcell.hyperv-r5-image-provenance.v1",
+  "schema_version": 2,
+  "contract": "vmcell.hyperv-r5-image-provenance.v2",
   "authority": "none",
   "acceptance": false,
   "authorizing": false,
+  "admission_result": "NOT_PROMOTED",
+  "admission_status": "NOT_STARTED",
   "real_platform_acceptance": "not_started",
   "support_status": "untested",
+  "admitted_for_candidate_sha": "REQUIRED_EXACT_40_HEX_SHA",
   "candidate": {
     "sha": "REQUIRED_EXACT_40_HEX_SHA",
-    "version": "REQUIRED_VERSION"
+    "version": "0.4.1",
+    "frozen_release_ref": "release/v0.4.1",
+    "frozen_release_sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"
   },
   "package": {
-    "archive_name": "REQUIRED_PACKAGE_NAME",
+    "archive_name": "REQUIRED_ARCHIVE_NAME",
     "archive_sha256": "REQUIRED_SHA256",
     "checksum_manifest_sha256": "REQUIRED_SHA256",
     "sha256": "REQUIRED_SHA256"
   },
   "candidate_binary": {
     "name": "REQUIRED_BINARY_NAME",
-    "version": "REQUIRED_VERSION",
+    "version": "0.4.1",
     "sha256": "REQUIRED_SHA256"
   },
   "windows": {
-    "edition": "REQUIRED_WINDOWS_EDITION",
-    "build": "REQUIRED_WINDOWS_BUILD",
+    "product": "Windows Server 2022",
+    "edition": "Standard",
+    "version": "21H2",
+    "build": "REQUIRED_20348_DOT_BUILD",
     "architecture": "x86_64"
   },
+  "hyperv": {
+    "generation": 2,
+    "secure_boot_enabled": true,
+    "secure_boot_template": "MicrosoftWindows",
+    "powershell_direct": "EXPECTED",
+    "qemu_guest_agent": "NOT_APPLICABLE"
+  },
   "image_source": {
-    "kind": "REQUIRED_IMAGE_SOURCE_KIND",
     "reference": "REQUIRED_SANITIZED_SOURCE_REFERENCE",
-    "source_sha256": "REQUIRED_SHA256"
+    "evidence_id": "REQUIRED_OPAQUE_SOURCE_EVIDENCE_ID",
+    "source_sha256": "REQUIRED_SHA256",
+    "acquisition_method": "REQUIRED_ACQUISITION_METHOD",
+    "build_method": "REQUIRED_BUILD_METHOD"
   },
   "vhdx": {
+    "format": "VHDX",
     "sha256": "REQUIRED_SHA256",
-    "generation": "REQUIRED_GENERATION",
-    "secure_boot": "REQUIRED_SECURITY_PROPERTY",
-    "virtualization_based_security": "REQUIRED_SECURITY_PROPERTY",
-    "vhd_type": "fixed",
-    "parent_path": null,
-    "attached": false
+    "size_bytes": 0,
+    "canonical_path_sha256": "REQUIRED_SHA256",
+    "parentless": true,
+    "attached": false,
+    "detached": true,
+    "immutable_owner_policy": "OWNER_ATTESTED_READ_ONLY",
+    "ordinary_non_reparse_evidence_id": "REQUIRED_OPAQUE_PATH_EVIDENCE_ID",
+    "backing_chain": "NONE",
+    "preparation_timestamp_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
+    "preparation_evidence_id": "REQUIRED_OPAQUE_PREPARATION_EVIDENCE_ID",
+    "secrets_present": false,
+    "credentials_embedded": "UNKNOWN_REQUIRES_OWNER_ATTESTATION"
   },
   "creation": {
     "created_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
     "created_by_evidence_id": "REQUIRED_OPAQUE_EVIDENCE_ID"
   },
   "immutability": {
-    "declared": "REQUIRED_BOOLEAN",
+    "owner_policy": "OWNER_ATTESTED_READ_ONLY",
     "verification_evidence_sha256": "REQUIRED_SHA256"
   },
   "admission_receipt": {
@@ -54,9 +77,13 @@
     "sha256": "REQUIRED_SHA256"
   },
   "exclusive_window": {
-    "eligible": "REQUIRED_BOOLEAN",
+    "eligible": false,
     "starts_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
     "ends_at_utc": "REQUIRED_RFC3339_UTC_TIMESTAMP",
     "evidence_sha256": "REQUIRED_SHA256"
+  },
+  "license_evaluation": {
+    "review_status": "HUMAN_REVIEW_REQUIRED",
+    "evidence_id": "REQUIRED_OPAQUE_LICENSE_EVIDENCE_ID"
   }
 }

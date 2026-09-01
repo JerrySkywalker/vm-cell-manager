@@ -1,7 +1,109 @@
 {
   "schema_version": 1,
-  "contract": "vmcell.hyperv-r5-preflight-fixture.v1",
-  "fixture_id": "eligible-host",
+  "contract": "vmcell.hyperv-r5-preflight-fixture.v2",
+  "fixture_id": "eligible-provenance-contract",
+  "expected_identity": {
+    "candidate_sha": "8fab858000111e35ab01789f2cbb6645dda3e6e7",
+    "candidate_version": "0.4.1",
+    "frozen_release_ref": "release/v0.4.1",
+    "frozen_release_sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637",
+    "package_archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "package_checksum_manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "package_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_binary_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "vhdx_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "vhdx_size_bytes": 42949672960,
+    "vhdx_canonical_path_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "provenance": {
+    "schema_version": 2,
+    "contract": "vmcell.hyperv-r5-image-provenance.v2",
+    "authority": "none",
+    "acceptance": false,
+    "authorizing": false,
+    "admission_result": "NOT_PROMOTED",
+    "admission_status": "NOT_STARTED",
+    "real_platform_acceptance": "not_started",
+    "support_status": "untested",
+    "admitted_for_candidate_sha": "8fab858000111e35ab01789f2cbb6645dda3e6e7",
+    "candidate": {
+      "sha": "8fab858000111e35ab01789f2cbb6645dda3e6e7",
+      "version": "0.4.1",
+      "frozen_release_ref": "release/v0.4.1",
+      "frozen_release_sha": "0e7fcf37f4310562d318f9d5c709ddf8e8ca1637"
+    },
+    "package": {
+      "archive_name": "vmcell-v0.4.1-windows-x86_64.zip",
+      "archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "checksum_manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "candidate_binary": {
+      "name": "vmcell.exe",
+      "version": "0.4.1",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "windows": {
+      "product": "Windows Server 2022",
+      "edition": "Standard",
+      "version": "21H2",
+      "build": "20348.2849",
+      "architecture": "x86_64"
+    },
+    "hyperv": {
+      "generation": 2,
+      "secure_boot_enabled": true,
+      "secure_boot_template": "MicrosoftWindows",
+      "powershell_direct": "EXPECTED",
+      "qemu_guest_agent": "NOT_APPLICABLE"
+    },
+    "image_source": {
+      "reference": "SRC-WS2022-EVAL-20260901",
+      "evidence_id": "EVID-SOURCE-20260901",
+      "source_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "acquisition_method": "OWNER_SUPPLIED_MEDIA",
+      "build_method": "SYSPREP_GENERALIZED"
+    },
+    "vhdx": {
+      "format": "VHDX",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "size_bytes": 42949672960,
+      "canonical_path_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "parentless": true,
+      "attached": false,
+      "detached": true,
+      "immutable_owner_policy": "OWNER_ATTESTED_READ_ONLY",
+      "ordinary_non_reparse_evidence_id": "EVID-PATH-20260901",
+      "backing_chain": "NONE",
+      "preparation_timestamp_utc": "2026-08-31T12:34:56Z",
+      "preparation_evidence_id": "EVID-PREP-20260901",
+      "secrets_present": false,
+      "credentials_embedded": "OWNER_ATTESTED_NONE"
+    },
+    "creation": {
+      "created_at_utc": "2026-08-31T12:34:56Z",
+      "created_by_evidence_id": "EVID-CREATOR-20260901"
+    },
+    "immutability": {
+      "owner_policy": "OWNER_ATTESTED_READ_ONLY",
+      "verification_evidence_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "admission_receipt": {
+      "receipt_id": "EVID-RECEIPT-20260901",
+      "issued_at_utc": "2026-08-31T12:34:56Z",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "exclusive_window": {
+      "eligible": true,
+      "starts_at_utc": "2026-09-01T12:00:00Z",
+      "ends_at_utc": "2026-09-01T14:00:00Z",
+      "evidence_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "license_evaluation": {
+      "review_status": "HUMAN_REVIEW_REQUIRED",
+      "evidence_id": "EVID-LICENSE-20260901"
+    }
+  },
   "observations": [
     { "code": "elevation", "status": "pass", "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     { "code": "administrators_membership", "status": "pass", "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
