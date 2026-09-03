@@ -362,6 +362,19 @@ function Test-JsonObject {
   return $null -ne $Value -and $Value -is [pscustomobject]
 }
 
+function Get-JsonObjectPropertyNames {
+  param([AllowNull()][object]$Value)
+
+  if (-not (Test-JsonObject -Value $Value)) {
+    return [string[]]@()
+  }
+  $names = [System.Collections.Generic.List[string]]::new()
+  foreach ($property in $Value.PSObject.Properties) {
+    $names.Add([string]$property.Name)
+  }
+  return [string[]]$names.ToArray()
+}
+
 function Test-JsonInteger {
   param([AllowNull()][object]$Value)
 
@@ -469,7 +482,7 @@ function Test-HyperVImageProvenance {
       $blockers.Add("provenance.invalid_type.$parentLabel")
       continue
     }
-    foreach ($property in $entry.value.PSObject.Properties.Name) {
+    foreach ($property in @(Get-JsonObjectPropertyNames -Value $entry.value)) {
       if ($parentFields[$parent] -cnotcontains $property) {
         $unknownPropertyCount += 1
       }
@@ -784,7 +797,7 @@ function Test-ClosedWorldObject {
   if (-not (Test-JsonObject -Value $Value)) {
     return $false
   }
-  foreach ($property in $Value.PSObject.Properties.Name) {
+  foreach ($property in @(Get-JsonObjectPropertyNames -Value $Value)) {
     if ($AllowedProperties -cnotcontains $property) {
       return $false
     }

@@ -42,6 +42,16 @@ function Invoke-Fixture {
   return ConvertFrom-ContractJson -Text $raw[0]
 }
 
+function Invoke-StructuredFixture {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $raw = @(& $scriptPath -FixturePath $Path)
+  Assert-True -Condition ($raw.Count -eq 1) -Message 'fixture invocation did not emit exactly one JSON document'
+  Assert-True -Condition ($raw[0] -notmatch '(?i)(PropertyNotFound|RuntimeException|stack trace|\bat\s+.+\.ps1:)') `
+    -Message 'fixture output exposed a raw PowerShell exception or stack trace'
+  return [pscustomobject]@{ raw = $raw[0]; result = (ConvertFrom-ContractJson -Text $raw[0]) }
+}
+
 function Write-Fixture {
   param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][object]$Fixture)
 
@@ -241,6 +251,7 @@ function Assert-PathSafetyAndDeterminism {
       'function Assert-OrdinaryPathAncestry',
       'function Get-OrdinaryPathItem',
       'function Get-OrdinaryProvenanceFile',
+      'function Get-JsonObjectPropertyNames',
       '[IO.FileAttributes]::ReparsePoint',
       '$ancestor = $ancestor.Directory',
       '$ancestor = $ancestor.Parent',
@@ -258,6 +269,8 @@ function Assert-PathSafetyAndDeterminism {
   Assert-True -Condition ($source -notmatch [regex]::Escape(
       'EvidenceSourceDigest (Get-Sha256Text -Text ([DateTimeOffset]::UtcNow.ToString(''O'')))'
     )) -Message 'live result digest must not be derived from wall-clock time'
+  Assert-True -Condition ($source -notmatch '\.PSObject\.Properties\.Name') `
+    -Message 'preflight retained implicit property-name enumeration'
 }
 
 function Assert-PathAncestryBehavior {
@@ -422,6 +435,93 @@ function Assert-RawParserAndSanitization {
   return [pscustomobject]@{ duplicate_cases = $duplicateCases.Count; scalar_malformed_cases = 7; unknown_property_cases = $unknownNames.Count }
 }
 
+function Assert-EmptyObjectBehavior {
+  param(
+    [Parameter(Mandatory)][object]$Fixture,
+    [Parameter(Mandatory)][object[]]$Fields
+  )
+
+  $emptyNames = @(Get-JsonObjectPropertyNames -Value ([pscustomobject]@{}))
+  $singleNames = @(Get-JsonObjectPropertyNames -Value ([pscustomobject]@{ alpha = 1 }))
+  $multipleNames = @(Get-JsonObjectPropertyNames -Value ([pscustomobject]@{ alpha = 1; beta = 2 }))
+  Assert-True -Condition ($emptyNames.Count -eq 0) 'empty object property-name enumeration was not empty'
+  Assert-True -Condition ($singleNames.Count -eq 1 -and $singleNames[0] -ceq 'alpha') 'single property-name enumeration drifted'
+  Assert-True -Condition (($multipleNames -join '|') -ceq 'alpha|beta') 'multiple property-name enumeration drifted'
+  foreach ($nonObject in @($null, 'scalar', [object[]]@('array'))) {
+    Assert-True -Condition (-not (Test-JsonObject -Value $nonObject)) 'non-object input was classified as a JSON object'
+  }
+
+  $rootPath = Join-Path $temporaryRoot 'empty-fixture-root.json'
+  Write-RawFixture -Path $rootPath -Text '{}'
+  $rootFirst = Invoke-StructuredFixture -Path $rootPath
+  $rootSecond = Invoke-StructuredFixture -Path $rootPath
+  Assert-True -Condition ($rootFirst.raw -ceq $rootSecond.raw) 'empty fixture-root output was not deterministic'
+  Assert-True -Condition ($rootFirst.result.disposition -ceq 'BLOCKED' -and
+    @($rootFirst.result.blockers) -ccontains 'fixture.schema_invalid') 'empty fixture root did not return the fixture.schema_invalid blocker'
+  Assert-True -Condition ($rootFirst.result.evidence_source -ceq 'fixture' -and
+    $rootFirst.result.mutation_flags.host_observation -eq $false) 'empty fixture root left fixture mode'
+
+  $containers = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  [void]$containers.Add('')
+  foreach ($field in $Fields) {
+    $segments = ([string]$field.path).Split('.')
+    for ($depth = 1; $depth -lt $segments.Count; $depth++) {
+      [void]$containers.Add(($segments[0..($depth - 1)] -join '.'))
+    }
+  }
+  $cases = [System.Collections.Generic.List[object]]::new()
+  foreach ($container in @($containers | Sort-Object)) {
+    $prefix = if ($container.Length -eq 0) { 'provenance.required_field_missing.' } else { "provenance.required_field_missing.$container." }
+    $cases.Add([pscustomobject]@{
+        name = if ($container.Length -eq 0) { 'empty-provenance-root' } else { "empty-provenance-$container" }
+        container_paths = @($container)
+        required_prefixes = @($prefix)
+        single_property = $false
+      })
+  }
+  $cases.Add([pscustomobject]@{
+      name = 'multiple-empty-nested-objects'
+      container_paths = @('image_source', 'creation')
+      required_prefixes = @('provenance.required_field_missing.image_source.', 'provenance.required_field_missing.creation.')
+      single_property = $false
+    })
+  $cases.Add([pscustomobject]@{
+      name = 'single-valid-property-incomplete-object'
+      container_paths = @('image_source')
+      required_prefixes = @('provenance.required_field_missing.image_source.')
+      single_property = $true
+    })
+
+  foreach ($case in $cases) {
+    $candidate = Copy-ContractObject -Value $Fixture
+    if ($case.single_property) {
+      $candidate.provenance.image_source = [pscustomobject]@{ reference = [string]$Fixture.provenance.image_source.reference }
+    } else {
+      foreach ($container in @($case.container_paths)) {
+        if ($container.Length -eq 0) {
+          $candidate.provenance = [pscustomobject]@{}
+        } else {
+          Set-JsonPathValue -Object $candidate.provenance -Path $container -Value ([pscustomobject]@{})
+        }
+      }
+    }
+    $path = Join-Path $temporaryRoot ($case.name + '.json')
+    Write-Fixture -Path $path -Fixture $candidate
+    $first = Invoke-StructuredFixture -Path $path
+    $second = Invoke-StructuredFixture -Path $path
+    Assert-True -Condition ($first.raw -ceq $second.raw) "empty-object output was not deterministic: $($case.name)"
+    Assert-True -Condition ($first.result.disposition -ceq 'BLOCKED' -and
+      @($first.result.blockers) -ccontains 'precondition_failed.image_provenance' -and
+      -not [bool]$first.result.provenance_validation.valid) "empty object was not structurally blocked: $($case.name)"
+    foreach ($prefix in @($case.required_prefixes)) {
+      Assert-True -Condition (@($first.result.provenance_validation.blockers | Where-Object { $_ -like "$prefix*" }).Count -gt 0) `
+        "empty object did not retain required-field blocker family: $($case.name)"
+    }
+  }
+  Assert-FixtureIsolation -Path $rootPath
+  return 1 + $cases.Count
+}
+
 function Assert-PlaceholderPolicy {
   param([Parameter(Mandatory)][object]$Fixture)
 
@@ -474,6 +574,7 @@ try {
   $safeNearMissCases = 0
   $duplicateMemberCases = 0
   $scalarMalformedCases = 0
+  $emptyObjectCases = 0
   $matrix = Get-IndependentGoldenMatrix
   $matrixFields = @($matrix.fields)
   Assert-StaticProductionSafety
@@ -619,6 +720,8 @@ try {
   $duplicateMemberCases = [int]$rawStats.duplicate_cases
   $scalarMalformedCases = [int]$rawStats.scalar_malformed_cases
   $executedCases += $duplicateMemberCases + $scalarMalformedCases + [int]$rawStats.unknown_property_cases
+  $emptyObjectCases = Assert-EmptyObjectBehavior -Fixture $fixture -Fields $matrixFields
+  $executedCases += $emptyObjectCases
   $placeholderStats = Assert-PlaceholderPolicy -Fixture $fixture
   $placeholderCases += [int]$placeholderStats.placeholder_cases
   $safeNearMissCases = [int]$placeholderStats.safe_near_miss_cases
@@ -665,4 +768,4 @@ try {
   Remove-Item -LiteralPath $temporaryRoot -Force -Recurse -ErrorAction SilentlyContinue
 }
 
-Write-Host "Windows Hyper-V R1 provenance contract tests passed (fields=$($matrixFields.Count); negative_cases=$negativeCases; placeholder_cases=$placeholderCases; safe_near_miss_cases=$safeNearMissCases; duplicate_member_cases=$duplicateMemberCases; scalar_malformed_cases=$scalarMalformedCases; fixture_cases=$executedCases)"
+Write-Host "Windows Hyper-V R1 provenance contract tests passed (fields=$($matrixFields.Count); negative_cases=$negativeCases; placeholder_cases=$placeholderCases; safe_near_miss_cases=$safeNearMissCases; duplicate_member_cases=$duplicateMemberCases; scalar_malformed_cases=$scalarMalformedCases; empty_object_cases=$emptyObjectCases; fixture_cases=$executedCases)"
